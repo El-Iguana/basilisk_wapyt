@@ -40,6 +40,7 @@ appcode/                   # pytincture modules_path
     sessions.py            #   manual commit mode: pinned connection per SQL tab, idle reaper — plain module
     sqlops.py              #   everything done to a database; the running-statement registry
     values.py              #   driver values <-> grid text; lossless row keys; typed coercion
+    plans.py               #   explain plans from every engine in one tree shape (pure parsers)
     connection_service.py  #   BFF: profiles, test, disconnect
     sql_service.py         #   BFF: thin front for sqlops (tree, table, browse, save, execute…)
     user_service.py, ui_state_service.py, about*.py, release_check.py   # from Monguana
@@ -48,7 +49,7 @@ appcode/                   # pytincture modules_path
   vendor/codemirror/       #   the SQL editor bundle (built, committed), served at /vendor
 docs/basilisk.webp         # the README's picture (both cut from the original artwork, 1254 px)
 tools/codemirror/          # its recipe: pinned package.json, entry.js, build.sh
-tests/                     # test_units.py, test_bff_state.py, test_live.py (needs the databases)
+tests/                     # test_units.py, test_plans.py, test_bff_state.py, test_live.py (needs the databases)
 tests/smoke/               # seed_sample.py + ui_smoke.py (Playwright, all four engines)
 Containerfile, scripts/podman-run.sh   # image + dev container "basilisk"
 ```
@@ -89,7 +90,7 @@ podman run -d --name basilisk-mysql -p 127.0.0.1:53306:3306 -e MYSQL_ROOT_PASSWO
 podman run -d --name basilisk-mssql -p 127.0.0.1:51433:1433 -e ACCEPT_EULA=Y \
   -e MSSQL_SA_PASSWORD="$PW" -e MSSQL_PID=Developer mcr.microsoft.com/mssql/server:2022-latest
 uv run python tests/smoke/seed_sample.py          # the shop sample in all four (SQLite: data/sqlite/shop.db)
-uv run --group dev pytest -q tests/test_live.py   # 60 live tests
+uv run --group dev pytest -q tests/test_live.py   # 68 live tests
 BASILISK_PASS=… python3 tests/smoke/ui_smoke.py   # ~22 UI checks per engine
 ```
 
@@ -226,6 +227,37 @@ badge. `execute(..., session=…)` runs through `_execute_manual`;
   runs in PEP 249 mode (`autocommit = False`, so DDL is transactional too) and
   is put back to legacy control on release; MySQL counts statements.
 
+### Explain plans (`plans.py`, milestone 2)
+
+**Explain** (Ctrl+Shift+E) shows the estimated plan of the statement at the
+cursor (or the selection); **Analyze** runs it for actual rows, loops and
+times. Each engine's `explain()` produces its native plan and `plans.py`
+turns it into one node shape (`op`, `object`, `detail`, `cost`, `est_rows`,
+`act_rows`, `time_ms`, `loops`, `extra`, `children`); `flatten` gives the
+grid's rows and `annotate` adds `share` and `misestimate`. `test_plans.py`
+pins each parser on captured output.
+
+| | estimated | actual (Analyze) |
+|---|---|---|
+| PostgreSQL | `EXPLAIN (FORMAT JSON)` | `+ ANALYZE, BUFFERS` |
+| MySQL 8 | `EXPLAIN FORMAT=TREE` (text, parsed by indent) | `EXPLAIN ANALYZE` (SELECT and multi-table UPDATE/DELETE only) |
+| MariaDB / old MySQL | tabular `EXPLAIN` | `ANALYZE` (tabular, `r_rows`) |
+| SQL Server | `SET SHOWPLAN_XML ON` | `SET STATISTICS XML ON` (the plan is an extra result set after the rows) |
+| SQLite | `EXPLAIN QUERY PLAN` (no costs) | not possible |
+
+- **Analyze executes the statement** on a connection that is never committed,
+  so a write is rolled back; a non-read statement needs confirming first
+  (`needs_confirm`), because effects outside the transaction (sequences,
+  triggers that call out) stay. It uses a pooled connection, not a manual-
+  commit session: the plan sees committed data only.
+- **"Own cost %"** is a node's cost minus its children's, over the statement's
+  total: engines report costs cumulatively, which painted every parent 100%.
+  ≥30% is red, ≥10% amber. PostgreSQL and MySQL report rows and times **per
+  loop**; they are multiplied out, and the estimate is compared with
+  `est_rows × loops`. An estimate off by 10x (with 100+ rows) gets a warning
+  icon. Double-click a node for every field the engine gave.
+- **Raw** shows the engine's own JSON, text or XML.
+
 ## Things that will bite
 
 - Everything in Monguana's list: `APP_ENTRYPOINT`, BFF modules re-executed per
@@ -245,6 +277,9 @@ badge. `execute(..., session=…)` runs through `_execute_manual`;
 - MySQL and SQLite return NULL for `1/0`; PostgreSQL and SQL Server raise.
 - SQL Server `VARCHAR` cannot hold an emoji (the seed uses `NVARCHAR`).
 - MySQL reorders JSON object keys.
+- **Plain modules (`plans.py`, `sqlops.py`, `sessions.py`, engines) load once**:
+  restart the dev server after editing them. Only BFF modules and the page
+  are re-read per request.
 - **pymssql opens its own `BEGIN TRANSACTION`** after every commit and
   rollback when auto-commit is off, so `@@TRANCOUNT` is always 1: SQL Server's
   "transaction open" needs statements counted too. A `COMMIT` typed into the

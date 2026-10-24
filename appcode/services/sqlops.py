@@ -642,6 +642,52 @@ def execute(user_id: int, conn_id: int, database: str, sql: str, mode: str = "sc
     }
 
 
+def explain(user_id: int, conn_id: int, database: str, sql: str, caret: int = 0,
+            analyze: bool = False, confirmed: bool = False) -> dict:
+    """
+    The plan of the statement at the caret (or the selection, sent as ``sql``).
+
+    ``analyze`` runs the statement to get real row counts and times. It runs on
+    a connection that is never committed, so a write is rolled back; anything a
+    statement does outside the transaction (sequences, notifications, calls
+    out) is not. A non-read statement therefore needs ``confirmed``.
+    """
+    from services.engines.base import strip_trailing_semicolon
+    from services.plans import annotate, flatten
+
+    engine, spec, profile = pool.open(user_id, conn_id, database)
+    try:
+        pieces = pick(spec, sql or "", "statement", caret)
+    except ValueError as exc:
+        raise OpError(str(exc)) from None
+    if not pieces:
+        raise OpError("Nothing to explain")
+    piece = pieces[0]
+    if analyze and not spec.can_analyze:
+        raise OpError(f"{spec.label} cannot run a statement for its actual plan; "
+                      "use Explain for the estimated one")
+    writes = first_word(piece.text) not in _READ_FIRST_WORDS
+    if analyze and writes and not confirmed:
+        return {"ok": False, "needs_confirm": True, "statement": piece.text[:300]}
+
+    started = time.monotonic()
+    with connect(user_id, conn_id, database, timeout_s=86_400) as (conn, spec, _p, _engine):
+        dbapi = conn.connection.dbapi_connection
+        try:
+            result = spec.explain(dbapi, strip_trailing_semicolon(piece.text), bool(analyze))
+        except Exception as exc:
+            raise OpError(error_text(exc)) from None
+        # The connection is rolled back when it closes: ANALYZE kept nothing.
+    annotate(result)
+    return {
+        "rows": flatten(result["plan"]), "summary": result.get("summary") or {},
+        "raw": result["raw"], "format": result["format"], "analyzed": bool(analyze),
+        "rolled_back": bool(analyze and writes), "sql": piece.text[:2000],
+        "start": piece.start, "end": piece.end, "can_analyze": spec.can_analyze,
+        "ms": int((time.monotonic() - started) * 1000),
+    }
+
+
 def _register_run(key: tuple, spec: Any, engine: Any, dbapi: Any, run_id: str) -> None:
     if run_id:
         session_id = spec.session_id(dbapi)

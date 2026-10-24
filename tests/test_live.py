@@ -435,3 +435,52 @@ def test_editing_a_profile_ends_its_transaction(user_id, profile):
     assert _status_of(user_id, conn_id, engine, 8) != "gone"
     told = sqlops.transaction(user_id, sid, "commit")
     assert not told["ok"] and "disconnected" in told["error"]
+
+
+# ---------------------------------------------------------------------------
+# Explain plans
+# ---------------------------------------------------------------------------
+
+JOIN = ("SELECT c.name, COUNT(*) AS n FROM customers c JOIN orders o ON o.customer_id = c.id "
+        "WHERE o.status = 'paid' GROUP BY c.name ORDER BY n DESC;")
+
+
+def test_explain_estimated_and_actual(user_id, profile):
+    from services import sqlops
+
+    engine, conn_id = profile
+    database, _schema = LOCATION[engine]
+    script = "SELECT 1 AS warmup;\n\n" + JOIN
+    plan = sqlops.explain(user_id, conn_id, database, script, caret=len(script) - 5)
+    assert plan["sql"].startswith("SELECT c.name") and plan["start"] > 0
+    ops = " | ".join(row["op"] + " " + row["object"] for row in plan["rows"])
+    assert "orders" in ops or " o" in ops, ops
+    assert all(row["act_rows"] is None for row in plan["rows"])
+    if engine == "sqlite":
+        with pytest.raises(sqlops.OpError, match="cannot run"):
+            sqlops.explain(user_id, conn_id, database, JOIN, analyze=True)
+        return
+    assert max(row["depth"] for row in plan["rows"]) >= 2
+    actual = sqlops.explain(user_id, conn_id, database, JOIN, analyze=True)
+    assert actual["analyzed"] and any(row["act_rows"] for row in actual["rows"])
+
+
+def test_explain_analyze_of_a_write_is_rolled_back(user_id, profile):
+    from services import sqlops
+
+    engine, conn_id = profile
+    if engine == "sqlite":
+        return
+    database, _schema = LOCATION[engine]
+    write = "UPDATE orders SET status = 'explained' WHERE id = 10"
+    asked = sqlops.explain(user_id, conn_id, database, write, analyze=True)
+    assert asked.get("needs_confirm")
+    if engine == "mysql":  # EXPLAIN ANALYZE: SELECT and multi-table UPDATE/DELETE only
+        try:
+            sqlops.explain(user_id, conn_id, database, write, analyze=True, confirmed=True)
+        except sqlops.OpError:
+            pass
+    else:
+        done = sqlops.explain(user_id, conn_id, database, write, analyze=True, confirmed=True)
+        assert done["rolled_back"]
+    assert _status_of(user_id, conn_id, engine, 10) != "explained"

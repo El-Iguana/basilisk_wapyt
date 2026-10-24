@@ -23,9 +23,10 @@ test.
   Follow-ups: a before-close hook in wapyt's TabWidget so closing a tab can ask
   instead of rolling back; a "smart commit" option (auto-commit reads, manual
   for writes).
-- **Explain plan** for the statement at the cursor, per engine (`EXPLAIN
-  (FORMAT JSON)`, `EXPLAIN FORMAT=JSON`, `SET SHOWPLAN_XML`, `EXPLAIN QUERY
-  PLAN`), drawn as a tree.
+- ~~**Explain plan**~~ — done (2026-10-24): Explain (Ctrl+Shift+E) and Analyze
+  for all four engines, one plan grid with own-cost shading, misestimate
+  warnings, node details and the raw plan. Follow-ups: a graphical plan
+  (boxes and arrows), and comparing two plans.
 - **Value viewer / editor panel** for long text, JSON (pretty) and binary
   (hex), which also lifts the "too large to edit in the grid" limit.
 - **More objects in the navigator**: functions / procedures, sequences,

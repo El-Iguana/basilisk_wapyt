@@ -115,6 +115,15 @@ class SQLite(Engine):
         # something ran in it.
         return {"open": statements > 0 and dbapi_conn.in_transaction, "failed": False}
 
+    can_analyze = False
+
+    def explain(self, dbapi_conn: Any, sql: str, analyze: bool) -> dict:
+        from services.plans import parse_sqlite
+
+        rows = dbapi_conn.execute("EXPLAIN QUERY PLAN " + sql).fetchall()
+        raw = "\n".join(f"{row[0]}\t{row[1]}\t{row[3]}" for row in rows)
+        return {**parse_sqlite(rows), "raw": "id\tparent\tdetail\n" + raw, "format": "text"}
+
     def cancel(self, engine: Any, dbapi_conn: Any, session: Any) -> None:
         dbapi_conn.interrupt()
 

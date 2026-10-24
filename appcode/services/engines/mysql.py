@@ -72,6 +72,25 @@ class MySQL(Engine):
         if database:
             dbapi_conn.select_db(database)
 
+    def explain(self, dbapi_conn: Any, sql: str, analyze: bool) -> dict:
+        from services.plans import parse_mysql_table, parse_mysql_tree
+
+        with dbapi_conn.cursor() as cur:
+            try:
+                # MySQL 8.0.18+: a tree, with real numbers under ANALYZE.
+                cur.execute(("EXPLAIN ANALYZE " if analyze else "EXPLAIN FORMAT=TREE ") + sql)
+                text = cur.fetchone()[0]
+                return {**parse_mysql_tree(text), "raw": text, "format": "text"}
+            except Exception as exc:  # noqa: BLE001 - MariaDB and old MySQL: the table form
+                if "syntax" not in str(exc).lower() and "1064" not in str(exc):
+                    raise
+            cur.execute(("ANALYZE " if analyze else "EXPLAIN ") + sql)
+            columns = [desc[0] for desc in cur.description]
+            rows = cur.fetchall()
+        raw = "\t".join(columns) + "\n" + "\n".join("\t".join("" if v is None else str(v)
+                                                              for v in row) for row in rows)
+        return {**parse_mysql_table(columns, rows), "raw": raw, "format": "text"}
+
     def session_id(self, dbapi_conn: Any) -> Any:
         return dbapi_conn.thread_id()
 

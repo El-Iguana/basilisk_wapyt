@@ -21,7 +21,7 @@ import { syntaxHighlighting, HighlightStyle, bracketMatching, indentOnInput }
 import { search, searchKeymap, highlightSelectionMatches } from "@codemirror/search";
 import { tags as t } from "@lezer/highlight";
 
-const VERSION = "1";
+const VERSION = "2";
 
 const DIALECTS = { PostgreSQL, MySQL, MSSQL, SQLite, StandardSQL };
 
@@ -119,6 +119,8 @@ function create(host, options = {}) {
     { key: "Mod-Shift-Enter", run: () => { call("onRunScript"); return true; } },
     { key: "Alt-x", run: () => { call("onRunScript"); return true; } },
     { key: "Mod-Shift-f", run: () => { call("onFormat"); return true; } },
+    // DBeaver's key for the execution plan of the statement at the caret.
+    { key: "Mod-Shift-e", run: () => { call("onExplain"); return true; }, preventDefault: true },
     { key: "Mod-s", run: () => { call("onSave"); return true; }, preventDefault: true },
   ];
 
