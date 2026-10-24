@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "basilisk"
+version = "0.1.0"
+description = "Browser-based SQL database manager — pytincture + wapyt"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.13,<3.15"
+authors = [{ name = "OldManGan", email = "eliguana@protonmail.com" }]
+dependencies = [
+    "sqlalchemy>=2.0.36",
+    "psycopg[binary]>=3.2",
+    "pymysql>=1.1",
+    "pymssql>=2.3",
+    "sqlparse>=0.5",
+    "bcrypt>=4.1.0",
+    "cryptography>=42.0.0",
+    "uvicorn[standard]>=0.30.0",
+    "argon2-cffi>=23.1.0",
+    "pytincture==1.0.0",
+    "wapyt",
+]
+
+[project.urls]
+homepage = "https://github.com/El-Iguana/basilisk_wapyt"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.uv.sources]
+# pytincture from PyPI (pinned above; keep requirements.txt in step). To work
+# on pytincture itself: pytincture = { path = "../pytincture", editable = true }
+# wapyt non-editable, as Monguana: development installs what the image ships.
+# `uv sync --reinstall-package wapyt` after changing wapyt's Python wrappers;
+# asset edits go through its scripts/dev_wheel.sh.
+wapyt = { path = "../wa_pytincture_widgetset", editable = false }
+
+[tool.setuptools]
+py-modules = ["service"]
