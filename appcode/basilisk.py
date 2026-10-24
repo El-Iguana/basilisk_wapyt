@@ -1146,7 +1146,8 @@ class Basilisk(MainWindow):
             return
         if tab["kind"] == "sql" and tab.get("manual"):
             _spawn(self._end_session(tab), "end session")
-        for key in ("grid", "cols_table", "idx_table", "fk_table", "con_table", "pager"):
+        for key in ("grid", "cols_table", "idx_table", "fk_table", "con_table", "pager",
+                    "plan_grid"):
             widget = tab.get(key)
             if widget is not None:
                 try:
@@ -2082,6 +2083,12 @@ class Basilisk(MainWindow):
             f'<select class="bk-select" data-role="database" id="{tid}-db">'
             f'<option value="{_esc(self._tabs[tid]["db"])}">{_esc(self._tabs[tid]["db"] or "(default)")}</option>'
             "</select>") if "database" in levels else ""
+        # SQLite can only estimate (EXPLAIN QUERY PLAN).
+        analyze = "" if conn.get("engine") == "sqlite" else (
+            f'<button type="button" class="bk-btn" data-bk="analyze" id="{tid}-analyze" '
+            'title="Run the statement for its actual plan: real rows and times '
+            '(a write is rolled back)"><span class="mdi mdi-timer-outline"></span>'
+            "<span>Analyze</span></button>")
         return f"""
 <div class="bk-view bk-sqltab" data-tab="{tid}">
   <div class="bk-head" id="{tid}-head"></div>
@@ -2092,6 +2099,10 @@ class Basilisk(MainWindow):
     <button type="button" class="bk-btn" data-bk="run_script" id="{tid}-script"
       title="Run the whole script (Ctrl+Shift+Enter or Alt+X)">
       <span class="mdi mdi-play-box-multiple-outline"></span><span>Script</span></button>
+    <button type="button" class="bk-btn" data-bk="explain" id="{tid}-explain"
+      title="The estimated plan of the statement at the cursor (Ctrl+Shift+E)">
+      <span class="mdi mdi-file-tree-outline"></span><span>Explain</span></button>
+    {analyze}
     <button type="button" class="bk-btn bk-danger" data-bk="cancel" id="{tid}-cancel" hidden
       title="Cancel the running statement">
       <span class="mdi mdi-stop"></span><span>Cancel</span></button>
@@ -2142,6 +2153,18 @@ class Basilisk(MainWindow):
   <div class="bk-results">
     <div class="bk-panel" id="{tid}-grid"></div>
     <pre class="bk-panel bk-msgs" id="{tid}-msgs" hidden></pre>
+    <div class="bk-panel bk-plan" id="{tid}-plan" hidden>
+      <div class="bk-plan-bar">
+        <span class="bk-seg" role="group" aria-label="Plan view">
+          <button type="button" class="bk-seg-btn" data-bk="plan_view" data-view="tree" aria-pressed="true">Plan</button>
+          <button type="button" class="bk-seg-btn" data-bk="plan_view" data-view="raw" aria-pressed="false">Raw</button></span>
+        <span class="bk-note bk-plan-summary" id="{tid}-plan-summary"></span>
+      </div>
+      <div class="bk-results">
+        <div class="bk-panel" id="{tid}-plan-grid"></div>
+        <pre class="bk-panel bk-msgs" id="{tid}-plan-raw" hidden></pre>
+      </div>
+    </div>
     <div class="bk-panel bk-empty" id="{tid}-empty">Run a statement (Ctrl+Enter) or the whole
       script (Ctrl+Shift+Enter). Ctrl+Space completes table and column names.</div>
   </div>
@@ -2183,6 +2206,7 @@ class Basilisk(MainWindow):
                     "onRun": lambda *_: _spawn(self._sql_run(tid, "statement"), "run"),
                     "onRunScript": lambda *_: _spawn(self._sql_run(tid, "script"), "run script"),
                     "onFormat": lambda *_: _spawn(self._sql_format(tid), "format"),
+                    "onExplain": lambda *_: _spawn(self._sql_explain(tid, False), "explain"),
                     "onChange": lambda *_: self._save_draft(tid),
                     "onCursor": _cursor,
                 })
@@ -2273,12 +2297,20 @@ class Basilisk(MainWindow):
             _spawn(self._history_dialog(tid), "history")
         elif action == "res":
             self._show_result(tid, int(_attr(button, "data-res") or 0))
+        elif action in ("explain", "analyze"):
+            _spawn(self._sql_explain(tid, action == "analyze"), action)
+        elif action == "plan_view":
+            self._plan_view(tid, _attr(button, "data-view"))
         elif action == "res_csv":
             self._result_csv(tid)
         elif action == "res_export":
             _spawn(self._result_export(tid), "export")
 
     def _sql_busy(self, tid: str, busy: bool) -> None:
+        for suffix in ("explain", "analyze"):
+            button = _el(f"{tid}-{suffix}")
+            if button:
+                button.disabled = busy
         for suffix, hide in (("run", busy), ("script", busy), ("cancel", not busy)):
             button = _el(f"{tid}-{suffix}")
             if button:
@@ -2501,6 +2533,156 @@ class Basilisk(MainWindow):
         _spawn(self._sql_completion(tid), "completion")
         self._save_draft(tid)
 
+    # -- explain plans ------------------------------------------------------
+
+    async def _sql_explain(self, tid: str, analyze: bool, confirmed: bool = False) -> None:
+        tab = self._tabs.get(tid)
+        if tab is None or tab["run_id"]:
+            return
+        sel = self._sql_selection(tid)
+        if sel["text"].strip():
+            sql, caret, offset = sel["text"], 0, sel["from"]
+        else:
+            sql, caret, offset = self._sql_text(tid), sel["head"], 0
+        if not sql.strip():
+            return
+        tab["run_id"] = "explain"
+        self._sql_busy(tid, True)
+        self._status(tid, "Running the statement for its actual plan…" if analyze
+                     else "Explaining…", "info")
+        try:
+            result = await SqlService().explain_async(tab["conn"], tab["db"], sql, caret,
+                                                      analyze, confirmed)
+        finally:
+            if tid in self._tabs:
+                tab["run_id"] = None
+                self._sql_busy(tid, False)
+        if tid not in self._tabs:
+            return
+        if result.get("needs_confirm"):
+            conn = self._conn(tab["conn"]) or {}
+            if await self._confirm_sql(
+                "Analyze a statement that changes data", [result.get("statement") or ""],
+                "Analyze runs the statement for real to measure it, then rolls the transaction "
+                "back. Effects outside the transaction (sequence values, triggers that call out) "
+                "are not undone.", prod=conn.get("env") == "prod", ok_text="Run and roll back"):
+                await self._sql_explain(tid, analyze, confirmed=True)
+            else:
+                self._status(tid, "Not run.", "info")
+            return
+        if not result.get("ok"):
+            self._status(tid, result.get("error", "Could not explain"))
+            if tab["editor"] is not None:
+                tab["editor"].mark(js.undefined, js.undefined)
+            return
+        self._status(tid, "")
+        result["start"] += offset
+        result["end"] += offset
+        tab["plan"] = result
+        if tab["editor"] is not None:
+            tab["editor"].mark(result["start"], result["end"], "run")
+        self._draw_restabs(tid)
+        self._render_plan(tid)
+        self._show_result(tid, -2)
+
+    def _render_plan(self, tid: str) -> None:
+        tab = self._tabs[tid]
+        plan = tab["plan"]
+        analyzed = plan["analyzed"]
+
+        def number(value, digits: int = 2) -> str:
+            if value is None:
+                return ""
+            if float(value).is_integer() and abs(value) >= 1:
+                return f"{int(value):,}"
+            return f"{value:,.{digits}f}".rstrip("0").rstrip(".") if value else "0"
+
+        rows = []
+        for i, item in enumerate(plan["rows"]):
+            depth = item["depth"]
+            indent = "\u00a0\u00a0\u00a0" * max(0, depth - 1) + ("└\u00a0" if depth else "")
+            share = item.get("share")
+            hot = "bk-hot" if share is not None and share >= 0.3 else (
+                "bk-warm" if share is not None and share >= 0.1 else "")
+            rows.append({
+                "id": f"p{i}", "op": indent + item["op"], "object": item["object"],
+                "est": number(item["est_rows"]), "act": number(item["act_rows"]),
+                "time": number(item["time_ms"], 3), "loops": number(item["loops"]),
+                "cost": number(item["cost"]), "share": "" if share is None else f"{share:.0%}",
+                "detail": item["detail"], "share_cls": hot,
+                "miss": "mdi-alert" if item.get("misestimate") else "",
+                "miss_title": "The estimate is off by 10x or more" if item.get("misestimate") else "",
+                "icon": "mdi-table" if item["object"] else "",
+            })
+        columns = [
+            ColumnConfig(id="op", header="Operation", width=300, sortable=False, icon_by="icon"),
+            ColumnConfig(id="object", header="Object", width=200, sortable=False),
+            ColumnConfig(id="est", header="Est. rows", width=95, align="right", sortable=False),
+        ]
+        if analyzed:
+            columns += [
+                ColumnConfig(id="act", header="Actual rows", width=110, align="right",
+                             sortable=False, icon_by="miss"),
+                ColumnConfig(id="loops", header="Loops", width=70, align="right", sortable=False),
+                ColumnConfig(id="time", header="Time ms", width=90, align="right", sortable=False),
+            ]
+        columns += [
+            ColumnConfig(id="cost", header="Cost", width=90, align="right", sortable=False),
+            ColumnConfig(id="share", header="Own cost %", width=95, align="right",
+                         sortable=False, cell_class_by="share_cls"),
+            ColumnConfig(id="detail", header="Details", width=420, sortable=False),
+        ]
+        if tab.get("plan_grid") is None:
+            tab["plan_grid"] = DataTable(DataTableConfig(
+                columns=columns, rows=rows, selection="single", resizable_columns=True,
+                sortable=False, empty_text="No plan",
+            ), container=_el(f"{tid}-plan-grid"))
+            tab["plan_grid"].on_activate(lambda payload: self._plan_node_dialog(tid, payload))
+        else:
+            tab["plan_grid"].set_columns(columns)
+            tab["plan_grid"].set_rows(rows)
+        _el(f"{tid}-plan-raw").textContent = plan["raw"]
+        summary = plan.get("summary") or {}
+        parts = ["Actual plan" if analyzed else "Estimated plan"]
+        if summary.get("cost") is not None:
+            parts.append(f"total cost {number(summary['cost'])}")
+        if summary.get("planning_ms") is not None:
+            parts.append(f"planning {number(summary['planning_ms'], 3)} ms")
+        if summary.get("execution_ms") is not None:
+            parts.append(f"execution {number(summary['execution_ms'], 3)} ms")
+        if plan.get("rolled_back"):
+            parts.append("the statement's changes were rolled back")
+        if summary.get("warnings"):
+            parts.append("warnings: " + ", ".join(summary["warnings"]))
+        _el(f"{tid}-plan-summary").textContent = " · ".join(parts)
+        self._plan_view(tid, tab.get("plan_view") or "tree")
+
+    def _plan_view(self, tid: str, view: str) -> None:
+        tab = self._tabs[tid]
+        tab["plan_view"] = view
+        _el(f"{tid}-plan-grid").hidden = view != "tree"
+        _el(f"{tid}-plan-raw").hidden = view != "raw"
+        for button in js.document.querySelectorAll(f'#{tid}-plan [data-bk="plan_view"]'):
+            button.setAttribute("aria-pressed", "true" if _attr(button, "data-view") == view else "false")
+
+    def _plan_node_dialog(self, tid: str, payload: dict) -> None:
+        tab = self._tabs[tid]
+        row_id = str(payload.get("id") or "p0")
+        item = tab["plan"]["rows"][int(row_id[1:])]
+        facts = [("Operation", item["op"]), ("Object", item["object"]), ("Details", item["detail"]),
+                 ("Estimated rows", item["est_rows"]), ("Actual rows", item["act_rows"]),
+                 ("Loops", item["loops"]), ("Time (ms)", item["time_ms"]),
+                 ("Cost", item["cost"]),
+                 ("Own share of the statement's cost",
+                  None if item.get("share") is None else f"{item['share']:.1%}"),
+                 *[(key, value) for key, value in item.get("extra") or []]]
+        modal = ModalWindow(ModalConfig(dispose_on_close=True, title=item["op"], width=620,
+                                        height=480))
+        modal.body.innerHTML = '<table class="bk-kv">' + "".join(
+            f"<tr><th>{_esc(key)}</th><td>{_esc(value)}</td></tr>"
+            for key, value in facts if value not in (None, "")) + "</table>"
+        modal.show()
+
     async def _sql_cancel(self, tid: str) -> None:
         tab = self._tabs.get(tid)
         if not tab or not tab["run_id"]:
@@ -2562,20 +2744,33 @@ class Basilisk(MainWindow):
                     tab["editor"].mark(error["start"], error["end"], "error")
             elif entries:
                 tab["editor"].mark(entries[0]["start"], entries[-1]["end"], "run")
+        tab["msg_error"] = error is not None
+        tab["ran"] = True
+        self._draw_restabs(tid)
+        if error is not None or not tab["results"]:
+            self._show_result(tid, -1)
+        else:
+            self._show_result(tid, len(tab["results"]) - 1 if len(tab["results"]) == 1 else 0)
+
+    def _draw_restabs(self, tid: str) -> None:
+        """Result N, Messages (when something ran) and Plan (when explained)."""
+        tab = self._tabs[tid]
         buttons = "".join(
             f'<button type="button" class="bk-restab" data-bk="res" data-res="{i}" role="tab">'
             f'<span class="mdi mdi-table"></span>Result {i + 1}'
             f'<small>{_count(entry["rowcount"])}{"+" if entry.get("more") else ""}</small></button>'
             for i, entry in enumerate(tab["results"]))
-        buttons += ('<button type="button" class="bk-restab" data-bk="res" data-res="-1" role="tab"'
-                    f'{" data-error" if error else ""}>'
-                    '<span class="mdi mdi-message-text-outline"></span>Messages</button>')
+        if tab.get("ran"):
+            buttons += ('<button type="button" class="bk-restab" data-bk="res" data-res="-1" role="tab"'
+                        f'{" data-error" if tab.get("msg_error") else ""}>'
+                        '<span class="mdi mdi-message-text-outline"></span>Messages</button>')
+        plan = tab.get("plan")
+        if plan:
+            buttons += ('<button type="button" class="bk-restab" data-bk="res" data-res="-2" role="tab">'
+                        '<span class="mdi mdi-file-tree-outline"></span>'
+                        f'{"Actual plan" if plan["analyzed"] else "Plan"}</button>')
         _el(f"{tid}-restabs").innerHTML = buttons
         _el(f"{tid}-empty").hidden = True
-        if error is not None or not tab["results"]:
-            self._show_result(tid, -1)
-        else:
-            self._show_result(tid, len(tab["results"]) - 1 if len(tab["results"]) == 1 else 0)
 
     def _show_result(self, tid: str, index: int) -> None:
         tab = self._tabs[tid]
@@ -2586,7 +2781,8 @@ class Basilisk(MainWindow):
         grid_host, msgs = _el(f"{tid}-grid"), _el(f"{tid}-msgs")
         showing_rows = 0 <= index < len(tab["results"])
         grid_host.hidden = not showing_rows
-        msgs.hidden = showing_rows
+        msgs.hidden = index != -1
+        _el(f"{tid}-plan").hidden = index != -2
         _el(f"{tid}-res-csv").hidden = not showing_rows
         _el(f"{tid}-res-export").hidden = not showing_rows
         summary = _el(f"{tid}-summary")
@@ -3045,6 +3241,7 @@ class Basilisk(MainWindow):
             ("Ctrl+Shift+Enter, Alt+X", "Run the whole script"),
             ("Ctrl+Space", "Complete keywords, tables and columns"),
             ("Ctrl+Shift+F", "Format the script (or the selection)"),
+            ("Ctrl+Shift+E", "Explain: the plan of the statement at the cursor"),
             ("Ctrl+F", "Find and replace in the editor"),
             ("Ctrl+]", "New SQL editor"),
             ("Enter", "Apply the WHERE / ORDER BY of a table"),
@@ -3189,6 +3386,13 @@ _CSS = """
 .bk-txn[data-state="open"]::before{content:"● ";color:#f59e0b;}
 .bk-txn[data-state="failed"]{background:#450a0a;border-color:#b91c1c;color:#fecaca;}
 .bk-pre-line{white-space:pre-line;}
+.bk-plan{display:flex;flex-direction:column;}
+.bk-plan-bar{display:flex;align-items:center;gap:8px;padding:5px 8px;flex:0 0 auto;
+  border-bottom:1px solid var(--bk-line);background:var(--bk-bg);}
+.bk-plan-bar .bk-seg{margin:0;}
+.bk-plan-summary{white-space:normal;}
+td.bk-hot{background:rgba(239,68,68,.22) !important;color:#fecaca;font-weight:600;}
+td.bk-warm{background:rgba(245,158,11,.16) !important;color:#fde68a;}
 .bk-msgs{margin:0;padding:10px 14px;overflow:auto;background:var(--bk-deep);color:#e2e8f0;
   font:12.5px/1.55 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;}
 .bk-empty{display:flex;align-items:center;justify-content:center;text-align:center;padding:24px;

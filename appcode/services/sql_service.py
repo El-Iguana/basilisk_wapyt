@@ -92,6 +92,12 @@ class SqlService:
                           int(caret or 0), int(max_rows or 500), run_id or "", bool(confirmed),
                           session or "")
 
+    def explain(self, conn_id: int, database: str, sql: str, caret: int = 0,
+                analyze: bool = False, confirmed: bool = False) -> dict:
+        """The plan of the statement at the caret; ``analyze`` runs it (rolled back)."""
+        return self._call("explain", int(conn_id), database or "", sql or "", int(caret or 0),
+                          bool(analyze), bool(confirmed))
+
     def transaction(self, session: str, action: str) -> dict:
         """Manual commit mode: ``commit``, ``rollback``, ``end`` or ``state``."""
         return self._call("transaction", session or "", action or "")

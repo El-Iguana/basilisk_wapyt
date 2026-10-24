@@ -73,6 +73,20 @@ class PostgreSQL(Engine):
         return {"open": status in (TransactionStatus.INTRANS, TransactionStatus.INERROR),
                 "failed": status == TransactionStatus.INERROR}
 
+    def explain(self, dbapi_conn: Any, sql: str, analyze: bool) -> dict:
+        import json
+
+        from services.plans import parse_postgresql
+
+        options = "FORMAT JSON, ANALYZE, BUFFERS" if analyze else "FORMAT JSON"
+        with dbapi_conn.cursor() as cur:
+            cur.execute(f"EXPLAIN ({options}) {sql}")
+            document = cur.fetchone()[0]
+        if isinstance(document, str):
+            document = json.loads(document)
+        return {**parse_postgresql(document), "raw": json.dumps(document, indent=2),
+                "format": "json"}
+
     def session_id(self, dbapi_conn: Any) -> Any:
         return None  # psycopg cancels on the connection object itself
 

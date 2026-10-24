@@ -137,6 +137,14 @@ class Engine:
         """``{"open", "failed"}``; by default open once anything ran."""
         return {"open": statements > 0, "failed": False}
 
+    # Explain plans (sqlops.explain). ``analyze`` runs the statement for real
+    # numbers; sqlops runs it in a transaction it rolls back.
+    can_analyze = True
+
+    def explain(self, dbapi_conn: Any, sql: str, analyze: bool) -> dict:
+        """``{"plan", "summary", "raw", "format"}`` (services.plans shapes)."""
+        raise EngineError(f"{self.label} plans are not supported yet")
+
     def use_database(self, dbapi_conn: Any, database: Optional[str]) -> None:
         """Make ``database`` current on a connection shared by several (MySQL)."""
 

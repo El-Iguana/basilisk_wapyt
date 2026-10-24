@@ -235,6 +235,7 @@ def sql_checks(page: Page, engine: str) -> None:
     check(time.monotonic() - started < 10, f"{engine}: Cancel stops a slow statement")
 
     manual_commit_checks(page, engine, tab)
+    explain_checks(page, engine, tab)
 
     page.click(f'{tab} [data-bk="history"]')
     page.wait_for_selector(f"{modal(page)} tbody tr", timeout=10000)
@@ -287,6 +288,31 @@ def manual_commit_checks(page: Page, engine: str, tab: str) -> None:
     time.sleep(0.5)
     check(not page.is_visible(f'{tab} [data-bk="commit"]'),
           f"{engine}: back in auto-commit after committing")
+
+
+def explain_checks(page: Page, engine: str, tab: str) -> None:
+    """Explain (Ctrl+Shift+E) and Analyze the statement at the cursor."""
+    page.click(f"{tab} .cm-content")
+    page.keyboard.press("Control+a")
+    page.keyboard.insert_text("SELECT 1 AS one;\n\nSELECT c.name, COUNT(*) AS n FROM customers c "
+                              "JOIN orders o ON o.customer_id = c.id GROUP BY c.name;")
+    page.keyboard.press("Control+End")
+    page.keyboard.press("Control+Shift+E")
+    ok = wait_text(page, f"{tab} .bk-res-tabs", "Plan", 20000)
+    check(ok, f"{engine}: Ctrl+Shift+E shows the plan")
+    ops = page.locator(f'{tab} [id$="-plan-grid"] tbody td[data-column-id="op"]').all_inner_texts()
+    check(len(ops) >= 2, f"{engine}: plan has nodes ({len(ops)})")
+    shot(page, f"smoke-{engine}-6-plan")
+    page.click(f'{tab} [data-bk="plan_view"][data-view="raw"]')
+    raw = page.inner_text(f'{tab} [id$="-plan-raw"]')
+    check(len(raw) > 20, f"{engine}: raw plan")
+    page.click(f'{tab} [data-bk="plan_view"][data-view="tree"]')
+    if engine != "sqlite":
+        page.click(f'{tab} [data-bk="analyze"]')
+        ok = wait_text(page, f"{tab} .bk-res-tabs", "Actual plan", 30000)
+        headers = page.locator(f'{tab} [id$="-plan-grid"] thead').inner_text() if ok else ""
+        check(ok and "Actual rows" in headers, f"{engine}: Analyze shows actual rows")
+        shot(page, f"smoke-{engine}-7-analyze")
 
 
 def page_grid(tab: str) -> str:

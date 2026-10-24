@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
-from services.engines.base import Engine, Field, Piece, _only_comments
+from services.engines.base import Engine, EngineError, Field, Piece, _only_comments
 
 ENCRYPTION = (
     ("request", "request (TLS when offered)"),
@@ -78,6 +78,32 @@ class SQLServer(Engine):
             return {"open": int(cur.fetchone()[0]) > 0, "failed": False}
         finally:
             cur.close()
+
+    def explain(self, dbapi_conn: Any, sql: str, analyze: bool) -> dict:
+        from services.plans import parse_mssql
+
+        option = "STATISTICS XML" if analyze else "SHOWPLAN_XML"
+        cur = dbapi_conn.cursor()
+        try:
+            # Each SET must be a batch of its own; pymssql sends one per execute.
+            cur.execute(f"SET {option} ON")
+            try:
+                cur.execute(sql)
+                xml_text = None
+                while True:
+                    if cur.description and str(cur.description[0][0]).endswith("Showplan"):
+                        xml_text = cur.fetchone()[0]
+                    elif cur.description:
+                        cur.fetchall()          # the statement's own rows, under ANALYZE
+                    if not cur.nextset():
+                        break
+            finally:
+                cur.execute(f"SET {option} OFF")
+        finally:
+            cur.close()
+        if not xml_text:
+            raise EngineError("SQL Server returned no plan for this statement")
+        return {**parse_mssql(xml_text), "raw": xml_text, "format": "xml"}
 
     def session_id(self, dbapi_conn: Any) -> Any:
         cur = dbapi_conn.cursor()
