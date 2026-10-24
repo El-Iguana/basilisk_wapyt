@@ -334,7 +334,8 @@ class Basilisk(MainWindow):
         return ToolbarConfig(items=items, label="Basilisk")
 
     def _on_before_unload(self, event) -> None:
-        if any(tab.get("pending") for tab in self._tabs.values()):
+        if any(tab.get("pending") or (tab.get("txn") or {}).get("open")
+               for tab in self._tabs.values()):
             event.preventDefault()
             event.returnValue = ""
 
@@ -376,10 +377,7 @@ class Basilisk(MainWindow):
         tab = self._tabs[tid]
         if tab["kind"] == "sql":
             if role == "database":
-                tab["db"] = str(target.value)
-                self._sql_header(tid)
-                _spawn(self._sql_completion(tid), "completion")
-                self._save_draft(tid)
+                _spawn(self._sql_switch_db(tid, str(target.value), target), "database")
             elif role == "max_rows":
                 tab["max_rows"] = int(target.value)
 
@@ -1146,6 +1144,8 @@ class Basilisk(MainWindow):
         tab = self._tabs.pop(tid, None)
         if tab is None:
             return
+        if tab["kind"] == "sql" and tab.get("manual"):
+            _spawn(self._end_session(tab), "end session")
         for key in ("grid", "cols_table", "idx_table", "fk_table", "con_table", "pager"):
             widget = tab.get(key)
             if widget is not None:
@@ -2050,6 +2050,10 @@ class Basilisk(MainWindow):
             "name": title, "engine": conn.get("engine") or "", "editor": None,
             "results": [], "shown": None, "run_id": None, "max_rows": 500,
             "grid": None, "fallback": None, "draft_timer": None, "restore_draft": not text,
+            # Manual commit mode: the tab's server session (sessions.py) and
+            # the last transaction state it reported.
+            "manual": bool(self._settings.get("manual_commit")) and not conn.get("read_only"),
+            "sid": f"{tid}-{int(js.Date.now())}", "txn": None,
         }
         self._tabs[tid] = tab
         container.innerHTML = self._sql_html(tid, conn)
@@ -2065,6 +2069,7 @@ class Basilisk(MainWindow):
         bottom.innerHTML = self._results_html(tid)
         self.tabs.set_active(tid)
         self._sql_header(tid)
+        self._sql_mode_ui(tid)
         _spawn(self._sql_setup(tid, text), "sql editor")
         return tid
 
@@ -2094,6 +2099,8 @@ class Basilisk(MainWindow):
     {db_select}
     <select class="bk-select" data-role="max_rows" title="Rows fetched per result">{rows}</select>
     <span class="bk-bar-sep"></span>
+    {self._txn_controls(tid, conn)}
+    <span class="bk-bar-sep"></span>
     <button type="button" class="bk-btn" data-bk="format" title="Format (Ctrl+Shift+F)">
       <span class="mdi mdi-format-align-left"></span><span>Format</span></button>
     <button type="button" class="bk-btn" data-bk="history" title="Statements run before">
@@ -2103,6 +2110,21 @@ class Basilisk(MainWindow):
   </div>
   <div class="bk-split" id="{tid}-split"></div>
 </div>"""
+
+    def _txn_controls(self, tid: str, conn: dict) -> str:
+        if conn.get("read_only"):
+            return ('<span class="bk-note" title="Every transaction on a read-only connection '
+                    'is rolled back"><span class="mdi mdi-lock"></span> read-only</span>')
+        return f"""<span class="bk-seg" role="group" aria-label="Commit mode">
+      <button type="button" class="bk-seg-btn" data-bk="mode" data-mode="auto"
+        title="Each statement is committed as it runs">Auto-commit</button>
+      <button type="button" class="bk-seg-btn" data-bk="mode" data-mode="manual"
+        title="Statements run in a transaction you commit or roll back">Manual</button></span>
+    <button type="button" class="bk-btn bk-commit" data-bk="commit" id="{tid}-commit" hidden
+      title="Commit the open transaction"><span class="mdi mdi-check-all"></span><span>Commit</span></button>
+    <button type="button" class="bk-btn" data-bk="rollback" id="{tid}-rollback" hidden
+      title="Roll back the open transaction"><span class="mdi mdi-undo-variant"></span><span>Rollback</span></button>
+    <span class="bk-txn" id="{tid}-txn" hidden></span>"""
 
     def _results_html(self, tid: str) -> str:
         return f"""
@@ -2235,7 +2257,11 @@ class Basilisk(MainWindow):
         return {"from": start, "to": end, "text": str(area.value)[start:end], "head": end}
 
     def _sql_action(self, tid: str, action: str, button) -> None:
-        if action == "run":
+        if action == "mode":
+            _spawn(self._sql_set_mode(tid, _attr(button, "data-mode") == "manual"), "commit mode")
+        elif action in ("commit", "rollback"):
+            _spawn(self._sql_finish(tid, action), action)
+        elif action == "run":
             _spawn(self._sql_run(tid, "statement"), "run")
         elif action == "run_script":
             _spawn(self._sql_run(tid, "script"), "run script")
@@ -2280,7 +2306,8 @@ class Basilisk(MainWindow):
             tab["editor"].mark(js.undefined, js.undefined)
         try:
             result = await SqlService().execute_async(
-                tab["conn"], tab["db"], sql, mode, caret, tab["max_rows"], run_id, confirmed)
+                tab["conn"], tab["db"], sql, mode, caret, tab["max_rows"], run_id, confirmed,
+                tab["sid"] if tab["manual"] else "")
         finally:
             if tid in self._tabs:
                 tab["run_id"] = None
@@ -2297,9 +2324,17 @@ class Basilisk(MainWindow):
             else:
                 self._status(tid, "Not run.", "info")
             return
+        if result.get("session_lost"):
+            # The transaction ended behind the tab's back (idle, disconnected).
+            self._sql_txn(tid, None)
+            self._status(tid, result["error"], "info")
+            self._toast(result["error"], kind="warning")
+            return
         if not result.get("results") and result.get("error"):
             self._status(tid, result["error"])
             return
+        if tab["manual"]:
+            self._sql_txn(tid, result.get("txn"))
         self._status(tid, "")
         for entry in result["results"]:
             entry["start"] += offset
@@ -2307,6 +2342,164 @@ class Basilisk(MainWindow):
             if entry.get("error_at") is not None:
                 entry["error_at"] += offset
         self._render_results(tid, result)
+
+    # -- manual commit mode ------------------------------------------------
+
+    def _sql_mode_ui(self, tid: str) -> None:
+        tab = self._tabs[tid]
+        root = js.document.querySelector(f'.bk-sqltab[data-tab="{tid}"]')
+        if not root:
+            return
+        for button in root.querySelectorAll('[data-bk="mode"]'):
+            on = (_attr(button, "data-mode") == "manual") == tab["manual"]
+            button.setAttribute("aria-pressed", "true" if on else "false")
+        for suffix in ("commit", "rollback", "txn"):
+            element = _el(f"{tid}-{suffix}")
+            if element:
+                element.hidden = not tab["manual"]
+        self._sql_txn(tid, tab["txn"])
+
+    def _sql_txn(self, tid: str, state: dict | None) -> None:
+        """Draw the transaction indicator, the buttons and the tab badge."""
+        tab = self._tabs.get(tid)
+        if tab is None:
+            return
+        tab["txn"] = state
+        chip = _el(f"{tid}-txn")
+        open_ = bool(state and state.get("open"))
+        failed = bool(state and state.get("failed"))
+        commit, rollback = _el(f"{tid}-commit"), _el(f"{tid}-rollback")
+        if commit:
+            commit.disabled = not open_ or failed
+            rollback.disabled = not open_
+            commit.classList.toggle("bk-primary", open_ and not failed)
+        if chip:
+            minutes = int((state or {}).get("idle_limit", 600)) // 60
+            if failed:
+                chip.textContent = "Transaction failed: roll back"
+                chip.setAttribute("data-state", "failed")
+            elif open_:
+                count = state.get("statements", 0)
+                chip.textContent = f"Transaction · {count} statement{'s' if count != 1 else ''}"
+                chip.setAttribute("data-state", "open")
+            else:
+                chip.textContent = "No open transaction"
+                chip.setAttribute("data-state", "idle")
+            chip.title = (f"Manual commit mode. An open transaction holds locks on the server; "
+                          f"it is rolled back after {minutes} minutes without activity.")
+        if tab["manual"]:
+            self.tabs.set_badge(tid, "TX" if open_ else None)
+        else:
+            self.tabs.set_badge(tid, None)
+
+    async def _choose(self, title: str, text: str, choices: list) -> str | None:
+        """A small dialog of buttons: ``[(id, label, style)]``; None if dismissed."""
+        loop = asyncio.get_event_loop()
+        answer = loop.create_future()
+        modal = ModalWindow(ModalConfig(dispose_on_close=True, title=title, width=500, height=230))
+        modal.body.innerHTML = (
+            '<div class="bk-dialog"><div class="bk-hint bk-pre-line">' + _esc(text) + "</div>"
+            '<div class="bk-actions">' + "".join(
+                f'<button type="button" class="bk-btn {style}" data-choice="{key}">{_esc(label)}</button>'
+                for key, label, style in choices) + "</div></div>")
+
+        def _on_click(event) -> None:
+            which = event.target.closest("[data-choice]")
+            if which and not answer.done():
+                answer.set_result(_attr(which, "data-choice"))
+                modal.close()
+
+        def _on_close(_payload) -> None:
+            if not answer.done():
+                answer.set_result(None)
+
+        proxy = create_proxy(_on_click)
+        self._proxies.append(proxy)
+        modal.body.addEventListener("click", proxy)
+        modal.on_close(_on_close)
+        modal.show()
+        return await answer
+
+    async def _settle_txn(self, tid: str, why: str) -> bool:
+        """With a transaction open, ask to commit or roll back first. False = cancelled."""
+        tab = self._tabs[tid]
+        txn = tab.get("txn") or {}
+        if not tab["manual"] or not txn.get("open"):
+            return True
+        count = txn.get("statements", 0)
+        choices = [("rollback", "Roll back", "bk-danger"), ("cancel", "Cancel", "")]
+        if not txn.get("failed"):
+            choices.insert(0, ("commit", "Commit", "bk-primary"))
+        choice = await self._choose(
+            "Open transaction",
+            f"{count} statement{'s' if count != 1 else ''} in this editor "
+            f"{'are' if count != 1 else 'is'} not committed yet.\n\n{why}", choices)
+        if choice in ("commit", "rollback"):
+            return await self._sql_finish(tid, choice)
+        return False
+
+    async def _sql_set_mode(self, tid: str, manual: bool) -> None:
+        tab = self._tabs.get(tid)
+        if tab is None or tab["manual"] == manual or tab["run_id"]:
+            return
+        if not manual:
+            if not await self._settle_txn(tid, "Commit or roll back before switching to auto-commit."):
+                return
+            await self._end_session(tab)
+        tab["manual"] = manual
+        tab["txn"] = None
+        self._sql_mode_ui(tid)
+        self._settings["manual_commit"] = manual
+        _spawn(UiStateService().set_async("settings", self._settings), "settings")
+        self._toast("Manual commit: statements wait for Commit." if manual
+                    else "Auto-commit: each statement is committed as it runs.")
+
+    async def _sql_finish(self, tid: str, action: str) -> bool:
+        tab = self._tabs.get(tid)
+        if tab is None:
+            return False
+        conn = self._conn(tab["conn"]) or {}
+        if action == "commit" and conn.get("env") == "prod":
+            count = (tab.get("txn") or {}).get("statements", 0)
+            if not await message.confirm(
+                f"Commit {count} statement{'s' if count != 1 else ''} on the production "
+                f"connection “{conn.get('name')}”?", title="Commit on production",
+                ok_text="Commit", danger=True):
+                return False
+        result = await SqlService().transaction_async(tab["sid"], action)
+        if not result.get("ok"):
+            self._toast(result.get("error", f"Could not {action}"), kind="error")
+            if "already" in str(result.get("error", "")) or "rolled back" in str(result.get("error", "")):
+                self._sql_txn(tid, None)
+            return False
+        state = result.get("txn") or {}
+        self._sql_txn(tid, state)
+        done = state.get("done") or 0
+        if state.get("nothing") or not state.get("was_open", True):
+            self._toast("There was no open transaction.")
+        elif action == "commit":
+            self._toast(f"Committed {done} statement{'s' if done != 1 else ''}.", kind="success")
+        else:
+            self._toast(f"Rolled back {done} statement{'s' if done != 1 else ''}.", kind="warning")
+        return True
+
+    async def _end_session(self, tab: dict) -> None:
+        result = await SqlService().transaction_async(tab["sid"], "end")
+        if result.get("ok") and result.get("rolled_back"):
+            self._toast(f"{tab['name']}: rolled back {result['rolled_back']} uncommitted "
+                        f"statement{'s' if result['rolled_back'] != 1 else ''}.", kind="warning")
+
+    async def _sql_switch_db(self, tid: str, db: str, select) -> None:
+        tab = self._tabs[tid]
+        if db == tab["db"]:
+            return
+        if not await self._settle_txn(tid, "Commit or roll back before switching database."):
+            select.value = tab["db"]
+            return
+        tab["db"] = db
+        self._sql_header(tid)
+        _spawn(self._sql_completion(tid), "completion")
+        self._save_draft(tid)
 
     async def _sql_cancel(self, tid: str) -> None:
         tab = self._tabs.get(tid)
@@ -2349,6 +2542,13 @@ class Basilisk(MainWindow):
                              + (f"{_count(affected)} rows affected" if affected is not None else "done"))
         if result.get("rolled_back"):
             lines.append("\nRead-only connection: the transaction was rolled back.")
+        txn = result.get("txn") or {}
+        if txn.get("lost"):
+            lines.append("\nThe cancelled statement ended the database session; "
+                         "the transaction was rolled back.")
+        elif txn.get("open"):
+            lines.append(f"\nIn a transaction: {txn['statements']} statement"
+                         f"{'s' if txn['statements'] != 1 else ''} not committed yet.")
         lines.append(f"\nTotal {result.get('ms', 0)} ms")
         _el(f"{tid}-msgs").textContent = "\n".join(lines)
         error = next((entry for entry in entries if entry.get("error")), None)
@@ -2981,6 +3181,14 @@ _CSS = """
 .bk-restab:hover{background:var(--bk-line);}
 .bk-restab[aria-selected="true"]{background:var(--bk-panel);border-color:var(--bk-line-2);color:var(--bk-accent);}
 .bk-restab[data-error]{color:#fca5a5;}
+.bk-commit.bk-primary{background:#15803d;border-color:#22c55e;color:#f0fdf4;}
+.bk-commit.bk-primary:hover:not(:disabled){background:#166534;}
+.bk-txn{padding:2px 9px;border-radius:999px;font:600 11.5px system-ui,sans-serif;white-space:nowrap;
+  border:1px solid var(--bk-line-2);color:var(--bk-dim);}
+.bk-txn[data-state="open"]{background:#3b2506;border-color:#b45309;color:#fde68a;}
+.bk-txn[data-state="open"]::before{content:"● ";color:#f59e0b;}
+.bk-txn[data-state="failed"]{background:#450a0a;border-color:#b91c1c;color:#fecaca;}
+.bk-pre-line{white-space:pre-line;}
 .bk-msgs{margin:0;padding:10px 14px;overflow:auto;background:var(--bk-deep);color:#e2e8f0;
   font:12.5px/1.55 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;}
 .bk-empty{display:flex;align-items:center;justify-content:center;text-align:center;padding:24px;

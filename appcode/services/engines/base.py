@@ -120,6 +120,23 @@ class Engine:
     def set_autocommit(self, dbapi_conn: Any, on: bool) -> None:  # pragma: no cover - abstract
         raise NotImplementedError
 
+    # Manual commit mode (sessions.py): a pinned connection with a transaction
+    # the person commits or rolls back. ``savepoints`` wraps each statement so
+    # an error undoes only that statement (PostgreSQL aborts the whole
+    # transaction otherwise).
+    savepoints = False
+
+    def begin_manual(self, dbapi_conn: Any) -> None:
+        self.set_autocommit(dbapi_conn, False)
+
+    def end_manual(self, dbapi_conn: Any) -> None:
+        """Back to the state the pool hands out: rolled back, not auto-commit."""
+        dbapi_conn.rollback()
+
+    def transaction_state(self, dbapi_conn: Any, statements: int) -> dict:
+        """``{"open", "failed"}``; by default open once anything ran."""
+        return {"open": statements > 0, "failed": False}
+
     def use_database(self, dbapi_conn: Any, database: Optional[str]) -> None:
         """Make ``database`` current on a connection shared by several (MySQL)."""
 

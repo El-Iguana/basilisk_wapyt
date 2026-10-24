@@ -16,10 +16,13 @@ test.
 
 ## Milestone 2: DBeaver parity, the everyday parts
 
-- **Manual commit mode** in the SQL editor: a pinned connection per tab with
-  Commit / Rollback buttons and a pending-transaction indicator (idle
-  rollback after N minutes). Needs a connection registry in `sqlops` keyed by
-  tab, like the run registry.
+- ~~**Manual commit mode**~~ — done (2026-10-24): Auto-commit | Manual switch,
+  pinned connection per tab, Commit / Rollback, transaction indicator and tab
+  badge, PostgreSQL savepoints per statement, idle rollback after 10 minutes,
+  prompts before leaving the mode or switching database with work pending.
+  Follow-ups: a before-close hook in wapyt's TabWidget so closing a tab can ask
+  instead of rolling back; a "smart commit" option (auto-commit reads, manual
+  for writes).
 - **Explain plan** for the statement at the cursor, per engine (`EXPLAIN
   (FORMAT JSON)`, `EXPLAIN FORMAT=JSON`, `SET SHOWPLAN_XML`, `EXPLAIN QUERY
   PLAN`), drawn as a tree.

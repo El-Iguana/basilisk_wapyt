@@ -168,8 +168,10 @@ class ConnectionService:
                 )
                 new_id = cursor.lastrowid
 
+        from services import sessions
         from services.engine_pool import pool
 
+        sessions.end_for_conn(self._user_id, new_id, "rolled back: the connection was edited")
         pool.close(self._user_id, new_id)
         return {"ok": True, "id": new_id}
 
@@ -185,8 +187,10 @@ class ConnectionService:
                          (self._user_id, int(conn_id)))
         if cursor.rowcount == 0:
             return {"ok": False, "error": "Connection not found"}
+        from services import sessions
         from services.engine_pool import pool
 
+        sessions.end_for_conn(self._user_id, int(conn_id), "rolled back: the connection was deleted")
         pool.close(self._user_id, int(conn_id))
         return {"ok": True}
 
@@ -266,8 +270,10 @@ class ConnectionService:
         return {"ok": True, "version": version, "ms": int((time.monotonic() - started) * 1000)}
 
     def disconnect(self, conn_id: int) -> dict:
+        from services import sessions
         from services.engine_pool import pool
 
+        sessions.end_for_conn(self._user_id, int(conn_id), "rolled back: you disconnected")
         pool.close(self._user_id, int(conn_id))
         return {"ok": True}
 

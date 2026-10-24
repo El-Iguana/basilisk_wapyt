@@ -147,8 +147,10 @@ class UserService:
             conn.execute("DELETE FROM users WHERE id = ?", (target,))
 
         # Their pooled clients hold open sockets to their servers.
+        from services import sessions
         from services.engine_pool import pool
 
+        sessions.end_user(target)
         pool.close_user(target)
         return {"ok": True}
 

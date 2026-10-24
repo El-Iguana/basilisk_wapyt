@@ -234,12 +234,59 @@ def sql_checks(page: Page, engine: str) -> None:
     page.wait_for_selector(f'{tab} [data-bk="run"]:visible', timeout=20000)
     check(time.monotonic() - started < 10, f"{engine}: Cancel stops a slow statement")
 
+    manual_commit_checks(page, engine, tab)
+
     page.click(f'{tab} [data-bk="history"]')
     page.wait_for_selector(f"{modal(page)} tbody tr", timeout=10000)
     rows = page.locator(f"{modal(page)} tbody tr").count()
     check(rows >= 3, f"{engine}: history lists the runs ({rows})")
     page.keyboard.press("Escape")
     page.wait_for_selector(".wapyt-modal", state="detached", timeout=5000)
+
+
+def run_sql(page: Page, tab: str, sql: str) -> None:
+    page.click(f"{tab} .cm-content")
+    page.keyboard.press("Control+a")
+    page.keyboard.insert_text(sql)
+    page.keyboard.press("Control+Enter")
+    page.wait_for_selector(f'{tab} [data-bk="run"]:visible', timeout=20000)
+    time.sleep(0.4)
+
+
+def manual_commit_checks(page: Page, engine: str, tab: str) -> None:
+    """Manual mode: an UPDATE waits in a transaction; Rollback undoes it;
+    leaving manual mode with work pending asks, and Commit keeps it."""
+    page.click(f'{tab} [data-bk="mode"][data-mode="manual"]')
+    try:
+        page.wait_for_selector(f'{tab} [data-bk="commit"]:visible', timeout=5000)
+        shown = True
+    except Exception:  # noqa: BLE001
+        shown = False
+    check(shown, f"{engine}: manual mode shows Commit")
+    run_sql(page, tab, "UPDATE orders SET status = 'held' WHERE id = 9")
+    ok = wait_text(page, f"{tab} .bk-txn", "Transaction · 1 statement", 10000)
+    check(ok, f"{engine}: indicator shows the open transaction")
+    check(page.locator('.wapyt-tab-badge:text-is("TX")').count() == 1,
+          f"{engine}: the tab is badged TX")
+    shot(page, f"smoke-{engine}-5-manual")
+    page.click(f'{tab} [data-bk="rollback"]')
+    ok = wait_text(page, f"{tab} .bk-txn", "No open transaction", 10000)
+    check(ok, f"{engine}: Rollback closes the transaction")
+    run_sql(page, tab, "SELECT status FROM orders WHERE id = 9")
+    after = page.locator(f'{page_grid(tab)} tbody td[data-column-id="c0"]').all_inner_texts()
+    # In manual mode the SELECT opened a new transaction; roll it back too.
+    check(after and after[0] != "held", f"{engine}: rolled-back change is gone ({after})")
+    page.click(f'{tab} [data-bk="rollback"]')
+    time.sleep(0.5)
+
+    run_sql(page, tab, "UPDATE orders SET status = status WHERE id = 9")
+    page.click(f'{tab} [data-bk="mode"][data-mode="auto"]')
+    page.wait_for_selector(f'{modal(page)} [data-choice="commit"]', timeout=10000)
+    page.click(f'{modal(page)} [data-choice="commit"]')
+    page.wait_for_selector(".wapyt-modal", state="detached", timeout=10000)
+    time.sleep(0.5)
+    check(not page.is_visible(f'{tab} [data-bk="commit"]'),
+          f"{engine}: back in auto-commit after committing")
 
 
 def page_grid(tab: str) -> str:

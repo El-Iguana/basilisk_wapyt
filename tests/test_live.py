@@ -327,3 +327,111 @@ def test_json_cell_edit_saves_an_object(user_id, profile):
     import json
 
     assert json.loads(shown) == {"mist": True, "ml": 500}, shown  # an object, not a string
+
+
+# ---------------------------------------------------------------------------
+# Manual commit mode (sessions.py)
+# ---------------------------------------------------------------------------
+
+def _status_of(user_id, conn_id, engine, order_id):
+    from services import sqlops
+
+    database, schema = LOCATION[engine]
+    page = sqlops.browse(user_id, conn_id, database, schema, "orders", where=f"id = {order_id}",
+                         pk=["id"])
+    return dict(zip(page["columns"], page["rows"][0]))["status"]
+
+
+def test_manual_commit_rollback_and_commit(user_id, profile):
+    from services import sqlops
+
+    engine, conn_id = profile
+    database, _schema = LOCATION[engine]
+    sid = f"t-{engine}-1"
+    before = _status_of(user_id, conn_id, engine, 5)
+    out = sqlops.execute(user_id, conn_id, database,
+                         "UPDATE orders SET status = 'manual' WHERE id = 5", session=sid)
+    assert out["ok"] and out["txn"]["open"] and out["txn"]["statements"] == 1, out
+    # The same session sees its own change.
+    seen = sqlops.execute(user_id, conn_id, database, "SELECT status FROM orders WHERE id = 5",
+                          session=sid)
+    assert seen["results"][0]["rows"] == [["manual"]]
+    if engine in ("postgresql", "mysql"):  # others would block on the row lock
+        assert _status_of(user_id, conn_id, engine, 5) == before  # not visible outside
+    rolled = sqlops.transaction(user_id, sid, "rollback")
+    assert rolled["ok"] and not rolled["txn"]["open"] and rolled["txn"]["done"] == 2
+    assert _status_of(user_id, conn_id, engine, 5) == before
+
+    sqlops.execute(user_id, conn_id, database,
+                   "UPDATE orders SET status = 'kept' WHERE id = 5", session=sid)
+    assert sqlops.transaction(user_id, sid, "commit")["ok"]
+    assert _status_of(user_id, conn_id, engine, 5) == "kept"
+    sqlops.execute(user_id, conn_id, database,
+                   f"UPDATE orders SET status = '{before}' WHERE id = 5", session=sid)
+    sqlops.transaction(user_id, sid, "commit")
+    ended = sqlops.transaction(user_id, sid, "end")
+    assert ended["ok"] and ended["ended"]
+    assert sqlops.history(user_id, conn_id)[0]["sql"] == "COMMIT"
+
+
+def test_manual_mode_survives_a_failed_statement(user_id, profile):
+    from services import sqlops
+
+    engine, conn_id = profile
+    database, _schema = LOCATION[engine]
+    sid = f"t-{engine}-2"
+    sqlops.execute(user_id, conn_id, database,
+                   "UPDATE orders SET status = 'step1' WHERE id = 6", session=sid)
+    bad = sqlops.execute(user_id, conn_id, database, "SELECT no_such_column FROM orders",
+                         session=sid)
+    assert not bad["ok"]
+    if engine == "postgresql":
+        assert "still open" in bad["results"][0]["error"]  # the savepoint undid only it
+    assert not bad["txn"]["failed"] and bad["txn"]["open"]
+    done = sqlops.transaction(user_id, sid, "commit")
+    assert done["ok"], done
+    assert _status_of(user_id, conn_id, engine, 6) == "step1"
+    sqlops.transaction(user_id, sid, "end")
+
+
+def test_manual_mode_guards(user_id, profile, monkeypatch):
+    from services import sessions, sqlops
+
+    engine, conn_id = profile
+    database, _schema = LOCATION[engine]
+    sid = f"t-{engine}-3"
+    before = _status_of(user_id, conn_id, engine, 7)
+    sqlops.execute(user_id, conn_id, database,
+                   "UPDATE orders SET status = 'idle' WHERE id = 7", session=sid)
+    if engine in ("postgresql", "mssql"):
+        moved = sqlops.execute(user_id, conn_id, "postgres" if engine == "postgresql" else "master",
+                               "SELECT 1 AS one", session=sid)
+        assert not moved["ok"] and "switching database" in moved["error"]
+    # Idle past the limit: rolled back by the reaper, and the page is told once.
+    assert sessions.reap(now=sessions.peek(user_id, sid).last_used + sessions.IDLE_SECONDS + 1) >= 1
+    assert _status_of(user_id, conn_id, engine, 7) == before
+    told = sqlops.execute(user_id, conn_id, database, "SELECT 1 AS one", session=sid)
+    assert not told["ok"] and "idle" in told["error"]
+    again = sqlops.execute(user_id, conn_id, database, "SELECT 1 AS one", session=sid)
+    assert again["ok"]
+    sqlops.transaction(user_id, sid, "end")
+
+    ro = _make_profile(user_id, engine, read_only=True)
+    refused = sqlops.execute(user_id, ro, database, "SELECT 1 AS one", session=f"t-{engine}-ro")
+    assert not refused["ok"] and "read-only" in refused["error"]
+
+
+def test_editing_a_profile_ends_its_transaction(user_id, profile):
+    from services import sqlops
+    from services.connection_service import ConnectionService
+
+    engine, _ = profile
+    conn_id = _make_profile(user_id, engine)
+    database, _schema = LOCATION[engine]
+    sid = f"t-{engine}-4"
+    sqlops.execute(user_id, conn_id, database,
+                   "UPDATE orders SET status = 'gone' WHERE id = 8", session=sid)
+    ConnectionService({"user_id": user_id}).disconnect(conn_id)
+    assert _status_of(user_id, conn_id, engine, 8) != "gone"
+    told = sqlops.transaction(user_id, sid, "commit")
+    assert not told["ok"] and "disconnected" in told["error"]

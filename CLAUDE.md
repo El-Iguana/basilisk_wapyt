@@ -37,6 +37,7 @@ appcode/                   # pytincture modules_path
       base.py              #     the hooks: URL, levels, read-only, timeout, cancel, split, DDL
       postgresql.py mysql.py mssql.py sqlite.py
     engine_pool.py         #   SQLAlchemy engines per (user, connection, database) — plain module
+    sessions.py            #   manual commit mode: pinned connection per SQL tab, idle reaper — plain module
     sqlops.py              #   everything done to a database; the running-statement registry
     values.py              #   driver values <-> grid text; lossless row keys; typed coercion
     connection_service.py  #   BFF: profiles, test, disconnect
@@ -87,7 +88,7 @@ podman run -d --name basilisk-mysql -p 127.0.0.1:53306:3306 -e MYSQL_ROOT_PASSWO
 podman run -d --name basilisk-mssql -p 127.0.0.1:51433:1433 -e ACCEPT_EULA=Y \
   -e MSSQL_SA_PASSWORD="$PW" -e MSSQL_PID=Developer mcr.microsoft.com/mssql/server:2022-latest
 uv run python tests/smoke/seed_sample.py          # the shop sample in all four (SQLite: data/sqlite/shop.db)
-uv run --group dev pytest -q tests/test_live.py   # 44 live tests
+uv run --group dev pytest -q tests/test_live.py   # 60 live tests
 BASILISK_PASS=… python3 tests/smoke/ui_smoke.py   # ~22 UI checks per engine
 ```
 
@@ -189,6 +190,41 @@ is saved per connection (`draft:<conn>` in ui_state) and restored when that
 connection's first editor opens. The editor/results split is a nested wapyt
 `Layout` with a resizable cell.
 
+### Manual commit mode (`sessions.py`, milestone 2)
+
+The SQL editor's **Auto-commit | Manual** switch (remembered per user as
+`settings.manual_commit`). In manual mode the tab owns a **pinned
+connection** (`Session`, keyed by `(user_id, session id)`; the page makes the
+id per tab) and statements run in one transaction until **Commit** or
+**Rollback**; the bar shows "● Transaction · N statements" and the tab a `TX`
+badge. `execute(..., session=…)` runs through `_execute_manual`;
+`SqlService.transaction(session, action)` does commit / rollback / end / state.
+
+- **PostgreSQL wraps each statement in `SAVEPOINT bk_stmt`**: an error rolls
+  back to it, so only that statement is undone and the transaction stays
+  usable (psql's `ON_ERROR_ROLLBACK`). Statements that are transaction control
+  themselves (`_TXN_WORDS`) are not wrapped. Other engines leave a failed
+  statement's transaction as is; auto-commit still rolls back on error, manual
+  mode never does.
+- **Idle transactions are rolled back** after 10 minutes (`IDLE_SECONDS`) by a
+  daemon reaper thread: an open transaction holds locks. The id is remembered
+  for an hour (`_expired`), so the next run or commit says what happened
+  (`session_lost`) instead of quietly starting a new transaction.
+- Leaving manual mode, or switching database, with work pending asks
+  **Commit / Roll back / Cancel** (`_settle_txn`). Closing the tab cannot be
+  vetoed (wapyt TabWidget has no before-close), so it **rolls back** and says
+  so in a toast. Leaving the page warns (`beforeunload`).
+- Editing, deleting or disconnecting a profile ends its sessions
+  (`end_for_conn`); deleting a user, theirs; shutdown, all.
+- Read-only profiles cannot use it (they roll back everything anyway); at most
+  5 sessions per user (each pins a pool connection); one run at a time per
+  session (its lock).
+- Commit on a **production** profile asks first.
+- `transaction_state` per engine: PostgreSQL reads `transaction_status`
+  (and knows a **failed** transaction, which can only be rolled back); SQLite
+  runs in PEP 249 mode (`autocommit = False`, so DDL is transactional too) and
+  is put back to legacy control on release; MySQL counts statements.
+
 ## Things that will bite
 
 - Everything in Monguana's list: `APP_ENTRYPOINT`, BFF modules re-executed per
@@ -208,6 +244,12 @@ connection's first editor opens. The editor/results split is a nested wapyt
 - MySQL and SQLite return NULL for `1/0`; PostgreSQL and SQL Server raise.
 - SQL Server `VARCHAR` cannot hold an emoji (the seed uses `NVARCHAR`).
 - MySQL reorders JSON object keys.
+- **pymssql opens its own `BEGIN TRANSACTION`** after every commit and
+  rollback when auto-commit is off, so `@@TRANCOUNT` is always 1: SQL Server's
+  "transaction open" needs statements counted too. A `COMMIT` typed into the
+  script leaves pymssql's state behind; use the Commit button.
+- **MySQL commits implicitly on DDL** (CREATE, ALTER, DROP…), even in manual
+  mode; the indicator, which counts statements, cannot tell.
 
 ## Conventions
 
