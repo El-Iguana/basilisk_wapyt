@@ -44,8 +44,9 @@ appcode/                   # pytincture modules_path
     sql_service.py         #   BFF: thin front for sqlops (tree, table, browse, save, execute…)
     user_service.py, ui_state_service.py, about*.py, release_check.py   # from Monguana
     transfer.py            #   plain routes under /bk: table export (GET), query export (POST)
-  static/                  #   artwork
+  static/                  #   basilisk_avatar.webp: logo, login page, favicon, About
   vendor/codemirror/       #   the SQL editor bundle (built, committed), served at /vendor
+docs/basilisk.webp         # the README's picture (both cut from the original artwork, 1254 px)
 tools/codemirror/          # its recipe: pinned package.json, entry.js, build.sh
 tests/                     # test_units.py, test_bff_state.py, test_live.py (needs the databases)
 tests/smoke/               # seed_sample.py + ui_smoke.py (Playwright, all four engines)
