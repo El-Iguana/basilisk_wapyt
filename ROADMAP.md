@@ -1,0 +1,59 @@
+# Basilisk roadmap
+
+## Milestone 1: core browser — done (2026-10-24)
+
+Connection profiles for PostgreSQL, MySQL/MariaDB, SQL Server and SQLite
+(test, folders, connection types, read-only, timeouts); the navigator
+(databases › schemas › tables/views, row estimates, system objects on
+request); the table editor (paged data, WHERE / ORDER BY, header sort,
+pending edits saved as one previewed transaction, add/duplicate/delete rows,
+Set NULL, filter by value, Columns / Keys & indexes / DDL); the SQL editor
+(CodeMirror + lang-sql with schema completion, statement / script runs,
+cancel, error position, results grid, messages, history, format, drafts);
+CSV/JSON export of tables and query results; users, password reminder,
+About; container image. 58 unit and live tests, a 4-engine Playwright smoke
+test.
+
+## Milestone 2: DBeaver parity, the everyday parts
+
+- **Manual commit mode** in the SQL editor: a pinned connection per tab with
+  Commit / Rollback buttons and a pending-transaction indicator (idle
+  rollback after N minutes). Needs a connection registry in `sqlops` keyed by
+  tab, like the run registry.
+- **Explain plan** for the statement at the cursor, per engine (`EXPLAIN
+  (FORMAT JSON)`, `EXPLAIN FORMAT=JSON`, `SET SHOWPLAN_XML`, `EXPLAIN QUERY
+  PLAN`), drawn as a tree.
+- **Value viewer / editor panel** for long text, JSON (pretty) and binary
+  (hex), which also lifts the "too large to edit in the grid" limit.
+- **More objects in the navigator**: functions / procedures, sequences,
+  triggers, materialized views refresh, users/roles (read-only listing first).
+- **Object actions**: create/rename/drop table (with the generated DDL shown
+  first), truncate, create/drop index, add column — DBeaver's table designer
+  in a modest form.
+- **Import CSV** into a table (column mapping, type coercion, one transaction,
+  progress through a job like Monguana's dumps).
+- **Column layout memory** per table (widths, order, hidden), as Monguana's
+  phase 35.
+- **Result grid niceties**: frozen first column, per-column filter, copy as
+  INSERT / Markdown, open a foreign key's row from a cell.
+- **Session manager**: running queries per server with kill (pg_stat_activity,
+  SHOW PROCESSLIST, sys.dm_exec_requests).
+
+## Milestone 3: bigger pieces
+
+- **ER diagram** of a schema (tables, columns, FK lines), auto-laid-out, export
+  as SVG.
+- **Data compare / schema compare** between two connections.
+- **SSH tunnels** for connections (paramiko; IguanaXterm has the know-how).
+- **More engines** through the adapter: MariaDB-specific bits, CockroachDB
+  (PostgreSQL dialect), DuckDB, Oracle (oracledb thin mode), BriskDB.
+- **Install story** like Monguana's: compose files, INSTALL.md, Windows
+  installer.
+
+## Small items
+
+- wapyt: TabWidget ignores `TabConfig.icon`; its badge needs dark colours.
+- The pager wraps onto a second toolbar row on narrow windows; give it its own
+  row below a width.
+- Statement mode for T-SQL splits on `;`, which breaks `DECLARE` scope; a
+  smarter splitter (blank lines as delimiters, as DBeaver offers) would help.

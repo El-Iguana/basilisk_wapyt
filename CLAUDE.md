@@ -1,0 +1,221 @@
+# Basilisk — SQL database browser on pytincture + wapyt
+
+A browser-based SQL database manager in the spirit of DBeaver, for
+**PostgreSQL, MySQL / MariaDB, SQL Server and SQLite**. The page is Python in
+Pyodide built from **wapyt** widgets (`../wa_pytincture_widgetset`); the server
+is **pytincture** (FastAPI) talking to the databases through **SQLAlchemy 2**
+and their drivers. Started 2026-10-24, modelled on **Monguana**
+(`../monguana_wapyt`, the MongoDB GUI) for its service wiring, auth, login
+page, profiles and container. Read Monguana's CLAUDE.md for the framework
+traps; the ones that bite here are summarised below, not re-explained.
+
+Private repo: El-Iguana/basilisk_wapyt. Next work: `ROADMAP.md`.
+
+## Related repos
+
+Siblings under `~/Development/Pytinc/`:
+
+- `pytincture/` — the framework, pinned to `pytincture==1.0.0` from PyPI in
+  `pyproject.toml` *and* `requirements.txt` (keep them in step).
+- `wa_pytincture_widgetset/` — **wapyt**. Basilisk uses Tree, DataTable
+  (inline editing, cell/row classes, CSV export), Pagination, Form (toggle
+  groups, static fields, buttons), Layout splitters, TabWidget, Toolbar,
+  ModalWindow, `message`. The Containerfile pins `WAPYT_REF`.
+- `monguana_wapyt/` — the sibling this one copies its plumbing from.
+
+## Layout
+
+```
+service.py                 # ASGI entrypoint: config, hooks, routes, static mounts, CLI banner
+manage.py                  # admin CLI: health, probe HOST PORT, users, reset-password
+appcode/                   # pytincture modules_path
+  basilisk.py              #   the page (Pyodide). APP_ENTRYPOINT lives here.
+  services/
+    auth.py, login_page.py #   from Monguana (authenticator + policy hook; "Username" login form)
+    db.py                  #   SQLite: users, connections, ui_state, query_history; Fernet; bcrypt
+    engines/               #   one adapter per engine — plain modules, NOT BFFs
+      base.py              #     the hooks: URL, levels, read-only, timeout, cancel, split, DDL
+      postgresql.py mysql.py mssql.py sqlite.py
+    engine_pool.py         #   SQLAlchemy engines per (user, connection, database) — plain module
+    sqlops.py              #   everything done to a database; the running-statement registry
+    values.py              #   driver values <-> grid text; lossless row keys; typed coercion
+    connection_service.py  #   BFF: profiles, test, disconnect
+    sql_service.py         #   BFF: thin front for sqlops (tree, table, browse, save, execute…)
+    user_service.py, ui_state_service.py, about*.py, release_check.py   # from Monguana
+    transfer.py            #   plain routes under /bk: table export (GET), query export (POST)
+  static/                  #   artwork
+  vendor/codemirror/       #   the SQL editor bundle (built, committed), served at /vendor
+tools/codemirror/          # its recipe: pinned package.json, entry.js, build.sh
+tests/                     # test_units.py, test_bff_state.py, test_live.py (needs the databases)
+tests/smoke/               # seed_sample.py + ui_smoke.py (Playwright, all four engines)
+Containerfile, scripts/podman-run.sh   # image + dev container "basilisk"
+```
+
+## Running
+
+```bash
+cp .env.example .env                                     # set BASILISK_ADMIN_PASS
+uv sync
+../wa_pytincture_widgetset/scripts/dev_wheel.sh appcode  # after ANY wapyt asset edit
+uv run python service.py                                 # http://127.0.0.1:8768/basilisk/
+uv run --group dev pytest -q                             # live tests skip absent servers
+scripts/podman-run.sh                                    # dev container: host network, local wapyt
+python manage.py reset-password admin                    # clears the change-password reminder
+```
+
+| Variable | Default | What |
+|---|---|---|
+| `BASILISK_ADMIN_USER` / `_PASS` | `admin` / `change_me` | first account, only when there are no users |
+| `BASILISK_DATA_DIR` | `./data` (container `/data`) | SQLite store, `secret.key`, `session.key` |
+| `BASILISK_SQLITE_ROOT` | `<data>/sqlite` | the only folder SQLite profiles may open files in |
+| `BASILISK_SECRET_KEY` / `_SESSION_SECRET` | generated into files | credential key / cookie key |
+| `PORT` | `8768` | |
+| `BASILISK_HOST` | `127.0.0.1` | loopback address the app is reached on |
+| `BASILISK_BIND` | `0.0.0.0` | listen address (`.env.example` sets 127.0.0.1) |
+| `BASILISK_CANONICAL_ORIGIN`, `_ALLOWED_HOSTS` | loopback | behind a TLS proxy |
+| `BASILISK_UPDATE_CHECK` | on | GitHub latest-release check in About |
+
+### Test databases
+
+Throwaway containers, password **`B@sil:isk/1`** (the `@ : /` are deliberate:
+they would break a password pasted into a URL):
+
+```bash
+PW='B@sil:isk/1'
+podman run -d --name basilisk-pg -p 127.0.0.1:55432:5432 -e POSTGRES_PASSWORD="$PW" docker.io/library/postgres:17
+podman run -d --name basilisk-mysql -p 127.0.0.1:53306:3306 -e MYSQL_ROOT_PASSWORD="$PW" docker.io/library/mysql:8.4
+podman run -d --name basilisk-mssql -p 127.0.0.1:51433:1433 -e ACCEPT_EULA=Y \
+  -e MSSQL_SA_PASSWORD="$PW" -e MSSQL_PID=Developer mcr.microsoft.com/mssql/server:2022-latest
+uv run python tests/smoke/seed_sample.py          # the shop sample in all four (SQLite: data/sqlite/shop.db)
+uv run --group dev pytest -q tests/test_live.py   # 44 live tests
+BASILISK_PASS=… python3 tests/smoke/ui_smoke.py   # ~22 UI checks per engine
+```
+
+Users: `postgres` / `root` / `sa`. The sample (`seed_sample.py`): customers,
+products (JSON, binary, a bigint past 2^53), orders (137 rows, uuid, time),
+order_items (composite key), `audit_log` (no primary key), view
+`order_totals`; PostgreSQL and SQL Server also have a `sales` schema.
+**Reseed before the smoke test**: `test_live.py` edits rows. The smoke test
+needs an admin whose password is not flagged (`manage.py reset-password`) and,
+against the container, `shop.db` copied into `/data/sqlite` (`podman cp`).
+
+## Design
+
+### Engines (`services/engines/`)
+
+Everything dialect-specific is an `Engine` method; `sqlops` never branches on
+the engine name except through them. **A new engine** = a subclass + an entry
+in `engines/__init__.py` + a profile in `test_live.py`.
+
+| | levels (tree) | engine per | read-only | timeout | cancel |
+|---|---|---|---|---|---|
+| PostgreSQL | database › schema | database | session `READ ONLY` + rollback | `statement_timeout` | `cancel_safe()` |
+| MySQL | database (= schema) | profile; `select_db` | session `READ ONLY` + rollback | `max_execution_time` (SELECT only; MariaDB `max_statement_time`) | `KILL QUERY` on a 2nd connection |
+| SQL Server | database › schema | database | **rollback only** (no read-only session) | `_conn.query_timeout` | `KILL <spid>`, then the connection is invalidated |
+| SQLite | none | profile | `mode=ro` URI + rollback | progress handler | `interrupt()` |
+
+### The pool (`engine_pool.py`)
+
+A SQLAlchemy Engine per `(user, connection, database)` — PostgreSQL and SQL
+Server connections are bound to one database. The profile is re-read per
+call and the engine rebuilt when its fingerprint (URL, options, read-only)
+changes; idle engines are disposed after 15 minutes. The `connect` event
+hook keeps only `read_only`, never the password.
+
+### Safety
+
+- Table/schema/column names from the browser are **always quoted by
+  SQLAlchemy** (`table()`/`column()` constructs), never pasted into SQL.
+- The WHERE / ORDER BY boxes are SQL the person types (they can run any SQL
+  in an editor anyway). They run on a connection that is **never committed**,
+  with bound LIMIT/OFFSET, so one statement on every driver but pymssql, whose
+  batch is rolled back.
+- **`typed_sql()` escapes colons**: SQLAlchemy's `text()` reads `:name` (and
+  PostgreSQL's `::` casts) as bind parameters.
+- Query export uses `exec_driver_sql` with **`no_parameters=True`**: with
+  parameters, pyformat drivers treat `%` in `LIKE 'a%'` specially.
+- SQL editor statements go to the DB-API cursor **without parameters** for the
+  same reason (`'100%'` is tested).
+- SQLite paths are relative to `BASILISK_SQLITE_ROOT` and checked on save
+  **and** every open (`resolve_file`): a profile must never open the app's own
+  database or any other server file.
+- Profiles are per user; there is no unscoped read of `connections`.
+
+### Grid editing (DBeaver's model: pending, then Save)
+
+Edits, added rows and deletions stay **pending** (amber cells, green new rows,
+struck-through deletions; the tab shows a count badge) until **Save**, which
+shows the generated SQL (`save_changes(dry_run=True)`) and then runs it in
+**one transaction**: an update or delete that does not match exactly one row
+rolls everything back. Rows are found again by their **primary key**, carried
+to the browser **losslessly** (`values.encode_key`: type-tagged, bytes in
+base64), so a cut-short display never targets the wrong row. Tables without a
+primary key, views and read-only profiles are read-only in the grid.
+
+- Values travel as **text** (bigints and decimals keep every digit) and are
+  coerced back by the reflected column type (`values.coerce`). **JSON columns
+  are parsed** — SQLAlchemy's JSON type has no `python_type` and would have
+  stored the text as a JSON *string* (caught by a unit test). MySQL's BOOLEAN
+  is TINYINT, so integer columns accept true/false.
+- Cells over 20,000 characters (binary over 2 KB) are cut for display, flagged
+  `bk-cut`, and refused for editing ("use a SQL editor").
+- Opening a NULL cell and leaving it empty keeps NULL; **Set NULL** and **Set
+  empty text** are in the cell menu.
+- The DataTable's context menu payload has the row but not the column: a
+  capture-phase `contextmenu` listener remembers the cell (`tab["menu_col"]`).
+- Pending-cell classes: the class key is not a column, so `_cell_class` sets
+  it on the live JS row (`datatable.getRow`) and redraws via `set_cell`.
+- Server-side sort: a header click writes `"col" ASC|DESC` (quoted per
+  dialect) into ORDER BY and reloads; every column's `sort_by` is a rank key
+  signed by the table's direction, so the widget's local sort keeps the
+  server's order (Monguana's trick).
+
+### SQL editor
+
+CodeMirror 6 + `@codemirror/lang-sql` (dialect per engine, schema completion
+from `completion()` via `get_multi_columns`), built by `tools/codemirror/` into
+`window.BkEditor`. **Ctrl+Enter** runs the selection or the statement at the
+caret (split server-side by sqlparse, with offsets), **Ctrl+Shift+Enter / Alt+X**
+the script, stopping at the first error, which is underlined (PostgreSQL gives
+a position; MySQL a line). SQL Server scripts run as **`GO` batches**; statement
+mode still splits on `;`. Statements run in **auto-commit**; a read-only
+profile runs them in one transaction that is rolled back. A **production**
+profile (`env=prod`) asks before running anything whose first word is not a
+read (`_READ_FIRST_WORDS`) — a safety net, not a security check. Results:
+up to 10,000 rows per result set (500 by default), CSV of what is shown
+(DataTable `export_csv`), or **Export all** through `POST /bk/export-query`.
+Every statement goes to `query_history` (500 kept per user). The editor text
+is saved per connection (`draft:<conn>` in ui_state) and restored when that
+connection's first editor opens. The editor/results split is a nested wapyt
+`Layout` with a resizable cell.
+
+## Things that will bite
+
+- Everything in Monguana's list: `APP_ENTRYPOINT`, BFF modules re-executed per
+  call (state lives in `engine_pool` / `sqlops`; `test_bff_state.py`), UI in
+  `load_ui`, `*_async` BFF calls, hooks by dotted path +
+  `AUTH_SESSION_CLAIM_KEYS`, absolute imports, import names not modules in
+  the page, literal loopback IP (never `localhost`), `JsNull` ≠ `None`, keep app
+  URLs absolute (`/static`, `/bk`, `/vendor`), no CDN.
+- **A JS object from the editor is a JsProxy**: `getSelection()` has a `from`
+  key, a Python keyword — call `.to_py()` and index it.
+- **pytincture validates BFF arguments by annotation**; BFF methods here take
+  plain positional arguments, called positionally from the page.
+- **`pkill -f "python service.py"` kills your own shell** when the command line
+  contains that text; stop the dev server by PID.
+- **wapyt TabWidget ignores `TabConfig.icon`** and its badge has no dark colours
+  (styled in `_CSS`). Worth fixing in wapyt.
+- MySQL and SQLite return NULL for `1/0`; PostgreSQL and SQL Server raise.
+- SQL Server `VARCHAR` cannot hold an emoji (the seed uses `NVARCHAR`).
+- MySQL reorders JSON object keys.
+
+## Conventions
+
+- `BASILISK_*` environment prefix, port **8768**, `/data` volume, SQLite +
+  Fernet at rest, MIT.
+- Version in `pyproject.toml` **and** `appcode/services/about.py` (`test_units`
+  checks); the editor bundle and its `VERSION` are committed together (also
+  checked).
+- Default branch `main`; every change ships on a feature branch with a PR.
+  Commit style: imperative sentence case, no prefix. Commit means commit and push.
+- This file is tracked.

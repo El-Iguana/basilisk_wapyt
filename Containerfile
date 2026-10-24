@@ -1,0 +1,94 @@
+# Basilisk — builds from a plain clone of this repository, with Docker or
+# Podman. For development, scripts/podman-run.sh builds and runs it.
+#
+#   docker build -f Containerfile -t basilisk .
+#   podman build -f Containerfile -t basilisk .
+#
+# (Docker only looks for a file named "Dockerfile" unless told; compose.yaml
+# names this one for you.)
+#
+# wapyt, the widgetset, is not on PyPI, so the first stages fetch it from
+# GitHub at a pinned commit and build the two wheels the app needs:
+#   * wapyt 0.1.0 — installed into the server's Python, where pytincture's
+#     widgetset discovery reads it (before pytincture 1.0.0rc13 it could
+#     not see an editable install; a built wheel is what ships anyway);
+#   * wapyt 99.99.99 — the development wheel the *browser* installs from the
+#     app's modules folder, with its asset manifest regenerated for that
+#     version (pytincture hash-checks every widget asset).
+#
+# To build against a local wapyt checkout instead (scripts/podman-run.sh does
+# this), replace the source stage with a directory:
+#   podman build --build-context wapyt-src=../wa_pytincture_widgetset .
+#   docker buildx build --build-context wapyt-src=../wa_pytincture_widgetset .
+
+ARG PYTHON_IMAGE=docker.io/library/python:3.13-slim
+
+# ── wapyt source, from GitHub ────────────────────────────────────────────────
+FROM ${PYTHON_IMAGE} AS wapyt-git
+ARG WAPYT_REPO=https://github.com/WAwesome-AI/wa_pytincture_widgetset.git
+# The commit Basilisk was verified against (wapyt 0.2.0 + #75). Bump deliberately.
+ARG WAPYT_REF=0457960bca1481ffee0c4e778128e5e4a4f295b5
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --filter=blob:none "$WAPYT_REPO" /src \
+    && git -C /src checkout --quiet "$WAPYT_REF" \
+    && rm -rf /src/.git
+
+# The source tree alone, at the root, so --build-context can replace it.
+FROM scratch AS wapyt-src
+COPY --from=wapyt-git /src /
+
+# ── the two wapyt wheels ─────────────────────────────────────────────────────
+FROM ${PYTHON_IMAGE} AS wapyt-wheels
+COPY --from=wapyt-src / /wapyt
+RUN set -eu; \
+    pip wheel --no-cache-dir --no-deps /wapyt -w /wheels/server; \
+    cp -r /wapyt /dev-src; \
+    sed -i 's/^version = ".*"$/version = "99.99.99"/' /dev-src/pyproject.toml; \
+    grep -q "pytincture-assets.json" /dev-src/MANIFEST.in \
+        || sed -i '1i include wapyt/pytincture-assets.json' /dev-src/MANIFEST.in; \
+    python /wapyt/scripts/generate_assets_manifest.py /dev-src; \
+    pip wheel --no-cache-dir --no-deps /dev-src -w /wheels/browser; \
+    ls /wheels/server/wapyt-*.whl /wheels/browser/wapyt-99.99.99-py3-none-any.whl
+
+# ── the app ──────────────────────────────────────────────────────────────────
+FROM ${PYTHON_IMAGE}
+
+WORKDIR /app
+
+# gcc + libffi cover the bcrypt/cryptography/argon2 C extensions on
+# architectures without prebuilt wheels (a no-op on x86_64 and arm64).
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY --from=wapyt-wheels /wheels/server/ /tmp/wapyt/
+RUN pip install --no-cache-dir /tmp/wapyt/wapyt-*.whl && rm -rf /tmp/wapyt
+
+COPY service.py manage.py ./
+COPY appcode/ appcode/
+COPY --from=wapyt-wheels /wheels/browser/wapyt-99.99.99-py3-none-any.whl appcode/
+
+# SQLite, secret.key (encrypts stored database passwords) and session.key live
+# here, and SQLite connections open files under /data/sqlite only. Keep it on a
+# named volume: losing secret.key loses every stored password.
+RUN mkdir -p /data/sqlite
+VOLUME /data
+
+EXPOSE 8768
+
+# BASILISK_BIND=0.0.0.0 inside the container is what makes a published port
+# work; publish it on the host on loopback only (127.0.0.1:8768).
+ENV BASILISK_DATA_DIR=/data \
+    BASILISK_SQLITE_ROOT=/data/sqlite \
+    BASILISK_BIND=0.0.0.0 \
+    PYTHONUNBUFFERED=1 \
+    PORT=8768
+
+# Never as root: the database holds every user's server credentials.
+RUN useradd --system --uid 10001 --home /app basilisk && chown -R basilisk /app /data
+USER basilisk
+
+CMD ["python", "service.py"]
