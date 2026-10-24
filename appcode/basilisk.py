@@ -73,7 +73,7 @@ from services.user_service import UserService
 # starts with HTTP 422.
 APP_ENTRYPOINT = "Basilisk"
 
-APP_FAVICON = "static/el_iguana_avatar.webp"
+APP_FAVICON = "static/basilisk_avatar.webp"
 
 EDITOR_SRC = "/vendor/codemirror/basilisk-editor.js"
 EDITOR_LOAD_SECONDS = 10
@@ -245,7 +245,7 @@ class Basilisk(MainWindow):
         sidebar_el.innerHTML = (
             '<div class="bk-sidebar">'
             '  <div class="bk-brand">'
-            '    <img class="bk-brand-logo" src="/static/el_iguana_avatar.webp"'
+            '    <img class="bk-brand-logo" src="/static/basilisk_avatar.webp"'
             '         alt="" width="40" height="40" decoding="async">'
             '    <div class="bk-brand-text">'
             '      <span class="bk-brand-name">Basilisk</span>'
@@ -2824,7 +2824,7 @@ class Basilisk(MainWindow):
         modal.body.innerHTML = (
             '<div class="bk-about">'
             '<div class="bk-about-head">'
-            '<img class="bk-about-logo" src="/static/el_iguana_avatar.webp" alt="">'
+            '<img class="bk-about-logo" src="/static/basilisk_avatar.webp" alt="">'
             '<div><div class="bk-about-name">Basilisk '
             f'<span class="bk-about-version">{_esc(VERSION)}</span></div>'
             '<div class="bk-about-sub">SQL databases in the browser · PostgreSQL · MySQL · '

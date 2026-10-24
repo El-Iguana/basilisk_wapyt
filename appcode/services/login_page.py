@@ -22,7 +22,7 @@ logger = logging.getLogger("basilisk.login")
 # anchor below — every extra anchor is another thing that can go stale.
 # Served from the app's own /static mount, which satisfies `img-src 'self'`.
 _LOGO = (
-    b'<img src="/static/el_iguana_avatar.webp" alt="" width="88" height="88" '
+    b'<img src="/static/basilisk_avatar.webp" alt="" width="88" height="88" '
     b'style="width:88px;height:88px;border-radius:50%;object-fit:cover;'
     b'display:block;margin:0 auto 14px;border:1px solid #334155;'
     b'box-shadow:0 6px 18px rgba(0,0,0,.45);">'

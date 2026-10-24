@@ -1,4 +1,8 @@
-# Basilisk
+<p align="center">
+  <img src="docs/basilisk.webp" alt="Basilisk: a blue iguana in a red fez and white suit, cigar in hand" width="320">
+</p>
+
+<h1 align="center">Basilisk</h1>
 
 A browser-based SQL database manager — think DBeaver, in a browser tab.
 PostgreSQL, MySQL / MariaDB, SQL Server and SQLite, built on
