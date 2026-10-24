@@ -47,6 +47,10 @@ HISTORY_SQL_CHARS = 20_000
 # "production connection" confirmation. A safety net, not a security check.
 _READ_FIRST_WORDS = frozenset({"SELECT", "SHOW", "EXPLAIN", "DESCRIBE", "DESC", "WITH",
                                "VALUES", "TABLE", "USE"})
+# Statements that are transaction control themselves: never wrapped in a
+# savepoint in manual mode.
+_TXN_WORDS = frozenset({"BEGIN", "START", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE",
+                        "ABORT"})
 _LEADING_COMMENTS = re.compile(r"^(?:\s+|--[^\n]*\n?|/\*.*?\*/)*", re.S)
 
 
@@ -571,11 +575,15 @@ def pick(spec: Any, sql: str, mode: str, caret: int) -> list:
 
 def execute(user_id: int, conn_id: int, database: str, sql: str, mode: str = "script",
             caret: int = 0, max_rows: int = 500, run_id: str = "",
-            confirmed: bool = False) -> dict:
+            confirmed: bool = False, session: str = "") -> dict:
     """
     Run a script, the statement at the caret, or a selection (sent as the
-    script). Statements run one by one in auto-commit (a read-only profile:
-    one transaction, rolled back), and the run stops at the first error.
+    script); the run stops at the first error.
+
+    Without ``session`` (auto-commit) each statement is committed on a pooled
+    connection (a read-only profile: one transaction, rolled back). With one
+    (manual commit mode, ``sessions.py``) they run in the tab's open
+    transaction on its pinned connection, and nothing is committed here.
     """
     max_rows = max(1, min(int(max_rows or 500), MAX_RESULT_ROWS))
     engine, spec, profile = pool.open(user_id, conn_id, database)
@@ -591,6 +599,9 @@ def execute(user_id: int, conn_id: int, database: str, sql: str, mode: str = "sc
         if writes:
             return {"ok": False, "needs_confirm": True,
                     "statements": [w[:300] for w in writes[:5]], "count": len(writes)}
+    if session:
+        return _execute_manual(user_id, conn_id, database, session, pieces, max_rows, run_id,
+                               profile)
 
     read_only = bool(profile.get("read_only"))
     results: list = []
@@ -602,22 +613,11 @@ def execute(user_id: int, conn_id: int, database: str, sql: str, mode: str = "sc
     try:
         spec.use_database(dbapi, database if spec.database_for(profile, database) is None
                           and "database" in spec.levels else None)
-        session = spec.session_id(dbapi)
-        if run_id:
-            with _runs_lock:
-                _runs[key] = _Run(int(user_id), spec, engine, dbapi, session)
+        _register_run(key, spec, engine, dbapi, run_id)
         if not read_only:
             spec.set_autocommit(dbapi, True)
         spec.set_timeout(dbapi, profile.get("timeout_s") or 0)
-
-        for index, piece in enumerate(pieces):
-            outcome = _run_piece(spec, dbapi, piece, index, max_rows)
-            results.extend(outcome)
-            if outcome and outcome[-1].get("error"):
-                if run_id and _runs.get(key) and _runs[key].cancelled:
-                    outcome[-1]["error"] = "Cancelled. " + outcome[-1]["error"]
-                    broken = spec.name == "mssql"
-                break
+        broken = _run_pieces(spec, dbapi, pieces, max_rows, key, run_id, results, manual=False)
         _remember(user_id, conn_id, database, results)
     finally:
         with _runs_lock:
@@ -642,8 +642,115 @@ def execute(user_id: int, conn_id: int, database: str, sql: str, mode: str = "sc
     }
 
 
-def _run_piece(spec: Any, dbapi: Any, piece: Any, index: int, max_rows: int) -> list:
-    """Every result set one piece produced; the last carries an error, if any."""
+def _register_run(key: tuple, spec: Any, engine: Any, dbapi: Any, run_id: str) -> None:
+    if run_id:
+        session_id = spec.session_id(dbapi)
+        with _runs_lock:
+            _runs[key] = _Run(key[0], spec, engine, dbapi, session_id)
+
+
+def _run_pieces(spec: Any, dbapi: Any, pieces: list, max_rows: int, key: tuple, run_id: str,
+                results: list, *, manual: bool) -> bool:
+    """Run until the first error. True when the connection is no longer usable."""
+    for index, piece in enumerate(pieces):
+        outcome = _run_piece(spec, dbapi, piece, index, max_rows, manual=manual)
+        results.extend(outcome)
+        if outcome and outcome[-1].get("error"):
+            run = _runs.get(key) if run_id else None
+            if run is not None and run.cancelled:
+                outcome[-1]["error"] = "Cancelled. " + outcome[-1]["error"]
+                return spec.name == "mssql"  # KILL ended the whole session
+            break
+    return False
+
+
+def _execute_manual(user_id: int, conn_id: int, database: str, sid: str, pieces: list,
+                    max_rows: int, run_id: str, profile: dict) -> dict:
+    from services import sessions
+
+    try:
+        session = sessions.acquire(user_id, sid, conn_id, database)
+    except sessions.SessionError as exc:
+        return {"ok": False, "error": str(exc), "session_lost": True}
+    if not session.lock.acquire(blocking=False):
+        return {"ok": False, "error": "A statement is still running in this editor."}
+    spec, dbapi = session.spec, session.dbapi
+    results: list = []
+    started = time.monotonic()
+    key = (int(user_id), str(run_id or ""))
+    broken = False
+    try:
+        spec.use_database(dbapi, database if "database" in spec.levels
+                          and spec.database_for(profile, database) is None else None)
+        _register_run(key, spec, session.engine, dbapi, run_id)
+        try:
+            spec.set_timeout(dbapi, profile.get("timeout_s") or 0)
+        except Exception:  # noqa: BLE001 - a failed PostgreSQL transaction refuses SET too
+            pass
+        broken = _run_pieces(spec, dbapi, pieces, max_rows, key, run_id, results, manual=True)
+        session.statements += len({r["index"] for r in results if not r.get("error")})
+        _remember(user_id, conn_id, database, results)
+    finally:
+        with _runs_lock:
+            _runs.pop(key, None)
+        session.last_used = time.monotonic()
+        state = None if broken else session.state()
+        if state is not None and not state["open"]:
+            session.statements = 0  # a COMMIT or ROLLBACK typed in the script
+            state["statements"] = 0
+        session.lock.release()
+    if broken:
+        sessions.drop(user_id, sid, "lost: cancelling ended the database session")
+        state = {"session": sid, "open": False, "failed": False, "statements": 0, "lost": True}
+    failed = any(result.get("error") for result in results)
+    return {"ok": not failed, "results": results,
+            "ms": int((time.monotonic() - started) * 1000), "read_only": False,
+            "rolled_back": False, "txn": state}
+
+
+def transaction(user_id: int, session: str, action: str) -> dict:
+    """Commit, roll back or end a tab's manual-commit session."""
+    from services import sessions
+
+    try:
+        if action == "commit":
+            state = sessions.commit(user_id, session)
+        elif action == "rollback":
+            state = sessions.rollback(user_id, session)
+        elif action == "end":
+            return {"ok": True, **sessions.end(user_id, session)}
+        elif action == "state":
+            found = sessions.peek(user_id, session)
+            if found is None or not found.lock.acquire(blocking=False):
+                return {"ok": True, "txn": None}
+            try:
+                return {"ok": True, "txn": found.state()}
+            finally:
+                found.lock.release()
+        else:
+            raise OpError(f"Unknown transaction action {action!r}")
+    except sessions.SessionError as exc:
+        return {"ok": False, "error": str(exc)}
+    if state.get("done") and not state.get("nothing"):
+        session_ = sessions.peek(user_id, session)
+        if session_ is not None:
+            _remember(user_id, session_.conn_id, session_.database, [{
+                "index": 0, "sql": "COMMIT" if action == "commit" else "ROLLBACK",
+                "rowcount": state["done"], "ms": 0}])
+    return {"ok": True, "txn": state}
+
+
+def _run_piece(spec: Any, dbapi: Any, piece: Any, index: int, max_rows: int,
+               manual: bool = False) -> list:
+    """
+    Every result set one piece produced; the last carries an error, if any.
+
+    In auto-commit an error rolls the connection back. In manual mode it must
+    not (that would discard the person's earlier work): an engine with
+    ``savepoints`` undoes just the failed statement, the others leave the
+    transaction as the server left it.
+    """
+    savepoint = manual and spec.savepoints and first_word(piece.text) not in _TXN_WORDS
     from services.engines.base import strip_trailing_semicolon
 
     text = piece.text if spec.name in ("postgresql", "sqlite") else strip_trailing_semicolon(piece.text)
@@ -652,6 +759,8 @@ def _run_piece(spec: Any, dbapi: Any, piece: Any, index: int, max_rows: int) -> 
     cur = dbapi.cursor()
     out: list = []
     try:
+        if savepoint:
+            cur.execute("SAVEPOINT bk_stmt")
         cur.execute(text)
         while True:
             entry = dict(base)
@@ -670,14 +779,22 @@ def _run_piece(spec: Any, dbapi: Any, piece: Any, index: int, max_rows: int) -> 
             if not _next_result(cur):
                 break
             started = time.monotonic()
+        if savepoint:
+            cur.execute("RELEASE SAVEPOINT bk_stmt")
     except Exception as exc:  # noqa: BLE001 - the statement's own error, shown as such
         entry = dict(base)
         entry.update(error=error_text(exc), ms=int((time.monotonic() - started) * 1000),
                      error_at=_error_offset(exc, piece))
         out.append(entry)
         try:
-            dbapi.rollback()
-        except Exception:  # noqa: BLE001
+            if savepoint:
+                cur2 = dbapi.cursor()
+                cur2.execute("ROLLBACK TO SAVEPOINT bk_stmt")
+                cur2.close()
+                entry["error"] += "\n(Only this statement was undone; the transaction is still open.)"
+            elif not manual:
+                dbapi.rollback()
+        except Exception:  # noqa: BLE001 - e.g. the transaction had already failed
             pass
     finally:
         try:

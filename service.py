@@ -190,6 +190,9 @@ def build_app():
 
     @application.on_event("shutdown")
     async def _close_pool() -> None:
+        from services.sessions import close_all
+
+        close_all()  # roll back open manual-commit transactions first
         pool.close_all()
 
     return application

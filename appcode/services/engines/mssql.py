@@ -66,6 +66,19 @@ class SQLServer(Engine):
             dbapi_conn.rollback()
         dbapi_conn.autocommit(on)
 
+    def transaction_state(self, dbapi_conn: Any, statements: int) -> dict:
+        # pymssql opens a transaction itself after every commit and rollback,
+        # so @@TRANCOUNT alone is always 1: "open" also needs something run.
+        # The count still catches a COMMIT typed into the script.
+        if not statements:
+            return {"open": False, "failed": False}
+        cur = dbapi_conn.cursor()
+        try:
+            cur.execute("SELECT @@TRANCOUNT")
+            return {"open": int(cur.fetchone()[0]) > 0, "failed": False}
+        finally:
+            cur.close()
+
     def session_id(self, dbapi_conn: Any) -> Any:
         cur = dbapi_conn.cursor()
         try:

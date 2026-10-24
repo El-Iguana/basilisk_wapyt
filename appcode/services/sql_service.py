@@ -86,9 +86,15 @@ class SqlService:
 
     def execute(self, conn_id: int, database: str, sql: str, mode: str = "script",
                 caret: int = 0, max_rows: int = 500, run_id: str = "",
-                confirmed: bool = False) -> dict:
+                confirmed: bool = False, session: str = "") -> dict:
+        """``session`` set: manual commit mode, in that editor's open transaction."""
         return self._call("execute", int(conn_id), database or "", sql or "", mode or "script",
-                          int(caret or 0), int(max_rows or 500), run_id or "", bool(confirmed))
+                          int(caret or 0), int(max_rows or 500), run_id or "", bool(confirmed),
+                          session or "")
+
+    def transaction(self, session: str, action: str) -> dict:
+        """Manual commit mode: ``commit``, ``rollback``, ``end`` or ``state``."""
+        return self._call("transaction", session or "", action or "")
 
     def cancel(self, run_id: str) -> dict:
         return self._call("cancel", run_id or "")

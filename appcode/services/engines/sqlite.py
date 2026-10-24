@@ -96,6 +96,25 @@ class SQLite(Engine):
             dbapi_conn.rollback()
         dbapi_conn.isolation_level = None if on else ""
 
+    def begin_manual(self, dbapi_conn: Any) -> None:
+        # PEP 249 mode (Python 3.12+): always inside a transaction, DDL
+        # included. The legacy mode only opened one before INSERT/UPDATE/DELETE.
+        if dbapi_conn.in_transaction:
+            dbapi_conn.rollback()
+        dbapi_conn.autocommit = False
+
+    def end_manual(self, dbapi_conn: Any) -> None:
+        import sqlite3
+
+        dbapi_conn.rollback()
+        dbapi_conn.autocommit = sqlite3.LEGACY_TRANSACTION_CONTROL
+        dbapi_conn.isolation_level = ""
+
+    def transaction_state(self, dbapi_conn: Any, statements: int) -> dict:
+        # PEP 249 mode keeps a transaction open at all times; "open" means
+        # something ran in it.
+        return {"open": statements > 0 and dbapi_conn.in_transaction, "failed": False}
+
     def cancel(self, engine: Any, dbapi_conn: Any, session: Any) -> None:
         dbapi_conn.interrupt()
 

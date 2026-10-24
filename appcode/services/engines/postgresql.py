@@ -64,6 +64,15 @@ class PostgreSQL(Engine):
             dbapi_conn.rollback()
             dbapi_conn.autocommit = on
 
+    savepoints = True
+
+    def transaction_state(self, dbapi_conn: Any, statements: int) -> dict:
+        from psycopg.pq import TransactionStatus
+
+        status = dbapi_conn.info.transaction_status
+        return {"open": status in (TransactionStatus.INTRANS, TransactionStatus.INERROR),
+                "failed": status == TransactionStatus.INERROR}
+
     def session_id(self, dbapi_conn: Any) -> Any:
         return None  # psycopg cancels on the connection object itself
 
