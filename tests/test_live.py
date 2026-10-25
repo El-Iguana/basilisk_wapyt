@@ -484,3 +484,117 @@ def test_explain_analyze_of_a_write_is_rolled_back(user_id, profile):
         done = sqlops.explain(user_id, conn_id, database, write, analyze=True, confirmed=True)
         assert done["rolled_back"]
     assert _status_of(user_id, conn_id, engine, 10) != "explained"
+
+
+# ---------------------------------------------------------------------------
+# The value panel: one cell uncut, by primary key
+# ---------------------------------------------------------------------------
+
+def test_cell_value_reads_a_cut_value_whole(user_id, profile):
+    import base64
+
+    from services import sqlops
+    from services.values import MAX_CELL_CHARS, encode_key
+
+    engine, conn_id = profile
+    database, schema = LOCATION[engine]
+    photo = sqlops.cell_value(user_id, conn_id, database, schema, "products",
+                              {"sku": encode_key("SKU-003")}, "photo")
+    assert photo["binary"] and base64.b64decode(photo["b64"]) == bytes(range(256)) * 20
+    png = sqlops.cell_value(user_id, conn_id, database, schema, "products",
+                            {"sku": encode_key("SKU-000")}, "photo")
+    assert base64.b64decode(png["b64"]).startswith(b"\x89PNG\r\n\x1a\n")
+    page = sqlops.browse(user_id, conn_id, database, schema, "customers", where="id = 11",
+                         pk=["id"])
+    notes_col = page["columns"].index("notes")
+    assert [0, notes_col] in page["truncated"]
+    note = sqlops.cell_value(user_id, conn_id, database, schema, "customers",
+                             {"id": encode_key(11)}, "notes")
+    assert len(note["text"]) > MAX_CELL_CHARS and note["text"].endswith("was happy.")
+    assert sqlops.cell_value(user_id, conn_id, database, schema, "products",
+                             {"sku": encode_key("SKU-001")}, "photo")["null"]
+    with pytest.raises(sqlops.OpError, match="no longer there"):
+        sqlops.cell_value(user_id, conn_id, database, schema, "products",
+                          {"sku": encode_key("SKU-999")}, "photo")
+    with pytest.raises(sqlops.OpError, match="No column"):
+        sqlops.cell_value(user_id, conn_id, database, schema, "products",
+                          {"sku": encode_key("SKU-000")}, "nope")
+    with pytest.raises(sqlops.OpError, match="primary key"):
+        sqlops.cell_value(user_id, conn_id, database, schema, "products", {}, "photo")
+
+
+def test_long_value_edit_saves_whole_and_previews_cut(user_id, profile):
+    from services import sqlops
+    from services.values import encode_key
+
+    engine, conn_id = profile
+    database, schema = LOCATION[engine]
+    key = {"id": encode_key(11)}
+    original = sqlops.cell_value(user_id, conn_id, database, schema, "customers", key,
+                                 "notes")["text"]
+    edited = original + "\nLine 0541: added from the value panel."
+    change = [{"row": "r10", "op": "update", "key": key, "values": {"notes": edited}}]
+    preview = sqlops.save_changes(user_id, conn_id, database, schema, "customers", change,
+                                  dry_run=True)
+    assert preview["ok"] and "characters in all" in preview["sql"][0]
+    assert sqlops.save_changes(user_id, conn_id, database, schema, "customers", change)["ok"]
+    try:
+        back = sqlops.cell_value(user_id, conn_id, database, schema, "customers", key, "notes")
+        assert back["text"] == edited
+    finally:
+        sqlops.save_changes(user_id, conn_id, database, schema, "customers", [
+            {"row": "r10", "op": "update", "key": key, "values": {"notes": original}}])
+    binary = [{"row": "r", "op": "update", "key": {"sku": encode_key("SKU-004")},
+               "values": {"photo": "0x" + bytes(range(256)).hex() * 10}}]
+    assert sqlops.save_changes(user_id, conn_id, database, schema, "products", binary)["ok"]
+    import base64
+
+    photo = sqlops.cell_value(user_id, conn_id, database, schema, "products",
+                              {"sku": encode_key("SKU-004")}, "photo")
+    assert base64.b64decode(photo["b64"]) == bytes(range(256)) * 10
+    sqlops.save_changes(user_id, conn_id, database, schema, "products", [
+        {"row": "r", "op": "update", "key": {"sku": encode_key("SKU-004")},
+         "values": {"photo": None}}])
+
+
+def test_cell_download_route(user_id, profile):
+    import json as _json
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from starlette.middleware.sessions import SessionMiddleware
+
+    from services import transfer
+    from services.values import encode_key
+
+    engine, conn_id = profile
+    database, schema = LOCATION[engine]
+    from starlette.responses import JSONResponse
+
+    app = FastAPI()
+
+    def _login(request):  # a plain Starlette route: no annotations to resolve
+        request.session["user"] = {"user_id": user_id}
+        return JSONResponse({})
+
+    app.add_route("/login-for-test", _login)
+
+    app.include_router(transfer.router)
+    app.add_middleware(SessionMiddleware, secret_key="test")
+    client = TestClient(app)
+    params = {"table": "products", "column": "photo", "database": database, "schema": schema,
+              "key": _json.dumps({"sku": encode_key("SKU-003")})}
+    assert client.get(f"/bk/cell/{conn_id}", params=params).status_code == 401
+    client.get("/login-for-test")
+    got = client.get(f"/bk/cell/{conn_id}", params=params)
+    assert got.status_code == 200, got.text
+    assert got.content == bytes(range(256)) * 20
+    assert got.headers["content-type"] == "application/octet-stream"
+    assert 'filename="products_photo.bin"' in got.headers["content-disposition"]
+    params.update(table="customers", column="notes", key=_json.dumps({"id": encode_key(11)}))
+    note = client.get(f"/bk/cell/{conn_id}", params=params)
+    assert note.status_code == 200 and note.text.startswith("Line 0001:")
+    params.update(key=_json.dumps({"id": encode_key(2)}))   # NULL notes
+    assert client.get(f"/bk/cell/{conn_id}", params=params).status_code == 404
+    params.update(key="not json")
+    assert client.get(f"/bk/cell/{conn_id}", params=params).status_code == 400

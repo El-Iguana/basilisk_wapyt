@@ -30,7 +30,7 @@ from contextlib import contextmanager
 from typing import Any, Iterator, Optional
 
 from services.engine_pool import error_text, pool
-from services.values import cell, coerce, decode_key, encode_key, kind_of
+from services.values import cell, coerce, decode_key, encode_key, full_value, kind_of
 
 PAGE_SIZES = (50, 100, 200, 500, 1000)
 MAX_PAGE_SIZE = 1000
@@ -406,6 +406,42 @@ def _encode_rows(raw_rows: list, width: int) -> tuple[list, list, list]:
     return rows, [kind or "text" for kind in kinds], truncated
 
 
+def fetch_cell(user_id: int, conn_id: int, database: str, schema: str, name: str,
+               key: dict, column: str) -> Any:
+    """One column of one row, found by its primary key, as the driver returns it."""
+    from sqlalchemy import and_, select
+
+    with connect(user_id, conn_id, database, BROWSE_TIMEOUT_S) as (conn, spec, _p, _engine):
+        insp = _inspector(conn)
+        target = spec.schema_for(database, schema)
+        columns = _reflect_columns(insp, name, target)
+        pk = list((insp.get_pk_constraint(name, schema=target) or {})
+                  .get("constrained_columns") or [])
+        types = {col["name"]: col["type"] for col in columns}
+        if column not in types:
+            raise OpError(f"No column named {column!r}")
+        if not pk or set(key or {}) != set(pk):
+            raise OpError("This row has no primary key to find it by")
+        table = _sa_table(spec, database, schema, name, tuple(types.items()))
+        try:
+            where = and_(*[table.c[col] == decode_key(key[col]) for col in pk])
+        except ValueError as exc:
+            raise OpError(str(exc)) from None
+        try:
+            rows = conn.execute(select(table.c[column]).where(where).limit(2)).fetchall()
+        except Exception as exc:
+            raise OpError(error_text(exc)) from None
+    if len(rows) != 1:
+        raise OpError("The row is no longer there; refresh to see the current data.")
+    return rows[0][0]
+
+
+def cell_value(user_id: int, conn_id: int, database: str, schema: str, name: str,
+               key: dict, column: str) -> dict:
+    """The value panel's uncut value (see ``values.full_value``)."""
+    return full_value(fetch_cell(user_id, conn_id, database, schema, name, key, column))
+
+
 def _render(stmt: Any, dialect: Any) -> str:
     """SQL to show the person, with values inlined where the dialect can."""
     try:
@@ -414,6 +450,16 @@ def _render(stmt: Any, dialect: Any) -> str:
         compiled = stmt.compile(dialect=dialect)
         params = ", ".join(f"{key}={value!r}" for key, value in compiled.params.items())
         return f"{compiled}\n-- with {params}" if params else str(compiled)
+
+
+PREVIEW_MAX_CHARS = 4000
+
+
+def _preview(sql: str) -> str:
+    """A statement for the Save preview: a megabyte value is cut, not shown whole."""
+    if len(sql) <= PREVIEW_MAX_CHARS:
+        return sql
+    return sql[:PREVIEW_MAX_CHARS] + f"… -- cut for display; {len(sql):,} characters in all"
 
 
 # ---------------------------------------------------------------------------
@@ -491,7 +537,7 @@ def save_changes(user_id: int, conn_id: int, database: str, schema: str, name: s
 
     if errors:
         return {"ok": False, "errors": errors}
-    preview = [_render(stmt, dialect) + ";" for _row, _op, stmt in statements]
+    preview = [_preview(_render(stmt, dialect) + ";") for _row, _op, stmt in statements]
     if dry_run:
         return {"ok": True, "sql": preview, "count": len(statements)}
 

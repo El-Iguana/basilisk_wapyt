@@ -17,10 +17,16 @@ running in Pyodide) and the wapyt widget set.
   one transaction), add / duplicate / delete rows, Set NULL, filter by a
   cell's value; columns, keys, indexes, foreign keys (double-click to follow)
   and DDL.
+- **Value panel** (F7, or Shift+Enter on a cell): the whole value of the
+  focused cell beside the grid, as text, pretty JSON, a hex dump or a
+  picture. Edit long text, JSON and binary there, load a value from a file or
+  save it to one.
 - **SQL editor**: syntax highlighting and table/column completion for each
   dialect, run the statement at the cursor or the whole script, cancel a
   running statement, per-statement timeouts, results in a grid, messages,
-  query history, formatting, drafts kept per connection.
+  query history, formatting, drafts kept per connection. Auto-commit or
+  manual commit with Commit / Rollback; explain plans (estimated or with
+  actual rows and times) for all four engines.
 - **Export** a table (with its filter) or a query result to CSV or JSON,
   streamed from the server.
 - Multi-user, passwords encrypted at rest, sign-in required.

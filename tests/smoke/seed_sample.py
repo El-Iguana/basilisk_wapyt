@@ -74,6 +74,26 @@ def metadata(schema: str | None) -> MetaData:
     return md
 
 
+def _png(width: int = 24, height: int = 24) -> bytes:
+    """A real little PNG (an amber gradient), for the value panel's Image view."""
+    import struct
+    import zlib
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+
+    raw = b"".join(b"\x00" + b"".join(bytes((245, 80 + 3 * x, 11 + 4 * y)) for x in range(width))
+                   for y in range(height))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+# Longer than the grid shows (values.MAX_CELL_CHARS), for the value panel.
+LONG_NOTE = "\n".join(f"Line {n:04}: the customer called about order {n} and was happy."
+                       for n in range(1, 541))
+
+
 def rows() -> dict:
     rnd = random.Random(7)
     names = ["Ada Lovelace", "Grace Hopper", "Alan Turing", "Edsger Dijkstra", "Barbara Liskov",
@@ -81,12 +101,12 @@ def rows() -> dict:
              "Radia Perlman", "Tim Berners-Lee", "O'Brien; Robert", "Zoë Ünicode 🦎"]
     customers = [{"id": i + 1, "name": n, "email": f"user{i + 1}@example.com" if i != 3 else None,
                   "vip": i % 4 == 0, "joined": dt.date(2024, 1, 1) + dt.timedelta(days=37 * i),
-                  "notes": None if i % 3 else "Prefers email.\nSecond line."}
+                  "notes": LONG_NOTE if i == 10 else (None if i % 3 else "Prefers email.\nSecond line.")}
                  for i, n in enumerate(names)]
     products = [{"sku": f"SKU-{i:03}", "title": t, "price": decimal.Decimal(p), "stock": s,
                  "attributes": a, "photo": b}
                 for i, (t, p, s, a, b) in enumerate([
-                    ("Lizard lamp", "19.99", 12, {"color": "green", "watts": 40}, b"\x89PNG\r\n"),
+                    ("Lizard lamp", "19.99", 12, {"color": "green", "watts": 40}, _png()),
                     ("Basking rock", "45.00", 3, {"material": "slate"}, None),
                     ("Cricket box", "4.50", 9_007_199_254_740_993, None, None),
                     ("Terrarium XL", "249.95", 0, {"dims": [120, 60, 60]}, bytes(range(256)) * 20),

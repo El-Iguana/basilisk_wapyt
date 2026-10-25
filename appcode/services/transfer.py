@@ -9,6 +9,8 @@ token the way pytincture's BFF handler does.
 
 * ``GET /bk/export/<conn_id>``: a table with the view's WHERE / ORDER BY.
 * ``POST /bk/export-query/<conn_id>``: one SELECT from the SQL editor.
+* ``GET /bk/cell/<conn_id>``: one cell's value as a file (the value panel's
+  Save to file), whatever its size.
 """
 from __future__ import annotations
 
@@ -20,7 +22,7 @@ import re
 from typing import Iterator, Optional
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from services.auth import current_user_id
 
@@ -186,3 +188,41 @@ async def export_query(request: Request, conn_id: int):
                    lambda conn, _spec: conn.execution_options(no_parameters=True)
                    .exec_driver_sql(strip_trailing_semicolon(sql)), fmt, EXPORT_MAX_ROWS)
     return _response(body, fmt, profile.get("name") or "query", "result")
+
+
+@router.get("/cell/{conn_id}")
+def download_cell(request: Request, conn_id: int, table: str, column: str, key: str,
+                  database: str = "", schema: str = ""):
+    """
+    One cell as a file: binary as is, JSON as ``.json``, anything else as
+    UTF-8 text. ``key`` is the row's primary key as JSON ``{column: tagged}``.
+    """
+    from services import sqlops
+    from services.values import full_text
+
+    user_id = _require_user(request)
+    try:
+        parsed = json.loads(key)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Malformed row key") from None
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail="Malformed row key")
+    _open_or_404(user_id, conn_id, database)
+    try:
+        value = sqlops.fetch_cell(user_id, conn_id, database, schema, table, parsed, column)
+    except sqlops.OpError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    if value is None:
+        raise HTTPException(status_code=404, detail="The value is NULL")
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        body, media, ext = bytes(value), "application/octet-stream", ".bin"
+    elif isinstance(value, (dict, list)):
+        body, media, ext = full_text(value).encode("utf-8"), "application/json", ".json"
+    else:
+        body, media, ext = full_text(value).encode("utf-8"), "text/plain; charset=utf-8", ".txt"
+    filename = _safe_filename(table, column) + ext
+    return Response(body, media_type=media, headers={
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+    })

@@ -14,6 +14,7 @@ import { EditorView, keymap, placeholder as placeholderExt, drawSelection, highl
 import { EditorState, EditorSelection, Prec, Compartment } from "@codemirror/state";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { sql, PostgreSQL, MySQL, MSSQL, SQLite, StandardSQL } from "@codemirror/lang-sql";
+import { json } from "@codemirror/lang-json";
 import { autocompletion, completionKeymap, closeBrackets, closeBracketsKeymap,
   completionStatus, closeCompletion } from "@codemirror/autocomplete";
 import { syntaxHighlighting, HighlightStyle, bracketMatching, indentOnInput }
@@ -21,7 +22,7 @@ import { syntaxHighlighting, HighlightStyle, bracketMatching, indentOnInput }
 import { search, searchKeymap, highlightSelectionMatches } from "@codemirror/search";
 import { tags as t } from "@lezer/highlight";
 
-const VERSION = "2";
+const VERSION = "3";
 
 const DIALECTS = { PostgreSQL, MySQL, MSSQL, SQLite, StandardSQL };
 
@@ -86,13 +87,21 @@ const highlight = HighlightStyle.define([
   { tag: t.string, color: "#86efac" },
   { tag: [t.number, t.bool, t.null], color: "#f9a8d4" },
   { tag: [t.function(t.variableName), t.special(t.name)], color: "#c4b5fd" },
-  { tag: [t.name, t.variableName, t.propertyName], color: "#e2e8f0" },
+  { tag: [t.name, t.variableName], color: "#e2e8f0" },
+  { tag: t.propertyName, color: "#7dd3fc" },  // JSON keys
   { tag: t.special(t.string), color: "#e2e8f0" },  // quoted identifiers
   { tag: [t.comment, t.lineComment, t.blockComment], color: "#64748b", fontStyle: "italic" },
   { tag: [t.operator, t.punctuation, t.paren, t.separator, t.bracket], color: "#94a3b8" },
 ]);
 
 // ── Editors ──────────────────────────────────────────────────────────────────
+
+// language: "sql" (the default), "json" or "text" (the value panel).
+function languageFor(options) {
+  if (options.language === "json") return json();
+  if (options.language === "text") return [];
+  return sqlConfig(options);
+}
 
 function sqlConfig(options) {
   const dialect = DIALECTS[options.dialect] || StandardSQL;
@@ -109,7 +118,8 @@ function create(host, options = {}) {
   };
   const language = new Compartment();
   const readOnly = new Compartment();
-  let current = { dialect: options.dialect, schema: options.schema,
+  const wrapping = new Compartment();
+  let current = { language: options.language, dialect: options.dialect, schema: options.schema,
     defaultSchema: options.defaultSchema };
 
   // Ctrl+Enter: the statement at the caret (or the selection). Ctrl+Shift+Enter
@@ -132,7 +142,7 @@ function create(host, options = {}) {
     closeBrackets(),
     highlightSelectionMatches(),
     search({ top: true }),
-    language.of(sqlConfig(current)),
+    language.of(languageFor(current)),
     syntaxHighlighting(highlight),
     theme,
     autocompletion({ activateOnTyping: true, icons: false }),
@@ -154,7 +164,11 @@ function create(host, options = {}) {
       },
     })),
     EditorView.updateListener.of((update) => {
-      if (update.docChanged) call("onChange", update.state.doc.toString());
+      // changeText: false skips copying the document on every keystroke (a
+      // value can be megabytes); the handler then calls getValue() itself.
+      if (update.docChanged) {
+        call("onChange", options.changeText === false ? null : update.state.doc.toString());
+      }
       if (update.selectionSet || update.docChanged) {
         const head = update.state.selection.main.head;
         const line = update.state.doc.lineAt(head);
@@ -172,7 +186,7 @@ function create(host, options = {}) {
   if (options.lineNumbers !== false) {
     extensions.push(lineNumbers(), highlightActiveLineGutter(), highlightActiveLine());
   }
-  if (options.wrap) extensions.push(EditorView.lineWrapping);
+  extensions.push(wrapping.of(options.wrap ? EditorView.lineWrapping : []));
 
   const view = new EditorView({
     parent: host,
@@ -217,12 +231,20 @@ function create(host, options = {}) {
     focus: () => view.focus(),
     setSchema: (schema, defaultSchema) => {
       current = { ...current, schema, defaultSchema };
-      view.dispatch({ effects: language.reconfigure(sqlConfig(current)) });
+      view.dispatch({ effects: language.reconfigure(languageFor(current)) });
     },
     setDialect: (dialect) => {
       current = { ...current, dialect };
-      view.dispatch({ effects: language.reconfigure(sqlConfig(current)) });
+      view.dispatch({ effects: language.reconfigure(languageFor(current)) });
     },
+    setLanguage: (name) => {
+      current = { ...current, language: name };
+      view.dispatch({ effects: language.reconfigure(languageFor(current)) });
+    },
+    setWrap: (value) => view.dispatch({
+      effects: wrapping.reconfigure(value ? EditorView.lineWrapping : []),
+    }),
+    length: () => view.state.doc.length,
     setReadOnly: (value) => view.dispatch({
       effects: readOnly.reconfigure(EditorState.readOnly.of(Boolean(value))),
     }),

@@ -2,6 +2,7 @@ basilisk-editor.js — CodeMirror 6, bundled by tools/codemirror/build.sh
 esbuild 0.28.2
 @codemirror/autocomplete@6.20.3
 @codemirror/commands@6.11.1
+@codemirror/lang-json@6.0.2
 @codemirror/lang-sql@6.10.0
 @codemirror/language@6.12.4
 @codemirror/search@6.7.2
@@ -9,4 +10,4 @@ esbuild 0.28.2
 @codemirror/view@6.43.13
 @lezer/highlight@1.2.4
 
-sha256 4083be4e2f52e049377dd4f85b6f9c572403956932f0375ac2d52010528b5735
+sha256 84e01ee55ebeb2ad36038dcc8017d293e3510c1f5ab8fe510938fd4e16a07390
