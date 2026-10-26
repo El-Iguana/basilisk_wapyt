@@ -10,8 +10,12 @@ PostgreSQL, MySQL / MariaDB, SQL Server and SQLite, built on
 running in Pyodide) and the wapyt widget set.
 
 - **Database navigator**: connections in folders, then databases, schemas,
-  tables and views, loaded as you open them. Development / test / production
-  connection types; read-only connections.
+  tables, views, functions, procedures, sequences and triggers, and each
+  server's users and roles, loaded as you open them. Open a routine, sequence,
+  trigger or role to see its properties and definition; a routine's **Call…**
+  writes a ready-to-fill call in a SQL editor. PostgreSQL materialized views
+  can be refreshed (concurrently when they allow it). Development / test /
+  production connection types; read-only connections.
 - **Table editor**: paged data with a WHERE / ORDER BY bar, sorting by header,
   inline editing that stays pending until **Save** (shown as SQL first, run in
   one transaction), add / duplicate / delete rows, Set NULL, filter by a

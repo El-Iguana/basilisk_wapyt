@@ -58,6 +58,19 @@ class SqlService:
     def objects(self, conn_id: int, database: str = "", schema: str = "") -> dict:
         return self._call("objects", int(conn_id), database or "", schema or "")
 
+    def object_info(self, conn_id: int, database: str, schema: str, kind: str, ident: str,
+                    table: str = "") -> dict:
+        return self._call("object_info", int(conn_id), database or "", schema or "",
+                          str(kind or ""), str(ident or ""), str(table or ""))
+
+    def roles(self, conn_id: int, show_system: bool = False) -> dict:
+        return self._call("roles", int(conn_id), bool(show_system))
+
+    def refresh_matview(self, conn_id: int, database: str, schema: str, name: str,
+                        dry_run: bool = False) -> dict:
+        return self._call("refresh_matview", int(conn_id), database or "", schema or "",
+                          str(name or ""), bool(dry_run))
+
     # One table ---------------------------------------------------------------
 
     def table_info(self, conn_id: int, database: str, schema: str, name: str) -> dict:

@@ -435,6 +435,54 @@ def generate_check(page: Page, engine: str) -> None:
     page.wait_for_selector(".wapyt-modal", state="detached", timeout=5000)
 
 
+def expand(page: Page, label: str) -> None:
+    row = exact_tree_row(page, label).first
+    row.click()
+    page.keyboard.press("ArrowRight")
+    time.sleep(0.4)
+
+
+def navigator_checks(page: Page, engine: str) -> None:
+    """Routines, triggers, roles and (PostgreSQL) a materialized view refresh."""
+    view = ".bk-view:visible"
+    expand(page, "Triggers")
+    exact_tree_row(page, "orders_status_check").first.dblclick()
+    ok = wait_text(page, f"{view} .bk-obj-props", "orders")
+    ok = ok and wait_text(page, f"{view} .bk-obj-def", "orders_status_check")
+    check(ok, f"{engine}: a trigger opens with its definition")
+    page.click(f'{view} [data-bk="obj_table"]')
+    check(wait_text(page, f"{view} .bk-head", "orders"), f"{engine}: trigger opens its table")
+    if engine != "sqlite":
+        expand(page, "Procedures")
+        exact_tree_row(page, "archive_order").first.dblclick()
+        ok = wait_text(page, f"{view} .bk-obj-props", "rocedure")  # "SQL stored procedure"
+        page.click(f'{view} [data-bk="obj_call"]')
+        page.wait_for_selector(".bk-sqltab:visible .cm-content", timeout=20000)
+        ok = ok and wait_text(page, ".bk-sqltab:visible .cm-content", "archive_order")
+        check(ok, f"{engine}: a procedure opens and Call… writes a call")
+        shot(page, f"smoke-{engine}-8-call")
+        roles = page.locator('.wapyt-tree-row:has(.wapyt-tree-label:text-matches("roles$"))')
+        roles.first.click()
+        page.keyboard.press("ArrowRight")
+        me = {"postgresql": "postgres", "mysql": "root@%", "mssql": "sa"}[engine]
+        page.wait_for_selector(f'.wapyt-tree-row:has(.wapyt-tree-label:text-is("{me}"))',
+                               timeout=20000)
+        exact_tree_row(page, me).first.dblclick()
+        check(wait_text(page, f"{view} .bk-obj-props", "Can log in"),
+              f"{engine}: {me} opens under "
+              f"{roles.first.locator('.wapyt-tree-label').inner_text().strip()}")
+        shot(page, f"smoke-{engine}-9-role")
+    if engine == "postgresql":
+        expand(page, "Views")
+        exact_tree_row(page, "product_sales").first.click(button="right")
+        page.click('.wapyt-tree-menu [data-action-id]:has-text("Refresh materialized")')
+        page.wait_for_selector(f"{modal(page)} .bk-pre", timeout=10000)
+        ok = "CONCURRENTLY" in page.inner_text(f"{modal(page)} .bk-pre")
+        page.click(f'{modal(page)} [data-answer="yes"]')
+        ok = ok and wait_text(page, "body", "Refreshed product_sales")
+        check(ok, f"{engine}: materialized view refreshes CONCURRENTLY")
+
+
 def close_tabs(page: Page) -> None:
     for _ in range(10):
         close = page.locator(".wapyt-tab-close").first
@@ -487,6 +535,7 @@ def main() -> int:
                 export_checks(page, engine, conn_id_of(page, name))
                 sql_checks(page, engine)
                 generate_check(page, engine)
+                navigator_checks(page, engine)
             except Exception as exc:  # noqa: BLE001 - report and carry on
                 check(False, f"{engine}: {type(exc).__name__}: {str(exc).splitlines()[0]}")
                 shot(page, f"smoke-{engine}-error")

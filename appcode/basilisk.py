@@ -212,7 +212,8 @@ class Basilisk(MainWindow):
         # Loaded tree levels. Keys are locations: (conn, db, schema).
         self._dbs: dict = {}                 # conn -> [database rows]
         self._schemas: dict = {}             # (conn, db) -> [schema rows]
-        self._objects: dict = {}             # (conn, db, schema) -> {"tables", "views"}
+        self._objects: dict = {}             # (conn, db, schema) -> sqlops.objects result
+        self._roles: dict = {}               # conn -> [role rows]
         self._errors: dict = {}              # tree node id -> load error
         self._loading: set = set()
         self._selected: dict = {}
@@ -266,7 +267,9 @@ class Basilisk(MainWindow):
 
         server = ["server"]
         location = ["server", "database", "schema"]
-        objects = ["table", "view"]
+        objects = ["table", "view", "matview"]
+        code = ["function", "procedure", "sequence", "trigger"]
+        routines = ["function", "procedure"]
         self.tree = Tree(
             TreeConfig(
                 filterable=True,
@@ -277,7 +280,7 @@ class Basilisk(MainWindow):
                     TreeAction("connect", "Connect / refresh", "mdi-connection", kinds=server),
                     TreeAction("sql", "New SQL editor", "mdi-console-line", kinds=location),
                     TreeAction("refresh", "Refresh", "mdi-refresh",
-                               kinds=["database", "schema", "group"]),
+                               kinds=["database", "schema", "group", "roles"]),
                     TreeAction("disconnect", "Disconnect", "mdi-lan-disconnect", kinds=server),
                     TreeAction(separator=True),
                     TreeAction("edit_conn", "Edit connection…", "mdi-pencil", kinds=server),
@@ -295,8 +298,17 @@ class Basilisk(MainWindow):
                                kinds=["table"]),
                     TreeAction("export_csv", "Export CSV", "mdi-file-delimited-outline",
                                kinds=objects),
+                    TreeAction("refresh_matview", "Refresh materialized view…",
+                               "mdi-table-refresh", kinds=["matview"]),
+                    TreeAction("open_obj", "Open", "mdi-information-outline",
+                               kinds=code + ["role"]),
+                    TreeAction("call_sql", "Call in a SQL editor", "mdi-play-outline",
+                               kinds=routines),
+                    TreeAction("def_sql", "Definition in a SQL editor", "mdi-console-line",
+                               kinds=code + ["role"]),
+                    TreeAction("trigger_table", "Open the table", "mdi-table", kinds=["trigger"]),
                     TreeAction("copy_name", "Copy qualified name", "mdi-content-copy",
-                               kinds=objects),
+                               kinds=objects + ["function", "procedure", "sequence"]),
                 ],
             ),
             root="#bk-tree-host",
@@ -371,6 +383,8 @@ class Basilisk(MainWindow):
         tab = self._tabs[tid]
         if tab["kind"] == "table":
             self._table_action(tid, action, button)
+        elif tab["kind"] == "object":
+            self._object_action(tid, action, button)
         else:
             self._sql_action(tid, action, button)
 
@@ -480,6 +494,7 @@ class Basilisk(MainWindow):
 
     def _forget(self, conn_id: int) -> None:
         self._dbs.pop(conn_id, None)
+        self._roles.pop(conn_id, None)
         for store in (self._schemas, self._objects):
             for key in [key for key in store if key[0] == conn_id]:
                 store.pop(key, None)
@@ -531,12 +546,42 @@ class Basilisk(MainWindow):
         if children is None:
             children = [self._note_item(node, self._errors.get(node) or (
                 "Connecting…" if node in self._loading else "Expand to connect"))]
+        elif conn.get("has_roles"):
+            children = children + [self._roles_item(conn)]
         badge = {"prod": "PROD", "test": "TEST", "dev": "DEV"}.get(conn.get("env") or "")
         return TreeItem(
             id=node, label=conn["name"], icon=conn.get("icon") or "mdi-database",
             tooltip=tooltip, items=children, badge=badge,
             data={"kind": "server", "conn": conn_id, "db": "", "schema": ""},
         )
+
+    def _roles_item(self, conn: dict) -> TreeItem:
+        conn_id = conn["id"]
+        node = _node_id("r", conn_id)
+        loaded = self._roles.get(conn_id)
+        if loaded is None:
+            items = [self._note_item(node, self._errors.get(node) or (
+                "Loading…" if node in self._loading else "Expand to list"))]
+        else:
+            items = [self._role_item(conn_id, row) for row in loaded] or [
+                self._note_item(node, "None visible")]
+        return TreeItem(
+            id=node, label=conn.get("roles_label") or "Users & roles", icon="mdi-account-group",
+            open_icon="mdi-account-group", badge=len(loaded) if loaded is not None else None,
+            items=items, data={"kind": "roles", "conn": conn_id, "db": "", "schema": ""})
+
+    @staticmethod
+    def _role_item(conn_id: int, row: dict) -> TreeItem:
+        flags = [word for word, on in (("can log in", row.get("login")),
+                                       ("administrator", row.get("admin")),
+                                       ("role", row.get("role"))) if on]
+        icon = "mdi-account-star" if row.get("admin") else (
+            "mdi-account" if row.get("login") else "mdi-account-outline")
+        return TreeItem(
+            id=_node_id("u", conn_id, row["id"]), label=row["name"], icon=icon,
+            tooltip=row["name"] + (f"\n{', '.join(flags)}" if flags else ""),
+            data={"kind": "role", "conn": conn_id, "db": "", "schema": "", "name": row["name"],
+                  "ident": row["id"]})
 
     def _db_item(self, conn: dict, row: dict) -> TreeItem:
         conn_id = conn["id"]
@@ -575,26 +620,72 @@ class Basilisk(MainWindow):
             data={"kind": "schema", "conn": conn_id, "db": db, "schema": name},
         )
 
+    # group key, label, icon, which list of the objects result, row kind
+    _GROUPS = (
+        ("tables", "Tables", "mdi-table-multiple", "tables", "table"),
+        ("views", "Views", "mdi-eye-outline", "views", "view"),
+        ("functions", "Functions", "mdi-function-variant", "routines", "function"),
+        ("procedures", "Procedures", "mdi-cog-play-outline", "routines", "procedure"),
+        ("sequences", "Sequences", "mdi-counter", "sequences", "sequence"),
+        ("triggers", "Triggers", "mdi-lightning-bolt-outline", "triggers", "trigger"),
+    )
+
     def _object_children(self, conn: dict, loc: tuple, parent: str) -> list | None:
-        """The Tables / Views groups of a location, or None while unloaded."""
+        """The object groups of a location (Tables, Views, ...), or None while unloaded."""
         found = self._objects.get(loc)
         if found is None:
             return None
         conn_id, db, schema = loc
+        shown = {"tables", "views", *(found.get("groups") or [])}
+        errors = found.get("errors") or {}
         groups = []
-        for group, label, icon, rows in (
-            ("tables", "Tables", "mdi-table-multiple", found.get("tables") or []),
-            ("views", "Views", "mdi-eye-outline", found.get("views") or []),
-        ):
+        for group, label, icon, source, kind in self._GROUPS:
+            if group not in shown:
+                continue
             gid = _node_id("g", conn_id, db, schema, group)
-            kind = "table" if group == "tables" else "view"
-            items = [self._object_item(loc, row, kind) for row in rows] or [
-                self._note_item(gid, f"No {label.lower()}")]
+            rows = [row for row in found.get(source) or []
+                    if source != "routines" or row.get("kind") == kind]
+            if source in errors:
+                items = [self._note_item(gid, f"⚠ {errors[source]}")]
+            else:
+                items = self._group_items(loc, rows, kind) or [
+                    self._note_item(gid, f"No {label.lower()}")]
             groups.append(TreeItem(
-                id=gid, label=label, icon=icon, open_icon=icon, badge=len(rows), items=items,
+                id=gid, label=label, icon=icon, open_icon=icon,
+                badge=None if source in errors else len(rows), items=items,
                 data={"kind": "group", "conn": conn_id, "db": db, "schema": schema},
             ))
         return groups
+
+    def _group_items(self, loc: tuple, rows: list, kind: str) -> list:
+        if kind in ("table", "view"):
+            return [self._object_item(loc, row, kind) for row in rows]
+        conn_id, db, schema = loc
+        names = [row["name"] for row in rows]
+        items = []
+        for row in rows:
+            name = row["name"]
+            ident = row.get("id") or name
+            table = row.get("table") or ""
+            label, tip = name, ".".join(part for part in (db, schema, name) if part)
+            if kind in ("function", "procedure"):
+                signature = f"{name}({row.get('args') or ''})"
+                if names.count(name) > 1:   # overloads: tell them apart
+                    label = signature
+                tip = f"{tip}({row.get('args') or ''})"
+                if row.get("returns"):
+                    tip += f"\nreturns {row['returns']}"
+            elif kind == "trigger":
+                if names.count(name) > 1:
+                    label = f"{name} ({table})"
+                tip += f"\n{row.get('timing', '')} {row.get('events', '')} ON {table}".rstrip()
+            items.append(TreeItem(
+                id=_node_id("o", conn_id, db, schema, kind, ident, table), label=label,
+                icon=dict((g[4], g[2]) for g in self._GROUPS)[kind], tooltip=tip,
+                data={"kind": kind, "conn": conn_id, "db": db, "schema": schema, "name": name,
+                      "ident": ident, "table": table, "label": label},
+            ))
+        return items
 
     def _object_item(self, loc: tuple, row: dict, kind: str) -> TreeItem:
         conn_id, db, schema = loc
@@ -603,8 +694,11 @@ class Basilisk(MainWindow):
         tip = ".".join(part for part in (db, schema, name) if part)
         if rows is not None:
             tip += f"\n≈ {_count(rows)} rows"
+        if row.get("materialized"):
+            kind = "matview"    # its own menu (Refresh); opens like a view
+            tip += "\nmaterialized view"
         icon = "mdi-table" if kind == "table" else (
-            "mdi-table-eye" if row.get("materialized") else "mdi-eye-outline")
+            "mdi-table-eye" if kind == "matview" else "mdi-eye-outline")
         return TreeItem(
             id=_node_id("t", conn_id, db, schema, name), label=name, icon=icon, tooltip=tip,
             data={"kind": kind, "conn": conn_id, "db": db, "schema": schema, "name": name},
@@ -648,11 +742,16 @@ class Basilisk(MainWindow):
                 _spawn(self._load_objects((conn_id, db, ""), node_id), "objects")
         elif kind == "schema" and (conn_id, db, schema) not in self._objects:
             _spawn(self._load_objects((conn_id, db, schema), node_id), "objects")
+        elif kind == "roles" and conn_id not in self._roles and node_id not in self._loading:
+            _spawn(self._load_roles(conn_id), "roles")
 
     def _on_tree_activate(self, payload: dict) -> None:
         data = self._payload_data(payload)
-        if data.get("kind") in ("table", "view"):
-            self._open_table(self._loc(data), data["name"], data["kind"])
+        kind = data.get("kind")
+        if kind in ("table", "view", "matview"):
+            self._open_table(self._loc(data), data["name"], "table" if kind == "table" else "view")
+        elif kind in self._OBJECT_ICONS:
+            self._open_object(data)
 
     @staticmethod
     def _loc(data: dict) -> tuple:
@@ -715,12 +814,22 @@ class Basilisk(MainWindow):
         conn_id, db, schema = loc
         result = await self._load(node, SqlService().objects_async(conn_id, db, schema))
         if result.get("ok"):
-            self._objects[loc] = {"tables": result["tables"], "views": result["views"]}
+            self._objects[loc] = {key: value for key, value in result.items() if key != "ok"}
             self._rebuild_tree()
             self.tree.expand(_node_id("g", conn_id, db, schema, "tables"))
         else:
             self._objects.pop(loc, None)
             self._rebuild_tree()
+
+    async def _load_roles(self, conn_id: int) -> None:
+        node = _node_id("r", conn_id)
+        result = await self._load(node, SqlService().roles_async(
+            conn_id, bool(self._settings.get("show_system"))))
+        if result.get("ok"):
+            self._roles[conn_id] = result["value"]
+        else:
+            self._roles.pop(conn_id, None)
+        self._rebuild_tree()
 
     async def _refresh_conn(self, conn_id: int) -> None:
         expanded = set(self.tree.get_expanded())
@@ -734,6 +843,8 @@ class Basilisk(MainWindow):
             await self._load_objects((conn_id, "", ""), _node_id("c", conn_id))
             return
         await self._load_databases(conn_id)
+        if _node_id("r", conn_id) in expanded and conn.get("has_roles"):
+            await self._load_roles(conn_id)
         for row in self._dbs.get(conn_id, []):
             dnode = _node_id("d", conn_id, row["name"])
             if dnode not in expanded:
@@ -755,6 +866,10 @@ class Basilisk(MainWindow):
         levels = conn.get("levels") or []
         kind = data.get("kind")
         db, schema = data.get("db") or "", data.get("schema") or ""
+        if kind == "roles":
+            self._roles.pop(conn_id, None)
+            await self._load_roles(conn_id)
+            return
         if kind == "database" and "schema" in levels:
             self._schemas.pop((conn_id, db), None)
             for key in [key for key in self._objects if key[:2] == (conn_id, db)]:
@@ -784,12 +899,20 @@ class Basilisk(MainWindow):
             "generate": lambda: self._generate_dialog(self._loc(data), name),
             "select_sql": lambda: self._select_in_editor(self._loc(data), name),
             "copy_name": lambda: self._copy_name(self._loc(data), name),
+            "refresh_matview": lambda: self._refresh_matview(self._loc(data), name),
+            "call_sql": lambda: self._object_to_sql(data, "call_sql"),
+            "def_sql": lambda: self._object_to_sql(data, "definition"),
         }
         if action == "sql":
             self._open_sql(conn_id, self._editor_db(data))
         elif action in ("open", "properties", "ddl"):
             sub = {"open": "data", "properties": "columns", "ddl": "ddl"}[action]
-            self._open_table(self._loc(data), name, data.get("kind", "table"), sub)
+            kind = data.get("kind", "table")
+            self._open_table(self._loc(data), name, "table" if kind == "table" else "view", sub)
+        elif action == "open_obj":
+            self._open_object(data)
+        elif action == "trigger_table":
+            self._open_table(self._loc(data), data.get("table") or "", "table")
         elif action == "export_csv":
             self._export_table(self._loc(data), name, "", "", "csv")
         elif action in handlers:
@@ -1178,7 +1301,7 @@ class Basilisk(MainWindow):
                     widget.destroy()
                 except Exception:  # noqa: BLE001 - already torn down with its tab
                     pass
-        for key in ("editor", "ddl_editor"):
+        for key in ("editor", "ddl_editor", "def_editor"):
             editor = tab.get(key)
             if editor is not None:
                 try:
@@ -2346,6 +2469,185 @@ class Basilisk(MainWindow):
         info = self._tabs[tid].get("info") or {}
         if await _copy(info.get("ddl") or ""):
             self._toast("Copied the DDL.", kind="success")
+
+    # ------------------------------------------------------------------
+    # Object tabs: a routine, sequence, trigger or role (read-only):
+    # its properties on the left, its definition on the right.
+    # ------------------------------------------------------------------
+
+    _OBJECT_ICONS = {"function": "mdi-function-variant", "procedure": "mdi-cog-play-outline",
+                     "sequence": "mdi-counter", "trigger": "mdi-lightning-bolt-outline",
+                     "role": "mdi-account"}
+
+    def _open_object(self, data: dict) -> str:
+        kind = data["kind"]
+        loc = self._loc(data)
+        ident = str(data.get("ident") or data["name"])
+        table = data.get("table") or ""
+        for tid, tab in self._tabs.items():
+            if (tab["kind"] == "object" and tab["loc"] == loc and tab["object_kind"] == kind
+                    and tab["ident"] == ident and tab["table"] == table):
+                self.tabs.set_active(tid)
+                return tid
+        conn = self._conn(loc[0]) or {}
+        icon = self._OBJECT_ICONS[kind]
+        label = data.get("label") or data["name"]
+        tid, container = self._new_tab(label, icon)
+        self._tabs[tid] = {
+            "tid": tid, "kind": "object", "conn": loc[0], "db": loc[1], "loc": loc,
+            "name": data["name"], "label": label, "object_kind": kind, "ident": ident,
+            "table": table, "engine": conn.get("engine") or "", "info": None, "def_editor": None,
+        }
+        container.innerHTML = self._object_html(tid, conn, loc, kind, label, icon)
+        self.tabs.set_active(tid)
+        _spawn(self._load_object(tid), "object open")
+        return tid
+
+    def _object_html(self, tid: str, conn: dict, loc: tuple, kind: str, label: str,
+                     icon: str) -> str:
+        extra = ""
+        if kind in ("function", "procedure"):
+            extra += ('<button type="button" class="bk-btn" data-bk="obj_call" '
+                      'title="A statement that calls it, in a new SQL editor">'
+                      '<span class="mdi mdi-play-outline"></span><span>Call…</span></button>')
+        if kind == "trigger":
+            extra += ('<button type="button" class="bk-btn" data-bk="obj_table" '
+                      'title="Open the table the trigger is on">'
+                      '<span class="mdi mdi-table"></span><span>Open table</span></button>')
+        word = kind.capitalize()
+        if kind == "role":
+            word = {"mysql": "Account", "mssql": "Login or role"}.get(conn.get("engine"), "Role")
+        return f"""
+<div class="bk-view" data-tab="{tid}">
+  <div class="bk-head">{self._crumbs(conn, loc[1], loc[2], label, icon)}
+    <span class="bk-head-stats">{_esc(word)}</span></div>
+  <div class="bk-bar">
+    <button type="button" class="bk-btn" data-bk="obj_copy" title="Copy the definition">
+      <span class="mdi mdi-content-copy"></span><span>Copy</span></button>
+    <button type="button" class="bk-btn" data-bk="obj_sql" title="The definition, in a new SQL editor">
+      <span class="mdi mdi-console-line"></span><span>Open in SQL editor</span></button>
+    {extra}
+    <button type="button" class="bk-btn" data-bk="obj_refresh" title="Read it again">
+      <span class="mdi mdi-refresh"></span></button>
+    <span class="bk-spacer"></span>
+    <span class="bk-note" id="{tid}-note"></span>
+  </div>
+  <div class="bk-status" id="{tid}-status" hidden></div>
+  <div class="bk-obj">
+    <div class="bk-obj-props" id="{tid}-props"><p class="bk-obj-empty">Loading…</p></div>
+    <div class="bk-results bk-obj-def"><div class="bk-panel bk-code-host" id="{tid}-def"></div></div>
+  </div>
+</div>"""
+
+    async def _load_object(self, tid: str) -> None:
+        tab = self._tabs.get(tid)
+        if tab is None:
+            return
+        conn_id, db, schema = tab["loc"]
+        result = await SqlService().object_info_async(conn_id, db, schema, tab["object_kind"],
+                                                      tab["ident"], tab["table"])
+        if tid not in self._tabs:
+            return
+        if not result.get("ok"):
+            self._status(tid, result.get("error", "Could not read it"))
+            _el(f"{tid}-props").innerHTML = ""
+            return
+        tab["info"] = result
+        self._status(tid, result.get("note") or "", "info")
+        _el(f"{tid}-note").textContent = (
+            "Definition from the server" if result.get("native")
+            else "Definition generated from the catalogue")
+        rows = "".join(f"<tr><th>{_esc(label)}</th><td>{_esc(value)}</td></tr>"
+                       for label, value in result.get("properties") or [])
+        lists = ""
+        for block in result.get("lists") or []:
+            items = block.get("items") or []
+            entries = "".join(
+                f'<li><button type="button" class="bk-link" data-bk="obj_role" '
+                f'data-name="{_esc(item)}">{_esc(item)}</button></li>'
+                if tab["object_kind"] == "role" else f"<li>{_esc(item)}</li>" for item in items)
+            lists += (f'<h3 class="bk-h3">{_esc(block["title"])} <small>{len(items)}</small></h3>'
+                      + (f'<ul class="bk-obj-list">{entries}</ul>' if items
+                         else '<p class="bk-obj-empty">None</p>'))
+        _el(f"{tid}-props").innerHTML = (
+            f'<table class="bk-kv bk-obj-kv"><tbody>{rows}</tbody></table>{lists}')
+        await self._show_definition(tid)
+
+    async def _show_definition(self, tid: str) -> None:
+        tab = self._tabs[tid]
+        text = (tab["info"] or {}).get("definition") or "-- No definition to show"
+        if tab.get("def_editor") is not None:
+            tab["def_editor"].setValue(text)
+            return
+        host = _el(f"{tid}-def")
+        conn = self._conn(tab["conn"]) or {}
+        if await self._ensure_editor():
+            if tid not in self._tabs:
+                return
+            tab["def_editor"] = self._mount_editor(host, value=text, read_only=True,
+                                                   dialect=conn.get("dialect") or "StandardSQL",
+                                                   label="Definition", wrap=True)
+        else:
+            host.innerHTML = f'<pre class="bk-pre bk-fill bk-wrap">{_esc(text)}</pre>'
+
+    def _object_action(self, tid: str, action: str, button) -> None:
+        tab = self._tabs[tid]
+        info = tab.get("info") or {}
+        if action == "obj_refresh":
+            _spawn(self._load_object(tid), "object refresh")
+        elif action == "obj_copy":
+            _spawn(self._copy_text(info.get("definition") or "", "Copied the definition."),
+                   "copy")
+        elif action in ("obj_sql", "obj_call"):
+            text = info.get("call_sql" if action == "obj_call" else "definition")
+            if text:
+                self._open_sql(tab["conn"], tab["db"], text=text)
+        elif action == "obj_table" and tab["table"]:
+            self._open_table(tab["loc"], tab["table"], "table")
+        elif action == "obj_role":
+            name = _attr(button, "data-name")
+            self._open_object({"kind": "role", "conn": tab["conn"], "db": "", "schema": "",
+                               "name": name, "ident": name})
+
+    async def _copy_text(self, text: str, done: str) -> None:
+        if await _copy(text):
+            self._toast(done, kind="success")
+        else:
+            self._toast("Could not reach the clipboard.", kind="error")
+
+    async def _object_to_sql(self, data: dict, which: str) -> None:
+        """A tree action: the definition (or a call) of an object, in a new SQL editor."""
+        loc = self._loc(data)
+        result = await SqlService().object_info_async(
+            loc[0], loc[1], loc[2], data["kind"], str(data.get("ident") or data["name"]),
+            data.get("table") or "")
+        if not result.get("ok"):
+            self._toast(result.get("error", "Could not read it"), kind="error")
+            return
+        self._open_sql(loc[0], loc[1], text=result.get(which) or "")
+
+    async def _refresh_matview(self, loc: tuple, name: str) -> None:
+        conn_id, db, schema = loc
+        conn = self._conn(conn_id) or {}
+        if conn.get("read_only"):
+            self._toast("This connection is read-only.", kind="warning")
+            return
+        plan = await SqlService().refresh_matview_async(conn_id, db, schema, name, True)
+        if not plan.get("ok"):
+            self._toast(plan.get("error", "Could not refresh"), kind="error")
+            return
+        if not await self._confirm_sql("Refresh materialized view", [plan["sql"]], plan["note"],
+                                       prod=conn.get("env") == "prod", ok_text="Refresh"):
+            return
+        self._toast(f"Refreshing {name}…")
+        done = await SqlService().refresh_matview_async(conn_id, db, schema, name, False)
+        if not done.get("ok"):
+            self._toast(done.get("error", "Could not refresh"), kind="error")
+            return
+        self._toast(f"Refreshed {name} in {done['ms']:,} ms.", kind="success")
+        for tid, tab in list(self._tabs.items()):
+            if tab["kind"] == "table" and tab["loc"] == loc and tab["name"] == name:
+                await self._refresh_table(tid)
 
     # ------------------------------------------------------------------
     # SQL editor tabs
@@ -3790,6 +4092,24 @@ td.bk-num{font-variant-numeric:tabular-nums;}
 .bk-about-link b{display:block;color:var(--bk-text);font-weight:600;}
 .bk-about-link small{color:var(--bk-muted);font-size:11.5px;}
 .bk-kv{border-collapse:collapse;width:100%;font:13px system-ui,sans-serif;color:var(--bk-text);}
+/* Object tabs: properties beside the definition, stacked when narrow. */
+.bk-obj{display:flex;flex:1 1 auto;min-height:0;}
+.bk-obj-props{flex:0 0 360px;overflow:auto;padding:6px 14px 16px;border-right:1px solid var(--bk-line);
+  box-sizing:border-box;}
+.bk-obj-def{flex:1 1 auto;min-width:0;}
+.bk-obj-kv th{width:auto;}
+.bk-obj-kv td{word-break:break-word;}
+.bk-obj-list{margin:0;padding:0 0 0 2px;list-style:none;}
+.bk-obj-list li{padding:2px 0;}
+.bk-obj-empty{margin:4px 0;color:var(--bk-dim);}
+.bk-wrap{white-space:pre-wrap;word-break:break-word;}
+.bk-link{background:none;border:0;padding:0;color:var(--bk-accent);cursor:pointer;
+  font:inherit;text-align:left;}
+.bk-link:hover{text-decoration:underline;}
+@container (max-width: 720px){
+  .bk-obj{flex-direction:column;}
+  .bk-obj-props{flex:0 0 auto;max-height:45%;border-right:0;border-bottom:1px solid var(--bk-line);}
+}
 .bk-kv th{text-align:left;font-weight:500;color:var(--bk-muted);padding:6px 12px 6px 0;
   white-space:nowrap;vertical-align:top;width:40%;}
 .bk-kv td{padding:6px 0;}

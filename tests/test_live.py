@@ -598,3 +598,137 @@ def test_cell_download_route(user_id, profile):
     assert client.get(f"/bk/cell/{conn_id}", params=params).status_code == 404
     params.update(key="not json")
     assert client.get(f"/bk/cell/{conn_id}", params=params).status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# More navigator objects: routines, sequences, triggers, roles, matviews
+# ---------------------------------------------------------------------------
+
+GROUPS = {
+    "postgresql": ["functions", "procedures", "sequences", "triggers"],
+    "mysql": ["functions", "procedures", "triggers"],
+    "mssql": ["functions", "procedures", "sequences", "triggers"],
+    "sqlite": ["triggers"],
+}
+
+
+def test_navigator_lists_routines_sequences_triggers(user_id, profile):
+    from services import sqlops
+
+    engine, conn_id = profile
+    database, schema = LOCATION[engine]
+    found = sqlops.objects(user_id, conn_id, database, schema)
+    assert found["groups"] == GROUPS[engine] and found["errors"] == {}
+    triggers = {(t["name"], t["table"]) for t in found["triggers"]}
+    assert ("orders_status_check", "orders") in triggers
+    trigger = next(t for t in found["triggers"] if t["name"] == "orders_status_check")
+    assert trigger["timing"] in ("BEFORE", "AFTER") and "UPDATE" in trigger["events"].upper()
+    routines = {(r["name"], r["kind"]) for r in found["routines"]}
+    sequences = {s["name"] for s in found["sequences"]}
+    if engine == "sqlite":
+        assert routines == set() and sequences == set()
+        return
+    assert {("order_total", "function"), ("archive_order", "procedure")} <= routines
+    if engine == "postgresql":
+        overloads = [r for r in found["routines"] if r["name"] == "order_total"]
+        assert sorted(r["args"] for r in overloads) == [
+            "p_order integer", "p_order integer, p_tax numeric"]
+        assert len({r["id"] for r in overloads}) == 2
+        assert {"invoice_no", "customers_id_seq"} <= sequences
+        assert any(v["name"] == "product_sales" and v["materialized"] for v in found["views"])
+    if engine == "mssql":
+        assert "invoice_no" in sequences
+        assert ("customer_orders", "function") in routines
+
+
+def test_object_info_definitions_and_call_templates(user_id, profile):
+    from services import sqlops
+
+    engine, conn_id = profile
+    database, schema = LOCATION[engine]
+    found = sqlops.objects(user_id, conn_id, database, schema)
+    trigger = sqlops.object_info(user_id, conn_id, database, schema, "trigger",
+                                 "orders_status_check", "orders")
+    assert "orders_status_check" in trigger["definition"]
+    assert trigger["table"] == "orders"
+    assert dict(trigger["properties"])["Table"] == "orders"
+    if engine == "sqlite":
+        return
+    by_name = {}
+    for r in found["routines"]:
+        by_name.setdefault(r["name"], r)
+    total = sqlops.object_info(user_id, conn_id, database, schema, "function",
+                               by_name["order_total"]["id"])
+    assert "order_total" in total["definition"] and total["definition"].upper().count("CREATE") >= 1
+    assert total["call_sql"].lstrip().upper().startswith("SELECT")
+    assert "order_total" in total["call_sql"] and "NULL" in total["call_sql"]
+    proc = sqlops.object_info(user_id, conn_id, database, schema, "procedure",
+                              by_name["archive_order"]["id"])
+    first = {"postgresql": "CALL", "mysql": "CALL", "mssql": "DECLARE"}[engine]
+    assert proc["call_sql"].startswith(first), proc["call_sql"]
+    if engine == "mysql":
+        assert "@p_moved" in proc["call_sql"] and proc["call_sql"].rstrip().endswith("SELECT @p_moved;")
+    if engine == "mssql":
+        assert "@moved = @out_moved OUTPUT" in proc["call_sql"]
+        table_fn = sqlops.object_info(user_id, conn_id, database, schema, "function",
+                                      by_name["customer_orders"]["id"])
+        assert table_fn["call_sql"].startswith("SELECT * FROM")
+    if engine == "postgresql":
+        table_fn = sqlops.object_info(user_id, conn_id, database, schema, "function",
+                                      by_name["customer_orders"]["id"])
+        assert table_fn["call_sql"].startswith("SELECT * FROM")
+        assert dict(total["properties"])["Comment"] == "Sum of an order's lines"
+    if engine in ("postgresql", "mssql"):
+        seq = sqlops.object_info(user_id, conn_id, database, schema, "sequence", "invoice_no")
+        assert dict(seq["properties"])["Start"] == "1000"
+        assert seq["definition"].startswith("CREATE SEQUENCE")
+    # The calls run: the templates are valid SQL once the NULLs are filled.
+    ran = sqlops.execute(user_id, conn_id, database,
+                         total["call_sql"].replace("NULL", "1", 1))
+    assert ran["ok"] and ran["results"][0].get("error") is None, ran
+    with pytest.raises(sqlops.OpError, match="any more"):
+        sqlops.object_info(user_id, conn_id, database, schema, "sequence", "no_such_thing")
+
+
+def test_roles_listing(user_id, profile):
+    from services import sqlops
+
+    engine, conn_id = profile
+    listed = sqlops.roles(user_id, conn_id)
+    if engine == "sqlite":
+        assert listed == []
+        return
+    me = {"postgresql": "postgres", "mysql": "root@%", "mssql": "sa"}[engine]
+    row = next(r for r in listed if r["name"] == me)
+    assert row["login"] and row["admin"]
+    shown = sqlops.object_info(user_id, conn_id, "", "", "role", me)
+    assert shown["definition"]
+    if engine == "postgresql":
+        assert "SUPERUSER" in shown["definition"] and not any(
+            r["name"].startswith("pg_") for r in listed)
+        assert any(r["name"].startswith("pg_") for r in sqlops.roles(user_id, conn_id, True))
+    if engine == "mysql":
+        assert "GRANT" in shown["definition"]
+        assert "password hash hidden" in shown["definition"] and "$A$" not in shown["definition"]
+    if engine == "mssql":
+        assert "sysadmin" in [i for lst in shown["lists"] for i in lst["items"]]
+
+
+def test_refresh_materialized_view(user_id, profile):
+    from services import sqlops
+
+    engine, conn_id = profile
+    database, schema = LOCATION[engine]
+    if engine != "postgresql":
+        with pytest.raises(sqlops.OpError, match="Only PostgreSQL"):
+            sqlops.refresh_matview(user_id, conn_id, database, schema, "order_totals", True)
+        return
+    plan = sqlops.refresh_matview(user_id, conn_id, database, schema, "product_sales", True)
+    assert plan["sql"] == 'REFRESH MATERIALIZED VIEW CONCURRENTLY public.product_sales;'
+    done = sqlops.refresh_matview(user_id, conn_id, database, schema, "product_sales")
+    assert done["ok"] and "ms" in done
+    ro = _make_profile(user_id, engine, read_only=True)
+    with pytest.raises(sqlops.OpError, match="read-only"):
+        sqlops.refresh_matview(user_id, ro, database, schema, "product_sales")
+    with pytest.raises(sqlops.OpError, match="No materialized view"):
+        sqlops.refresh_matview(user_id, conn_id, database, schema, "order_totals", True)

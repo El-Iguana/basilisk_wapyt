@@ -1,9 +1,10 @@
 """MySQL and MariaDB, through PyMySQL. A database is a schema here."""
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
-from services.engines.base import Engine, Field
+from services.engines.base import Engine, Field, info
 
 TLS_MODES = (
     ("off", "off"),
@@ -127,3 +128,182 @@ class MySQL(Engine):
         what = "VIEW" if kind == "view" else "TABLE"
         row = conn.execute(text(f"SHOW CREATE {what} {target}")).first()
         return (row[1] + ";") if row else None
+
+    # ------------------------------------------------------------------
+    # More navigator objects (MariaDB sequences are not listed yet)
+    # ------------------------------------------------------------------
+    object_groups = ("functions", "procedures", "triggers")
+    has_roles = True
+    _SYSTEM_ACCOUNTS = frozenset({"mysql.sys", "mysql.session", "mysql.infoschema",
+                                  "mariadb.sys"})
+
+    def list_routines(self, conn: Any, schema: Optional[str]) -> list:
+        from sqlalchemy import text
+
+        rows = conn.execute(text(
+            "SELECT ROUTINE_NAME, ROUTINE_TYPE, DTD_IDENTIFIER FROM information_schema.ROUTINES "
+            "WHERE ROUTINE_SCHEMA = :schema ORDER BY ROUTINE_NAME"), {"schema": schema}).all()
+        params = self._params(conn, schema)
+        return [{"id": f"{kind}:{name}", "name": name, "kind": kind.lower(),
+                 "args": ", ".join(_param_text(p) for p in params.get((kind, name), [])),
+                 "returns": returns or ""} for name, kind, returns in rows]
+
+    def _params(self, conn: Any, schema: Optional[str], name: Optional[str] = None) -> dict:
+        from sqlalchemy import text
+
+        sql = ("SELECT ROUTINE_TYPE, SPECIFIC_NAME, PARAMETER_MODE, PARAMETER_NAME, "
+               "DTD_IDENTIFIER FROM information_schema.PARAMETERS "
+               "WHERE SPECIFIC_SCHEMA = :schema AND ORDINAL_POSITION > 0")
+        if name is not None:
+            sql += " AND SPECIFIC_NAME = :name"
+        sql += " ORDER BY SPECIFIC_NAME, ORDINAL_POSITION"
+        binds = {"schema": schema} if name is None else {"schema": schema, "name": name}
+        found: dict = {}
+        for kind, routine, mode, pname, ptype in conn.execute(text(sql), binds).all():
+            found.setdefault((kind, routine), []).append(
+                {"name": pname or "", "type": ptype or "", "mode": mode or "IN"})
+        return found
+
+    def list_triggers(self, conn: Any, schema: Optional[str]) -> list:
+        from sqlalchemy import text
+
+        rows = conn.execute(text(
+            "SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE, ACTION_TIMING, EVENT_MANIPULATION "
+            "FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = :schema "
+            "ORDER BY EVENT_OBJECT_TABLE, TRIGGER_NAME"), {"schema": schema}).all()
+        return [{"name": name, "table": table, "timing": timing, "events": event}
+                for name, table, timing, event in rows]
+
+    def routine_info(self, conn: Any, schema: Optional[str], ident: str) -> Optional[dict]:
+        from sqlalchemy import text
+
+        kind, _, name = (ident or "").partition(":")
+        if kind not in ("FUNCTION", "PROCEDURE") or not name:
+            return None
+        row = conn.execute(text(
+            "SELECT DTD_IDENTIFIER, ROUTINE_BODY, SQL_DATA_ACCESS, IS_DETERMINISTIC, "
+            "SECURITY_TYPE, DEFINER, CREATED, LAST_ALTERED, ROUTINE_COMMENT, ROUTINE_DEFINITION "
+            "FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = :schema "
+            "AND ROUTINE_NAME = :name AND ROUTINE_TYPE = :kind"),
+            {"schema": schema, "name": name, "kind": kind}).first()
+        if row is None:
+            return None
+        returns, body, access, deterministic, security, definer, created, altered, comment, \
+            source = row
+        params = self._params(conn, schema, name).get((kind, name), [])
+        prep = conn.dialect.identifier_preparer
+        qualified = f"{prep.quote_identifier(schema)}.{prep.quote_identifier(name)}"
+        ddl, native = None, True
+        try:
+            shown = conn.execute(text(f"SHOW CREATE {kind} {qualified}")).first()
+            ddl = shown[2] if shown else None
+        except Exception:  # noqa: BLE001 - needs SHOW_ROUTINE or being the definer
+            ddl = None
+        if not ddl:
+            native = False
+            args = ", ".join(_param_text(p) for p in params)
+            head = f"CREATE {kind} {qualified}({args})"
+            if kind == "FUNCTION":
+                head += f" RETURNS {returns}"
+            ddl = f"{head}\n{source or '-- The body is hidden: it needs the SHOW_ROUTINE privilege'}"
+        return info(name, kind.lower(), [
+            ("Kind", kind.capitalize()),
+            ("Arguments", ", ".join(_param_text(p) for p in params) or "(none)"),
+            ("Returns", returns if kind == "FUNCTION" else None),
+            ("Language", body), ("Data access", access),
+            ("Deterministic", deterministic == "YES"), ("Security", security),
+            ("Definer", definer), ("Created", created), ("Last altered", altered),
+            ("Comment", comment),
+        ], ddl.rstrip().rstrip(";") + ";", native=native, returns=returns or "", sets=False,
+            params=params)
+
+    def trigger_info(self, conn: Any, schema: Optional[str], name: str,
+                     table: str) -> Optional[dict]:
+        from sqlalchemy import text
+
+        row = conn.execute(text(
+            "SELECT EVENT_OBJECT_TABLE, ACTION_TIMING, EVENT_MANIPULATION, ACTION_ORDER, "
+            "ACTION_STATEMENT, DEFINER, CREATED FROM information_schema.TRIGGERS "
+            "WHERE TRIGGER_SCHEMA = :schema AND TRIGGER_NAME = :name"),
+            {"schema": schema, "name": name}).first()
+        if row is None:
+            return None
+        table, timing, event, order, statement, definer, created = row
+        prep = conn.dialect.identifier_preparer
+        native = True
+        try:
+            shown = conn.execute(text(
+                f"SHOW CREATE TRIGGER {prep.quote_identifier(schema)}."
+                f"{prep.quote_identifier(name)}")).first()
+            ddl = shown[2] if shown else None
+        except Exception:  # noqa: BLE001
+            ddl = None
+        if not ddl:
+            native = False
+            ddl = (f"CREATE TRIGGER {prep.quote_identifier(name)} {timing} {event} "
+                   f"ON {prep.quote_identifier(table)}\nFOR EACH ROW {statement}")
+        return info(name, "trigger", [
+            ("Table", table), ("Timing", timing), ("Events", event), ("For each", "ROW"),
+            ("Order", order), ("Definer", definer), ("Created", created),
+        ], ddl.rstrip().rstrip(";") + ";", native=native, table=table)
+
+    def list_roles(self, conn: Any, show_system: bool) -> list:
+        from sqlalchemy import text
+
+        rows = conn.execute(text(
+            "SELECT User, Host, account_locked, Super_priv FROM mysql.user "
+            "ORDER BY User, Host")).all()
+        return [{"id": f"{user}@{host}", "name": f"{user}@{host}", "login": locked != "Y",
+                 "admin": superuser == "Y"} for user, host, locked, superuser in rows
+                if show_system or user not in self._SYSTEM_ACCOUNTS]
+
+    def role_info(self, conn: Any, ident: str) -> Optional[dict]:
+        from sqlalchemy import text
+
+        user, _, host = (ident or "").rpartition("@")
+        row = conn.execute(text(
+            "SELECT account_locked, password_expired, password_last_changed, plugin, "
+            "Super_priv, max_connections, max_user_connections FROM mysql.user "
+            "WHERE User = :user AND Host = :host"), {"user": user, "host": host}).first()
+        if row is None:
+            return None
+        locked, expired, changed, plugin, superuser, max_conn, max_user_conn = row
+        account = {"user": user, "host": host}
+        parts = []
+        try:
+            created = conn.execute(text("SHOW CREATE USER :user@:host"), account).scalar()
+            parts.append(_HASH.sub(r"\1'…' /* password hash hidden */", created or ""))
+        except Exception:  # noqa: BLE001 - needs SELECT on the mysql schema
+            pass
+        try:
+            parts += [r[0] for r in conn.execute(text("SHOW GRANTS FOR :user@:host"), account)]
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            granted = [f"{r[0]}@{r[1]}" for r in conn.execute(text(
+                "SELECT FROM_USER, FROM_HOST FROM mysql.role_edges "
+                "WHERE TO_USER = :user AND TO_HOST = :host ORDER BY 1, 2"), account)]
+            holders = [f"{r[0]}@{r[1]}" for r in conn.execute(text(
+                "SELECT TO_USER, TO_HOST FROM mysql.role_edges "
+                "WHERE FROM_USER = :user AND FROM_HOST = :host ORDER BY 1, 2"), account)]
+        except Exception:  # noqa: BLE001 - MariaDB keeps roles elsewhere
+            granted, holders = [], []
+        return info(ident, "role", [
+            ("User", user), ("Host", host), ("Can log in", locked != "Y"),
+            ("Password expired", expired == "Y"), ("Password changed", changed),
+            ("Authentication", plugin), ("Super privilege", superuser == "Y"),
+            ("Max connections per hour", max_conn or "no limit"),
+            ("Max simultaneous connections", max_user_conn or "no limit"),
+        ], ";\n\n".join(part.rstrip(";") for part in parts if part) + (";" if parts else ""),
+            lists=[{"title": "Granted roles", "items": granted},
+                   {"title": "Granted to", "items": holders}])
+
+
+# The password hash in SHOW CREATE USER: quoted (with backslash escapes) or hex.
+_HASH = re.compile(r"(IDENTIFIED\s+WITH\s+'[^']*'\s+AS\s+)(?:'(?:[^'\\]|\\.|'')*'|0x[0-9A-Fa-f]+)",
+                   re.I)
+
+
+def _param_text(param: dict) -> str:
+    mode = "" if param["mode"] == "IN" else param["mode"] + " "
+    return f"{mode}{param['name']} {param['type']}".strip()

@@ -34,7 +34,8 @@ appcode/                   # pytincture modules_path
     auth.py, login_page.py #   from Monguana (authenticator + policy hook; "Username" login form)
     db.py                  #   SQLite: users, connections, ui_state, query_history; Fernet; bcrypt
     engines/               #   one adapter per engine — plain modules, NOT BFFs
-      base.py              #     the hooks: URL, levels, read-only, timeout, cancel, split, DDL
+      base.py              #     the hooks: URL, levels, read-only, timeout, cancel, split, DDL,
+                           #     routines / sequences / triggers / roles (lists and object info)
       postgresql.py mysql.py mssql.py sqlite.py
     engine_pool.py         #   SQLAlchemy engines per (user, connection, database) — plain module
     sessions.py            #   manual commit mode: pinned connection per SQL tab, idle reaper — plain module
@@ -91,8 +92,8 @@ podman run -d --name basilisk-mysql -p 127.0.0.1:53306:3306 -e MYSQL_ROOT_PASSWO
 podman run -d --name basilisk-mssql -p 127.0.0.1:51433:1433 -e ACCEPT_EULA=Y \
   -e MSSQL_SA_PASSWORD="$PW" -e MSSQL_PID=Developer mcr.microsoft.com/mssql/server:2022-latest
 uv run python tests/smoke/seed_sample.py          # the shop sample in all four (SQLite: data/sqlite/shop.db)
-uv run --group dev pytest -q tests/test_live.py   # 80 live tests
-BASILISK_PASS=… python3 tests/smoke/ui_smoke.py   # ~22 UI checks per engine
+uv run --group dev pytest -q tests/test_live.py   # 96 live tests
+BASILISK_PASS=… python3 tests/smoke/ui_smoke.py   # ~27 UI checks per engine
 ```
 
 Users: `postgres` / `root` / `sa`. The sample (`seed_sample.py`): customers,
@@ -100,7 +101,13 @@ products (JSON, binary, a bigint past 2^53), orders (137 rows, uuid, time),
 order_items (composite key), `audit_log` (no primary key), a real PNG in
 `products.photo` and a 32,000-character note on customer 11 (both for the
 value panel), view
-`order_totals`; PostgreSQL and SQL Server also have a `sales` schema.
+`order_totals`; PostgreSQL and SQL Server also have a `sales` schema. For the
+navigator (`EXTRAS`): `order_total` (overloaded on PostgreSQL), a table
+function `customer_orders` (PostgreSQL, SQL Server), procedure
+`archive_order` with an output argument, sequence `invoice_no` (PostgreSQL,
+SQL Server), trigger `orders_status_check` on `orders` in all four (it only
+refuses an empty status), and on PostgreSQL the materialized view
+`product_sales` with a unique index.
 **Reseed before the smoke test**: `test_live.py` edits rows. The smoke test
 needs an admin whose password is not flagged (`manage.py reset-password`) and,
 against the container, `shop.db` copied into `/data/sqlite` (`podman cp`).
@@ -208,6 +215,38 @@ remembered per user (`settings.value_panel`).
   click reaches the document: `_on_keydown` opens the panel on
   `tab["focus_cell"]`, which a capture-phase click listener keeps
   (`_watch_cells`).
+
+### Navigator objects (milestone 2)
+
+- `sqlops.objects` lists tables and views, then the engine's
+  `object_groups` (functions, procedures, sequences, triggers; SQLite has
+  only triggers, MySQL no sequences). Each extra list fails on its own: its
+  group shows the error and the tables still load. On PostgreSQL each runs
+  in a **savepoint**, since one failed query aborts the transaction.
+- Opening one (`object_info`) answers `engines.base.info`: `[label, value]`
+  properties, the definition (the server's own where it has one:
+  `pg_get_functiondef`, `SHOW CREATE`, `OBJECT_DEFINITION`, `sqlite_master`;
+  generated for sequences and roles), optional lists (role memberships) and
+  a note. Object tabs are read-only: properties left, definition right.
+- Routine identity: PostgreSQL by **oid** (overloads share a name and are
+  labelled `name(args)`), SQL Server by object_id, MySQL by `KIND:name`.
+  PostgreSQL trigger names belong to their table, so a trigger is
+  `(name, table)`.
+- `call_sql` writes a call with `NULL /* name type */` per argument (block
+  comments, so a closing `;` never lands in one): `SELECT f(...)`,
+  `SELECT * FROM f(...)` for set-returning, `CALL p(...)`; MySQL OUT
+  arguments become `@vars` selected after; T-SQL declares `@out_` variables
+  for OUTPUT arguments and `EXEC`s with named arguments.
+- **Users & roles** (`list_roles` / `role_info`) are server-level, a group
+  under the connection after its databases: `pg_roles` (hiding `pg_*`
+  unless system objects are shown), `mysql.user` (needs SELECT on `mysql`;
+  `SHOW CREATE USER` with the **password hash masked**), SQL Server
+  `sys.server_principals` ("Logins & roles", fixed roles and `NT ` accounts
+  hidden). Database-level users are not listed yet.
+- **Refresh materialized view** (PostgreSQL) shows the statement first;
+  `CONCURRENTLY` when the view is populated and has a unique index on plain
+  columns. Refused on read-only profiles; prod connections get the red
+  confirm.
 
 ### SQL editor
 
