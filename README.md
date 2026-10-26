@@ -16,6 +16,10 @@ running in Pyodide) and the wapyt widget set.
   writes a ready-to-fill call in a SQL editor. PostgreSQL materialized views
   can be refreshed (concurrently when they allow it). Development / test /
   production connection types; read-only connections.
+- **Object actions**: create a table (columns, types, primary key, an
+  auto-numbered column), rename, truncate or drop it, add / rename / drop
+  columns, create / drop indexes, drop views. Each shows its SQL as you
+  fill it in and runs it in one transaction where the engine allows.
 - **Table editor**: paged data with a WHERE / ORDER BY bar, sorting by header,
   inline editing that stays pending until **Save** (shown as SQL first, run in
   one transaction), add / duplicate / delete rows, Set NULL, filter by a

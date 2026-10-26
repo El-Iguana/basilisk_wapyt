@@ -39,9 +39,14 @@ test.
   table's own tab; SQL Server database users and MySQL/MariaDB events;
   MariaDB sequences; role privileges (grants on objects); hiding
   extension-owned PostgreSQL functions.
-- **Object actions**: create/rename/drop table (with the generated DDL shown
-  first), truncate, create/drop index, add column — DBeaver's table designer
-  in a modest form.
+- ~~**Object actions**~~ — done (2026-10-26): create table (columns, types,
+  primary key, an auto-numbered column), rename, truncate, drop tables and
+  views; add / rename / drop columns; create / drop indexes. Each previews
+  its SQL live and runs in one transaction where the engine allows.
+  Follow-ups: change a column's type / NULL / default (ALTER COLUMN differs
+  per engine; SQLite needs a table rebuild); foreign keys and check
+  constraints; PostgreSQL DROP … CASCADE; create view; drop routines,
+  sequences and triggers.
 - **Import CSV** into a table (column mapping, type coercion, one transaction,
   progress through a job like Monguana's dumps).
 - **Column layout memory** per table (widths, order, hidden), as Monguana's

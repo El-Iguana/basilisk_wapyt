@@ -298,10 +298,11 @@ class ConnectionService:
             data["default_database"] = spec.default_database
             data["has_roles"] = spec.has_roles
             data["roles_label"] = spec.roles_label
+            data["types"] = list(spec.common_types)
         except engines.EngineError:
             data.update(engine_label=data.get("engine") or "?", icon="mdi-database-alert",
                         levels=[], dialect="StandardSQL", read_only_by_rollback=False,
-                        default_database="", has_roles=False, roles_label="")
+                        default_database="", has_roles=False, roles_label="", types=[])
         # Engine options hold no secrets today; send them back for the editor.
         data["options"] = options
         data["read_only"] = bool(data.get("read_only"))

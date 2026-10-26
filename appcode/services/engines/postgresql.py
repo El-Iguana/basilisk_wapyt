@@ -118,6 +118,9 @@ class PostgreSQL(Engine):
     # ------------------------------------------------------------------
     object_groups = ("functions", "procedures", "sequences", "triggers")
     has_roles = True
+    common_types = ("integer", "bigint", "smallint", "numeric(12,2)", "real",
+                    "double precision", "boolean", "text", "varchar(255)", "date", "time",
+                    "timestamp", "timestamptz", "uuid", "jsonb", "bytea")
 
     def list_routines(self, conn: Any, schema: Optional[str]) -> list:
         from sqlalchemy import text

@@ -309,6 +309,17 @@ class Basilisk(MainWindow):
                     TreeAction("trigger_table", "Open the table", "mdi-table", kinds=["trigger"]),
                     TreeAction("copy_name", "Copy qualified name", "mdi-content-copy",
                                kinds=objects + ["function", "procedure", "sequence"]),
+                    TreeAction(separator=True),
+                    TreeAction("create_table", "Create table…", "mdi-table-plus",
+                               kinds=["server", "database", "schema", "group"]),
+                    TreeAction("add_column", "Add column…", "mdi-table-column-plus-after",
+                               kinds=["table"]),
+                    TreeAction("create_index", "Create index…", "mdi-sort-ascending",
+                               kinds=["table"]),
+                    TreeAction("rename_table", "Rename…", "mdi-rename-box", kinds=["table"]),
+                    TreeAction("truncate", "Truncate…", "mdi-table-remove", kinds=["table"],
+                               danger=True),
+                    TreeAction("drop", "Drop…", "mdi-delete", kinds=objects, danger=True),
                 ],
             ),
             root="#bk-tree-host",
@@ -902,6 +913,12 @@ class Basilisk(MainWindow):
             "refresh_matview": lambda: self._refresh_matview(self._loc(data), name),
             "call_sql": lambda: self._object_to_sql(data, "call_sql"),
             "def_sql": lambda: self._object_to_sql(data, "definition"),
+            "create_table": lambda: self._create_table(data),
+            "add_column": lambda: self._add_column(self._loc(data), name),
+            "create_index": lambda: self._create_index(self._loc(data), name),
+            "rename_table": lambda: self._rename_table(self._loc(data), name),
+            "truncate": lambda: self._truncate(self._loc(data), name),
+            "drop": lambda: self._drop(self._loc(data), name, data.get("kind") or "table"),
         }
         if action == "sql":
             self._open_sql(conn_id, self._editor_db(data))
@@ -1437,10 +1454,24 @@ class Basilisk(MainWindow):
     <div class="bk-foot"><code id="{tid}-sql"></code></div>
   </div>
   <div class="bk-sub" data-sub="columns" hidden>
+    <div class="bk-bar" data-ddl-bar="1" hidden>
+      <button type="button" class="bk-btn" data-bk="col_add" title="Add a column to the table">
+        <span class="mdi mdi-table-column-plus-after"></span><span>Add column</span></button>
+      <button type="button" class="bk-btn" data-bk="col_rename" title="Rename the selected column">
+        <span class="mdi mdi-rename-box"></span><span>Rename</span></button>
+      <button type="button" class="bk-btn" data-bk="col_drop" title="Drop the selected column">
+        <span class="mdi mdi-table-column-remove"></span><span>Drop</span></button>
+    </div>
     <div class="bk-results"><div class="bk-panel" id="{tid}-cols"></div></div>
   </div>
   <div class="bk-sub bk-scroll" data-sub="keys" hidden>
-    <h3 class="bk-h3"><span class="mdi mdi-sort-ascending"></span>Indexes</h3>
+    <h3 class="bk-h3"><span class="mdi mdi-sort-ascending"></span>Indexes
+      <span class="bk-h3-tools" data-ddl-bar="1" hidden>
+        <button type="button" class="bk-btn bk-mini" data-bk="ix_create">
+          <span class="mdi mdi-plus"></span><span>Create index</span></button>
+        <button type="button" class="bk-btn bk-mini" data-bk="ix_drop" title="Drop the selected index">
+          <span class="mdi mdi-delete-outline"></span><span>Drop</span></button>
+      </span></h3>
     <div class="bk-box" id="{tid}-idx"></div>
     <h3 class="bk-h3"><span class="mdi mdi-link-variant"></span>Foreign keys
       <small>double-click to open the referenced table</small></h3>
@@ -1487,6 +1518,9 @@ class Basilisk(MainWindow):
             button.hidden = not editable
         for button in (_el(f"{tid}-save"), _el(f"{tid}-revert")):
             button.hidden = not editable
+        # Column and index actions: any table on a writable connection.
+        for bar in root.querySelectorAll("[data-ddl-bar]"):
+            bar.hidden = info["kind"] != "table" or bool(info.get("read_only"))
         note = ""
         if info.get("read_only"):
             note = "Read-only connection"
@@ -1724,6 +1758,8 @@ class Basilisk(MainWindow):
         elif action == "ddl_sql":
             info = tab.get("info") or {}
             self._open_sql(tab["conn"], tab["db"], info.get("ddl") or "")
+        elif action in ("col_add", "col_rename", "col_drop", "ix_create", "ix_drop"):
+            _spawn(self._tab_ddl(tid, action), action)
 
     async def _refresh_table(self, tid: str) -> None:
         if await self._discard_ok(tid):
@@ -2329,7 +2365,7 @@ class Basilisk(MainWindow):
                      "used; see the marked cells.")
 
     async def _confirm_sql(self, title: str, statements: list, note: str, *, prod: bool = False,
-                           ok_text: str = "Run") -> bool:
+                           ok_text: str = "Run", danger: bool = False) -> bool:
         """Show SQL before it runs; resolves to the person's answer."""
         loop = asyncio.get_event_loop()
         answer = loop.create_future()
@@ -2344,7 +2380,7 @@ class Basilisk(MainWindow):
             f'<pre class="bk-pre">{_esc(chr(10).join(shown) + more)}</pre>'
             '<div class="bk-actions">'
             '<button type="button" class="bk-btn" data-answer="no">Cancel</button>'
-            f'<button type="button" class="bk-btn {"bk-danger" if prod else "bk-primary"}" '
+            f'<button type="button" class="bk-btn {"bk-danger" if prod or danger else "bk-primary"}" '
             f'data-answer="yes">{_esc(ok_text)}</button></div></div>')
 
         def _on_click(event) -> None:
@@ -2406,7 +2442,7 @@ class Basilisk(MainWindow):
                 {"id": f"i{i}", "name": ix["name"] or "", "columns": ", ".join(ix["columns"]),
                  "kind": "UNIQUE" if ix["unique"] else "INDEX"}
                 for i, ix in enumerate(info["indexes"])],
-            selection="none", empty_text="No indexes"), container=_el(f"{tid}-idx"))
+            selection="single", empty_text="No indexes"), container=_el(f"{tid}-idx"))
 
         tab["fk_table"] = DataTable(DataTableConfig(
             columns=[ColumnConfig(id="name", header="Name", width=220),
@@ -2469,6 +2505,423 @@ class Basilisk(MainWindow):
         info = self._tabs[tid].get("info") or {}
         if await _copy(info.get("ddl") or ""):
             self._toast("Copied the DDL.", kind="success")
+
+    # ------------------------------------------------------------------
+    # Object actions: create / rename / drop / truncate a table, its
+    # columns and indexes. Each shows its SQL (sqlops.alter, dry run)
+    # before it runs; drops and truncates get the red confirm.
+    # ------------------------------------------------------------------
+
+    def _writable(self, conn_id: int) -> bool:
+        conn = self._conn(conn_id) or {}
+        if conn.get("read_only"):
+            self._toast("This connection is read-only.", kind="warning")
+            return False
+        return True
+
+    def _tabs_of(self, loc: tuple, name: str) -> list:
+        return [tid for tid, tab in self._tabs.items()
+                if tab["kind"] == "table" and tab["loc"] == loc and tab["name"] == name]
+
+    def _edits_pending(self, loc: tuple, name: str) -> bool:
+        if any(self._tabs[tid].get("pending") for tid in self._tabs_of(loc, name)):
+            self._toast(f"{name} has unsaved row changes: save or revert them first.",
+                        kind="warning")
+            return True
+        return False
+
+    def _type_list(self, conn: dict) -> str:
+        options = "".join(f'<option value="{_esc(t)}">' for t in conn.get("types") or [])
+        return f'<datalist id="bk-types-{conn.get("id")}">{options}</datalist>'
+
+    async def _ddl_dialog(self, loc: tuple, table: str, action: str, title: str, fields: str,
+                          *, collect=None, on_click=None, ok_text: str = "Run",
+                          height: int = 460) -> dict | None:
+        """
+        A form for one object action with its SQL previewed as you type
+        (a dry run of sqlops.alter). Resolves to the run's result, or None
+        when cancelled.
+        """
+        conn_id, db, schema = loc
+        conn = self._conn(conn_id) or {}
+        prod = conn.get("env") == "prod"
+        loop = asyncio.get_event_loop()
+        answer = loop.create_future()
+        modal = ModalWindow(ModalConfig(dispose_on_close=True, title=title, width=720,
+                                        height=height))
+        warn = ('<div class="bk-warn"><span class="mdi mdi-alert-octagon-outline"></span> '
+                "This is a <b>production</b> connection.</div>") if prod else ""
+        modal.body.innerHTML = (
+            '<div class="bk-dialog bk-ddl">' + warn + self._type_list(conn) +
+            f'<div class="bk-ddl-fields">{fields}</div>'
+            '<div class="bk-hint" data-ddl="note">…</div>'
+            '<pre class="bk-pre bk-ddl-sql" data-ddl="sql"></pre>'
+            '<div class="bk-actions">'
+            '<button type="button" class="bk-btn" data-answer="no">Cancel</button>'
+            f'<button type="button" class="bk-btn {"bk-danger" if prod else "bk-primary"}" '
+            f'data-answer="yes" disabled>{_esc(ok_text)}</button></div></div>')
+        body = modal.body
+        state = {"params": None, "timer": None, "seq": 0, "busy": False, "order": {}}
+        note, sql_box = body.querySelector('[data-ddl="note"]'), body.querySelector('[data-ddl="sql"]')
+        run = body.querySelector('[data-answer="yes"]')
+
+        def _collect() -> dict:
+            values: dict = {}
+            for el in body.querySelectorAll("[data-p]"):
+                key = _attr(el, "data-p")
+                if _attr(el, "data-multi"):
+                    continue
+                values[key] = bool(el.checked) if str(el.type) == "checkbox" else str(el.value)
+            for key, picked in state["order"].items():
+                values[key] = list(picked)
+            if collect is not None:
+                values.update(collect(body))
+            return values
+
+        async def _preview() -> None:
+            state["seq"] += 1
+            seq = state["seq"]
+            params = _collect()
+            result = await SqlService().alter_async(conn_id, db, schema, table, action, params,
+                                                    True)
+            if seq != state["seq"] or answer.done():
+                return
+            if result.get("ok"):
+                state["params"] = params
+                sql_box.textContent = "\n\n".join(result["sql"])
+                note.textContent = result.get("note") or ""
+                note.removeAttribute("data-kind")
+                run.disabled = bool(result.get("read_only"))
+            else:
+                state["params"] = None
+                sql_box.textContent = ""
+                note.textContent = result.get("error", "Not ready")
+                note.setAttribute("data-kind", "error")
+                run.disabled = True
+
+        def _fire() -> None:
+            _spawn(_preview(), "ddl preview")
+
+        fire = create_proxy(_fire)
+        self._proxies.append(fire)
+
+        def _schedule(_event=None) -> None:
+            if state["timer"]:
+                js.clearTimeout(state["timer"])
+            state["timer"] = js.setTimeout(fire, 250)
+
+        def _on_change(event) -> None:
+            target = event.target
+            if _attr(target, "data-multi"):
+                picked = state["order"].setdefault(_attr(target, "data-p"), [])
+                value = _attr(target, "data-v")
+                if target.checked and value not in picked:
+                    picked.append(value)
+                elif not target.checked and value in picked:
+                    picked.remove(value)
+                for el in body.querySelectorAll("[data-order-of]"):
+                    at = picked.index(_attr(el, "data-order-of")) + 1 \
+                        if _attr(el, "data-order-of") in picked else 0
+                    el.textContent = str(at) if at else ""
+            # Text and checkboxes already scheduled a preview on "input".
+
+        async def _run() -> None:
+            if state["busy"]:
+                return
+            state["busy"] = True
+            # Preview what the fields say now, so what runs is what is shown.
+            if state["timer"]:
+                js.clearTimeout(state["timer"])
+                state["timer"] = None
+            await _preview()
+            if state["params"] is None:
+                state["busy"] = False
+                return
+            run.disabled = True
+            note.textContent = "Running…"
+            result = await SqlService().alter_async(conn_id, db, schema, table, action,
+                                                    state["params"], False)
+            state["busy"] = False
+            if result.get("ok"):
+                if not answer.done():
+                    answer.set_result(result)
+                modal.close()
+                return
+            note.textContent = result.get("error", "Failed")
+            note.setAttribute("data-kind", "error")
+            run.disabled = False
+
+        def _on_click(event) -> None:
+            which = event.target.closest("[data-answer]")
+            if which:
+                if _attr(which, "data-answer") == "yes":
+                    _spawn(_run(), "ddl run")
+                elif not answer.done():
+                    answer.set_result(None)
+                    modal.close()
+                return
+            if on_click is not None and on_click(event, body):
+                _schedule()
+
+        def _on_close(_payload) -> None:
+            if state["timer"]:
+                js.clearTimeout(state["timer"])
+            if not answer.done():
+                answer.set_result(None)
+
+        for event_name, handler in (("click", _on_click), ("input", _schedule),
+                                    ("change", _on_change)):
+            proxy = create_proxy(handler)
+            self._proxies.append(proxy)
+            body.addEventListener(event_name, proxy)
+        modal.on_close(_on_close)
+        modal.show()
+        first = body.querySelector(".bk-ddl-fields input:not([type=checkbox])")
+        if first:
+            first.focus()
+            first.select()
+        _fire()
+        return await answer
+
+    @staticmethod
+    def _field(label: str, inner: str) -> str:
+        return f'<label class="bk-ddl-field"><span>{_esc(label)}</span>{inner}</label>'
+
+    def _name_input(self, key: str, value: str = "", placeholder: str = "") -> str:
+        return (f'<input class="bk-input" data-p="{key}" value="{_esc(value)}" '
+                f'placeholder="{_esc(placeholder)}" spellcheck="false" autocomplete="off">')
+
+    def _column_fields(self, conn: dict) -> str:
+        types = f'bk-types-{conn.get("id")}'
+        return (self._field("Name", self._name_input("name", "", "new_column"))
+                + self._field("Type", f'<input class="bk-input bk-code" data-p="type" '
+                              f'list="{types}" spellcheck="false" autocomplete="off" '
+                              f'value="{_esc((conn.get("types") or [""])[0])}">')
+                + self._field("Default", '<input class="bk-input bk-code" data-p="default" '
+                              'placeholder="none (an SQL expression: 0, &#39;text&#39;, now())" '
+                              'spellcheck="false" autocomplete="off">')
+                + '<label class="bk-check"><input type="checkbox" data-p="not_null"> NOT NULL'
+                  "</label>")
+
+    async def _after_table_change(self, loc: tuple, name: str, sub: str = "columns") -> None:
+        """Reopen a table's tabs so they show its new columns and indexes."""
+        for tid in self._tabs_of(loc, name):
+            was = self._tabs[tid]["sub"]
+            kind = self._tabs[tid]["object_kind"]
+            self._close_tab(tid)
+            self._open_table(loc, name, kind, was or sub)
+
+    async def _reload_location(self, loc: tuple) -> None:
+        conn_id, db, schema = loc
+        await self._refresh_location({"kind": "schema", "conn": conn_id, "db": db,
+                                      "schema": schema})
+
+    async def _create_table(self, data: dict) -> None:
+        conn_id = int(data["conn"])
+        conn = self._conn(conn_id) or {}
+        levels = conn.get("levels") or []
+        loc = self._loc(data)
+        if ("schema" in levels and not loc[2]) or ("database" in levels and not loc[1]):
+            self._toast("Choose the " + ("schema" if "schema" in levels else "database")
+                        + " for the new table in the navigator.", kind="warning")
+            return
+        if not self._writable(conn_id):
+            return
+        types = f'bk-types-{conn_id}'
+        int_type = (conn.get("types") or ["integer"])[0]
+
+        def row(col: dict) -> str:
+            def check(key):
+                return (f'<td class="bk-ddl-c"><input type="checkbox" data-c="{key}"'
+                        f'{" checked" if col.get(key) else ""}></td>')
+            return (f'<tr data-col="1"><td><input class="bk-input" data-c="name" '
+                    f'value="{_esc(col.get("name", ""))}" spellcheck="false" autocomplete="off"></td>'
+                    f'<td><input class="bk-input bk-code" data-c="type" list="{types}" '
+                    f'value="{_esc(col.get("type", ""))}" spellcheck="false" autocomplete="off"></td>'
+                    + check("pk") + check("identity") + check("not_null") +
+                    '<td><input class="bk-input bk-code" data-c="default" spellcheck="false" '
+                    'autocomplete="off"></td>'
+                    '<td><button type="button" class="bk-btn bk-mini" data-ddl="remove" '
+                    'title="Remove this column"><span class="mdi mdi-close"></span></button></td></tr>')
+
+        fields = (self._field("Table name", self._name_input("name", "", "new_table"))
+                  + '<table class="bk-ddl-cols"><thead><tr><th>Column</th><th>Type</th>'
+                  '<th title="Primary key">PK</th><th title="Numbers itself (identity)">Auto</th>'
+                  '<th>NOT NULL</th><th>Default</th><th></th></tr></thead><tbody>'
+                  + row({"name": "id", "type": int_type, "pk": True, "identity": True})
+                  + '</tbody></table><button type="button" class="bk-btn bk-mini" data-ddl="add">'
+                  '<span class="mdi mdi-plus"></span><span>Add column</span></button>')
+
+        def collect(body) -> dict:
+            columns = []
+            for tr in body.querySelectorAll("tr[data-col]"):
+                col = {}
+                for el in tr.querySelectorAll("[data-c]"):
+                    key = _attr(el, "data-c")
+                    col[key] = bool(el.checked) if str(el.type) == "checkbox" else str(el.value)
+                columns.append(col)
+            return {"columns": columns}
+
+        def on_click(event, body) -> bool:
+            button = event.target.closest("[data-ddl]")
+            if not button:
+                return False
+            if _attr(button, "data-ddl") == "add":
+                body.querySelector(".bk-ddl-cols tbody").insertAdjacentHTML(
+                    "beforeend", row({"type": (conn.get("types") or [""])[0]}))
+                rows = body.querySelectorAll("tr[data-col]")
+                rows[rows.length - 1].querySelector("input").focus()
+            elif _attr(button, "data-ddl") == "remove":
+                button.closest("tr").remove()
+            return True
+
+        done = await self._ddl_dialog(loc, "", "create_table", "Create table", fields,
+                                      collect=collect, on_click=on_click, ok_text="Create",
+                                      height=560)
+        if done:
+            created = done.get("table") or ""
+            self._toast(f"Created {created}.", kind="success")
+            await self._reload_location(loc)
+            if created:
+                self._open_table(loc, created, "table", "columns")
+
+    async def _add_column(self, loc: tuple, name: str) -> None:
+        if not self._writable(loc[0]) or self._edits_pending(loc, name):
+            return
+        conn = self._conn(loc[0]) or {}
+        done = await self._ddl_dialog(loc, name, "add_column", f"Add a column to {name}",
+                                      self._column_fields(conn), ok_text="Add column")
+        if done:
+            self._toast(f"Added the column to {name}.", kind="success")
+            await self._after_table_change(loc, name)
+
+    async def _create_index(self, loc: tuple, name: str) -> None:
+        if not self._writable(loc[0]):
+            return
+        info = await SqlService().table_info_async(loc[0], loc[1], loc[2], name)
+        if not info.get("ok"):
+            self._toast(info.get("error", "Could not read the table"), kind="error")
+            return
+        boxes = "".join(
+            f'<label class="bk-check"><input type="checkbox" data-p="columns" data-multi="1" '
+            f'data-v="{_esc(col["name"])}"> <span class="bk-order" '
+            f'data-order-of="{_esc(col["name"])}"></span>{_esc(col["name"])} '
+            f'<small title="{_esc(col["type"])}">{_esc(col["type"])}</small></label>' for col in info["columns"])
+        fields = (self._field("Index name", self._name_input("name", f"ix_{name}_"))
+                  + '<div class="bk-ddl-field"><span>Columns <small>in the order you tick them'
+                  f'</small></span><div class="bk-ddl-boxes">{boxes}</div></div>'
+                  '<label class="bk-check"><input type="checkbox" data-p="unique"> UNIQUE</label>')
+        done = await self._ddl_dialog(loc, name, "create_index", f"Create an index on {name}",
+                                      fields, ok_text="Create index", height=560)
+        if done:
+            self._toast(f"Created the index on {name}.", kind="success")
+            await self._after_table_change(loc, name, "keys")
+
+    async def _rename_table(self, loc: tuple, name: str) -> None:
+        if not self._writable(loc[0]) or self._edits_pending(loc, name):
+            return
+        fields = self._field("New name", self._name_input("new_name", name))
+        done = await self._ddl_dialog(loc, name, "rename_table", f"Rename {name}", fields,
+                                      ok_text="Rename", height=330)
+        if not done:
+            return
+        new = done.get("table") or ""
+        self._toast(f"Renamed {name}" + (f" to {new}." if new else "."), kind="success")
+        reopen = [self._tabs[tid]["sub"] for tid in self._tabs_of(loc, name)]
+        for tid in self._tabs_of(loc, name):
+            self._close_tab(tid)
+        await self._reload_location(loc)
+        if reopen and new:
+            self._open_table(loc, new, "table", reopen[0])
+
+    async def _simple_ddl(self, loc: tuple, name: str, action: str, params: dict, title: str,
+                          warning: str, ok_text: str) -> bool:
+        conn_id, db, schema = loc
+        conn = self._conn(conn_id) or {}
+        plan = await SqlService().alter_async(conn_id, db, schema, name, action, params, True)
+        if not plan.get("ok"):
+            self._toast(plan.get("error", "Not possible"), kind="error")
+            return False
+        if not await self._confirm_sql(title, plan["sql"], f"{warning} {plan.get('note', '')}",
+                                       prod=conn.get("env") == "prod", ok_text=ok_text,
+                                       danger=True):
+            return False
+        done = await SqlService().alter_async(conn_id, db, schema, name, action, params, False)
+        if not done.get("ok"):
+            await message.alert(done.get("error", "Failed"), title=title)
+            return False
+        return True
+
+    async def _truncate(self, loc: tuple, name: str) -> None:
+        if not self._writable(loc[0]) or self._edits_pending(loc, name):
+            return
+        if await self._simple_ddl(loc, name, "truncate", {}, f"Truncate {name}",
+                                  "Every row of the table is deleted.", "Truncate"):
+            self._toast(f"Truncated {name}.", kind="success")
+            for tid in self._tabs_of(loc, name):
+                await self._browse(tid, with_count=True)
+            await self._reload_location(loc)
+
+    async def _drop(self, loc: tuple, name: str, kind: str) -> None:
+        if not self._writable(loc[0]) or self._edits_pending(loc, name):
+            return
+        word = {"table": "table", "view": "view", "matview": "materialized view"}.get(kind, kind)
+        warning = ("The table and every row in it are deleted." if kind == "table"
+                   else f"The {word} is deleted; its tables are not touched.")
+        if await self._simple_ddl(loc, name, "drop", {"kind": kind}, f"Drop {word} {name}",
+                                  warning, "Drop"):
+            self._toast(f"Dropped {name}.", kind="success")
+            for tid in self._tabs_of(loc, name):
+                self._close_tab(tid)
+            await self._reload_location(loc)
+
+    async def _tab_ddl(self, tid: str, action: str) -> None:
+        """The Columns / Keys & indexes buttons of a table tab."""
+        tab = self._tabs[tid]
+        loc, name, info = tab["loc"], tab["name"], tab.get("info") or {}
+        if action == "col_add":
+            await self._add_column(loc, name)
+            return
+        if action == "ix_create":
+            await self._create_index(loc, name)
+            return
+        if action in ("col_rename", "col_drop"):
+            picked = tab["cols_table"].get_selected_ids() if tab.get("cols_table") else []
+            if not picked:
+                self._toast("Select a column first.", kind="warning")
+                return
+            column = str(picked[0])
+            if not self._writable(loc[0]) or self._edits_pending(loc, name):
+                return
+            if action == "col_rename":
+                fields = self._field("New name", self._name_input("new_name", column)) + (
+                    f'<input type="hidden" data-p="column" value="{_esc(column)}">')
+                if await self._ddl_dialog(loc, name, "rename_column", f"Rename {column}",
+                                          fields, ok_text="Rename", height=330):
+                    self._toast(f"Renamed {column}.", kind="success")
+                    await self._after_table_change(loc, name)
+            elif await self._simple_ddl(loc, name, "drop_column", {"column": column},
+                                        f"Drop column {column}",
+                                        "The column and its values are deleted.", "Drop"):
+                self._toast(f"Dropped {column}.", kind="success")
+                await self._after_table_change(loc, name)
+            return
+        # ix_drop
+        rows = tab["idx_table"].get_selected_rows() if tab.get("idx_table") else []
+        if not rows:
+            self._toast("Select an index first.", kind="warning")
+            return
+        row = rows[0]
+        if row.get("id") == "pk":
+            self._toast("That is the primary key, not an index.", kind="warning")
+            return
+        index = row.get("name") or ""
+        if not self._writable(loc[0]):
+            return
+        if await self._simple_ddl(loc, name, "drop_index", {"index": index},
+                                  f"Drop index {index}", "The index is deleted.", "Drop"):
+            self._toast(f"Dropped {index}.", kind="success")
+            await self._after_table_change(loc, name, "keys")
 
     # ------------------------------------------------------------------
     # Object tabs: a routine, sequence, trigger or role (read-only):
@@ -4103,6 +4556,34 @@ td.bk-num{font-variant-numeric:tabular-nums;}
 .bk-obj-list li{padding:2px 0;}
 .bk-obj-empty{margin:4px 0;color:var(--bk-dim);}
 .bk-wrap{white-space:pre-wrap;word-break:break-word;}
+/* Object action dialogs: fields, a live SQL preview, Run. */
+.bk-ddl{height:100%;box-sizing:border-box;}
+.bk-ddl-fields{display:flex;flex-direction:column;gap:9px;flex:0 1 auto;min-height:0;overflow:auto;}
+.bk-ddl-field{display:flex;flex-direction:column;gap:4px;}
+.bk-ddl-field > span{font:600 11px system-ui,sans-serif;text-transform:uppercase;letter-spacing:.05em;
+  color:var(--bk-muted);}
+.bk-ddl-field small{text-transform:none;letter-spacing:0;font-weight:400;color:var(--bk-dim);}
+.bk-check{display:inline-flex;align-items:center;justify-content:flex-start;gap:6px;
+  color:var(--bk-text);cursor:pointer;width:auto;}
+.bk-check input[type=checkbox]{flex:0 0 auto;width:auto;margin:0;}
+.bk-check small{color:var(--bk-dim);}
+.bk-ddl-boxes{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:4px 12px;
+  justify-items:start;
+  max-height:170px;overflow:auto;padding:6px 8px;border:1px solid var(--bk-line);border-radius:6px;}
+.bk-ddl-boxes .bk-check{max-width:100%;min-width:0;white-space:nowrap;}
+.bk-ddl-boxes small{overflow:hidden;text-overflow:ellipsis;min-width:0;}
+.bk-order{display:inline-block;min-width:14px;text-align:center;color:var(--bk-accent);font-weight:600;}
+.bk-ddl-sql{flex:1 1 auto;min-height:70px;white-space:pre-wrap;word-break:break-word;}
+.bk-hint[data-kind="error"]{color:#fca5a5;}
+.bk-ddl-cols{border-collapse:collapse;width:100%;}
+.bk-ddl-cols th{text-align:left;font:600 11px system-ui,sans-serif;color:var(--bk-muted);
+  padding:2px 4px;white-space:nowrap;}
+.bk-ddl-cols td{padding:2px 4px;}
+.bk-ddl-cols td .bk-input{width:100%;}
+.bk-ddl-cols .bk-ddl-c{text-align:center;width:44px;}
+.bk-ddl-fields > .bk-btn{align-self:flex-start;}
+.bk-btn.bk-mini{padding:3px 8px;font-size:12px;}
+.bk-h3-tools{display:inline-flex;gap:4px;margin-left:auto;text-transform:none;letter-spacing:0;}
 .bk-link{background:none;border:0;padding:0;color:var(--bk-accent);cursor:pointer;
   font:inherit;text-align:left;}
 .bk-link:hover{text-decoration:underline;}

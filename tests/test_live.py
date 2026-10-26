@@ -732,3 +732,76 @@ def test_refresh_materialized_view(user_id, profile):
         sqlops.refresh_matview(user_id, ro, database, schema, "product_sales")
     with pytest.raises(sqlops.OpError, match="No materialized view"):
         sqlops.refresh_matview(user_id, conn_id, database, schema, "order_totals", True)
+
+
+# ---------------------------------------------------------------------------
+# Object actions: create / alter / drop through sqlops.alter
+# ---------------------------------------------------------------------------
+
+TYPES = {
+    "postgresql": ("integer", "varchar(50)"),
+    "mysql": ("int", "varchar(50)"),
+    "mssql": ("int", "nvarchar(50)"),
+    "sqlite": ("INTEGER", "TEXT"),
+}
+
+
+def test_object_actions_round_trip(user_id, profile):
+    from services import sqlops
+
+    engine, conn_id = profile
+    database, schema = LOCATION[engine]
+    int_type, text_type = TYPES[engine]
+    for name in ("bk_scratch", "bk_scratch2"):
+        sqlops.execute(user_id, conn_id, database, f"DROP TABLE IF EXISTS {name}")
+
+    def alter(table, action, **params):
+        done = sqlops.alter(user_id, conn_id, database, schema, table, action, params)
+        assert done["ok"], done
+        return done
+
+    plan = sqlops.alter(user_id, conn_id, database, schema, "", "create_table", {
+        "name": "bk_scratch", "columns": [
+            {"name": "id", "type": int_type, "pk": True, "identity": True},
+            {"name": "label", "type": text_type, "not_null": True, "default": "'none: yet'"},
+        ]}, True)
+    assert plan["sql"][0].startswith("CREATE TABLE") and plan["note"]
+    assert ("cannot be rolled back" in plan["note"]) == (engine == "mysql")
+    alter("", "create_table", **{"name": "bk_scratch", "columns": [
+        {"name": "id", "type": int_type, "pk": True, "identity": True},
+        {"name": "label", "type": text_type, "not_null": True, "default": "'none: yet'"}]})
+    info = sqlops.table_info(user_id, conn_id, database, schema, "bk_scratch")
+    assert info["pk"] == ["id"] and [c["name"] for c in info["columns"]] == ["id", "label"]
+    ran = sqlops.execute(user_id, conn_id, database,
+                         "INSERT INTO bk_scratch (label) VALUES ('a')")
+    assert ran["ok"] and not ran["results"][0].get("error"), ran
+    page = sqlops.browse(user_id, conn_id, database, schema, "bk_scratch", pk=["id"])
+    assert page["rows"] == [["1", "a"]]
+
+    alter("bk_scratch", "add_column", name="qty", type=int_type, not_null=True, default="0")
+    alter("bk_scratch", "rename_column", column="qty", new_name="amount")
+    alter("bk_scratch", "create_index", name="ix_bk_scratch_label", columns=["label"],
+          unique=True)
+    info = sqlops.table_info(user_id, conn_id, database, schema, "bk_scratch")
+    assert [c["name"] for c in info["columns"]] == ["id", "label", "amount"]
+    assert any(ix["name"] == "ix_bk_scratch_label" and ix["unique"] for ix in info["indexes"])
+    alter("bk_scratch", "drop_index", index="ix_bk_scratch_label")
+    alter("bk_scratch", "drop_column", column="amount")
+    alter("bk_scratch", "truncate")
+    assert sqlops.browse(user_id, conn_id, database, schema, "bk_scratch", pk=["id"])["rows"] == []
+    alter("bk_scratch", "rename_table", new_name="bk_scratch2")
+    tables = {t["name"] for t in sqlops.objects(user_id, conn_id, database, schema)["tables"]}
+    assert "bk_scratch2" in tables and "bk_scratch" not in tables
+    alter("bk_scratch2", "drop", kind="table")
+    tables = {t["name"] for t in sqlops.objects(user_id, conn_id, database, schema)["tables"]}
+    assert "bk_scratch2" not in tables
+
+    with pytest.raises(sqlops.OpError, match="cannot contain"):
+        sqlops.alter(user_id, conn_id, database, schema, "orders", "add_column",
+                     {"name": "x", "type": "int; DROP TABLE orders"}, True)
+    ro = _make_profile(user_id, engine, read_only=True)
+    preview = sqlops.alter(user_id, ro, database, schema, "orders", "truncate", {}, True)
+    assert preview["read_only"]
+    with pytest.raises(sqlops.OpError, match="read-only"):
+        sqlops.alter(user_id, ro, database, schema, "orders", "truncate", {})
+    assert sqlops.browse(user_id, conn_id, database, schema, "orders", pk=["id"])["total"] == 137

@@ -145,6 +145,12 @@ class SQLite(Engine):
     # More navigator objects: SQLite has triggers, and nothing else here.
     # ------------------------------------------------------------------
     object_groups = ("triggers",)
+    identity_clause = "PRIMARY KEY AUTOINCREMENT"
+    identity_inline_pk = True
+    common_types = ("INTEGER", "REAL", "TEXT", "BLOB", "NUMERIC")
+
+    def sql_truncate(self, prep: Any, schema: Optional[str], table: str) -> str:
+        return f"DELETE FROM {self.qualified(prep, schema, table)}"
 
     def list_triggers(self, conn: Any, schema: Optional[str]) -> list:
         from sqlalchemy import text
