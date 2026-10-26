@@ -789,6 +789,67 @@ def save_changes(user_id: int, conn_id: int, database: str, schema: str, name: s
 
 
 # ---------------------------------------------------------------------------
+# ER diagram: every table of a location, its columns, keys and foreign keys
+# ---------------------------------------------------------------------------
+
+ER_MAX_TABLES = 400
+
+
+def er_model(user_id: int, conn_id: int, database: str, schema: str) -> dict:
+    """
+    ``{"tables": [{name, columns: [{name, type, pk, nullable}], pk, fks:
+    [{name, columns, ref_schema, ref_table, ref_columns}]}], "schema",
+    "truncated"}`` for the ER diagram, read with SQLAlchemy's bulk
+    ``get_multi_*`` reflection (one query per kind, not per table).
+    ``ref_schema`` is None when the referenced table is in the same schema.
+    """
+    started = time.monotonic()
+    with connect(user_id, conn_id, database) as (conn, spec, _p, _engine):
+        insp = _inspector(conn)
+        target = spec.schema_for(database, schema)
+        names = sorted(insp.get_table_names(schema=target))
+        truncated = len(names) > ER_MAX_TABLES
+        names = names[:ER_MAX_TABLES]
+        if not names:
+            return {"tables": [], "schema": target, "truncated": False, "ms": 0}
+        try:
+            columns = insp.get_multi_columns(schema=target, filter_names=names)
+            pks = insp.get_multi_pk_constraint(schema=target, filter_names=names)
+            fks = _quiet(insp.get_multi_foreign_keys, schema=target, filter_names=names) or {}
+        except Exception as exc:
+            raise OpError(error_text(exc)) from None
+        dialect = conn.dialect
+    tables = []
+    for name in names:
+        key = (target, name)
+        pk = list((pks.get(key) or {}).get("constrained_columns") or [])
+        found = []
+        for fk in fks.get(key) or []:
+            ref_schema = fk.get("referred_schema")
+            if ref_schema == target or (spec.name == "mysql" and ref_schema == database):
+                ref_schema = None
+            found.append({"name": fk.get("name"), "columns": fk.get("constrained_columns") or [],
+                          "ref_schema": ref_schema, "ref_table": fk.get("referred_table"),
+                          "ref_columns": fk.get("referred_columns") or []})
+        tables.append({
+            "name": name, "pk": pk, "fks": found,
+            "columns": [{"name": col["name"], "type": _short_type(col["type"], dialect),
+                         "pk": col["name"] in pk, "nullable": bool(col.get("nullable", True))}
+                        for col in columns.get(key) or []],
+        })
+    return {"tables": tables, "schema": target, "truncated": truncated,
+            "ms": int((time.monotonic() - started) * 1000)}
+
+
+_TYPE_NOISE = re.compile(r"\s+(?:COLLATE\s+\S+|CHARACTER SET\s+\S+|CHARSET\s+\S+)", re.I)
+
+
+def _short_type(sa_type: Any, dialect: Any) -> str:
+    """A column type without its collation or character set, for the diagram."""
+    return _TYPE_NOISE.sub("", _type_name(sa_type, dialect)).strip()
+
+
+# ---------------------------------------------------------------------------
 # Session manager: the server's client sessions, and stopping one
 # ---------------------------------------------------------------------------
 

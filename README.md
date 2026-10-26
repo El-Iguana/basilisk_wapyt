@@ -32,6 +32,9 @@ running in Pyodide) and the wapyt widget set.
 - **Import CSV** into a table: the delimiter and encoding are guessed,
   columns are matched by name, a preview shows what will be stored. The whole
   file goes in one transaction, with a progress bar and Cancel.
+- **ER diagram** of a schema, or of one table and its neighbours: tables
+  laid out by their foreign keys (crow's-foot lines), drag tables around
+  (remembered), all columns / keys only / names, find, export as SVG.
 - **Sessions**: what is running on a PostgreSQL, MySQL / MariaDB or SQL
   Server server, refreshed every few seconds, with Cancel query and End
   session.

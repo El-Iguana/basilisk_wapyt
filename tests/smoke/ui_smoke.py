@@ -697,6 +697,66 @@ def session_checks(page: Page, engine: str, name: str) -> None:
     page.click(f'{modal(page)} [data-s="close"]')
 
 
+def er_box(page: Page, table: str):
+    return page.locator(f'.bk-view:visible .bk-er-table[data-t="{table}"]')
+
+
+def er_checks(page: Page, engine: str, name: str) -> None:
+    """The ER diagram: draw, drag (remembered), column modes, find, SVG, focus on a table."""
+    where = {"postgresql": "public", "mysql": "shop", "mssql": "dbo", "sqlite": name}[engine]
+    view = ".bk-view:visible"
+    exact_tree_row(page, where).first.click(button="right")
+    page.click('.wapyt-tree-menu [data-action-id="er"]')
+    page.wait_for_selector(f"{view} .bk-er-table", timeout=30000)
+    stats = page.inner_text(f"{view} .bk-head-stats")
+    edges = page.locator(f"{view} .bk-er-edge").count()
+    check(er_box(page, "order_items").count() == 1 and edges == 3 and "3 foreign keys" in stats,
+          f"{engine}: the ER diagram draws the tables and keys ({stats})")
+    shot(page, f"smoke-{engine}-16-er")
+    box = er_box(page, "customers")
+    before = box.get_attribute("transform")
+    path = page.locator(f'{view} .bk-er-edge[data-to="customers"]').first.get_attribute("d")
+    area = box.bounding_box()
+    page.mouse.move(area["x"] + 30, area["y"] + 12)
+    page.mouse.down()
+    page.mouse.move(area["x"] + 90, area["y"] + 112, steps=8)
+    page.mouse.up()
+    moved = box.get_attribute("transform")
+    redrawn = page.locator(f'{view} .bk-er-edge[data-to="customers"]').first.get_attribute("d")
+    check(moved != before and redrawn != path, f"{engine}: dragging a table moves it and its lines")
+    page.click(f'{view} [data-bk="er_mode"][data-mode="keys"]')
+    check(page.locator(f"{view} .bk-er-more").count() > 0, f"{engine}: Keys mode hides other columns")
+    time.sleep(1)                       # saved after a pause
+    close_tabs(page)
+    exact_tree_row(page, where).first.click(button="right")
+    page.click('.wapyt-tree-menu [data-action-id="er"]')
+    page.wait_for_selector(f"{view} .bk-er-table", timeout=30000)
+    check(er_box(page, "customers").get_attribute("transform") == moved
+          and page.locator(f"{view} .bk-er-more").count() > 0,
+          f"{engine}: the moved table and the mode are remembered")
+    page.fill(f'{view} [data-role="er_find"]', "order_i")
+    hot = "bk-er-hot" in (er_box(page, "order_items").get_attribute("class") or "")
+    dim = "bk-er-dim" in (er_box(page, "audit_log").get_attribute("class") or "")
+    check(hot and dim, f"{engine}: Find picks a table out and dims the unrelated ones")
+    with page.expect_download() as download:
+        page.click(f'{view} [data-bk="er_svg"]')
+    text = Path(download.value.path()).read_text()
+    check(text.startswith("<?xml") and "order_items" in text and "<svg" in text,
+          f"{engine}: the diagram saves as SVG ({download.value.suggested_filename})")
+    page.click(f'{view} [data-bk="er_layout"]')
+    time.sleep(1)
+    er_box(page, "orders").dblclick()
+    check(wait_text(page, f"{view} .bk-head", "orders"), f"{engine}: double-click opens the table")
+    close_tabs(page)
+    exact_tree_row(page, "orders").first.click(button="right")
+    page.click('.wapyt-tree-menu [data-action-id="er_table"]')
+    page.wait_for_selector(f"{view} .bk-er-table", timeout=30000)
+    shown = sorted(_attr for _attr in page.eval_on_selector_all(
+        f"{view} .bk-er-table", "els => els.map(e => e.dataset.t)"))
+    check(shown == ["customers", "order_items", "orders"],
+          f"{engine}: a table's diagram shows its neighbours ({shown})")
+
+
 def close_tabs(page: Page) -> None:
     for _ in range(10):
         close = page.locator(".wapyt-tab-close").first
@@ -761,6 +821,8 @@ def main() -> int:
                 import_checks(page, engine)
                 close_tabs(page)
                 session_checks(page, engine, name)
+                close_tabs(page)
+                er_checks(page, engine, name)
             except Exception as exc:  # noqa: BLE001 - report and carry on
                 check(False, f"{engine}: {type(exc).__name__}: {str(exc).splitlines()[0]}")
                 shot(page, f"smoke-{engine}-error")
