@@ -21,6 +21,7 @@ Conventions carried from Monguana and IguanaXterm, each learned the hard way:
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import json
 import traceback
@@ -68,6 +69,8 @@ from services.connection_service import ConnectionService
 from services.sql_service import SqlService
 from services.ui_state_service import UiStateService
 from services.user_service import UserService
+from services.values import MAX_CELL_CHARS
+from ui.value_panel import ValuePanel, grid_text
 
 # pytincture's MainWindow detection only knows dhxpyt; without this the app
 # starts with HTTP 422.
@@ -75,7 +78,7 @@ APP_ENTRYPOINT = "Basilisk"
 
 APP_FAVICON = "static/basilisk_avatar.webp"
 
-EDITOR_SRC = "/vendor/codemirror/basilisk-editor.js"
+EDITOR_SRC = "/vendor/codemirror/basilisk-editor.js?v=3"  # bump with the bundle
 EDITOR_LOAD_SECONDS = 10
 
 PAGE_SIZES = [50, 100, 200, 500, 1000]
@@ -171,6 +174,11 @@ def _count(value) -> str:
 
 def _column_width(header: str) -> int:
     return max(90, min(320, len(header) * 8 + 44))
+
+
+def _binary_type(type_name: str) -> bool:
+    upper = type_name.upper()
+    return any(word in upper for word in ("BYTEA", "BLOB", "BINARY", "IMAGE", "RAW"))
 
 
 def _download(url: str) -> None:
@@ -400,6 +408,13 @@ class Basilisk(MainWindow):
                     event.preventDefault()
                     _spawn(self._sql_run(tid, "script" if event.shiftKey else "statement"), "run")
                     return
+        if key == "F7" and not (event.ctrlKey or event.metaKey or event.altKey):
+            active = tid or self.tabs.get_active()
+            tab = self._tabs.get(str(active)) if active else None
+            if tab is not None and (tab["kind"] == "sql" or tab.get("sub") == "data"):
+                event.preventDefault()
+                self._vp_toggle(str(active))
+                return
         if (event.ctrlKey or event.metaKey) and key == "]":
             event.preventDefault()
             self._on_toolbar("sql")
@@ -410,6 +425,15 @@ class Basilisk(MainWindow):
         if event.ctrlKey or event.metaKey or event.altKey:
             return
         if any(str(o.style.display) == "flex" for o in js.document.querySelectorAll(".wapyt-modal-overlay")):
+            return
+        if key == "Enter" and event.shiftKey:
+            # A click on a cell does not give it keyboard focus, so Shift+Enter
+            # after a click lands here: open the panel on the clicked cell.
+            active = self.tabs.get_active()
+            tab = self._tabs.get(str(active)) if active else None
+            if tab is not None and tab.get("focus_cell"):
+                event.preventDefault()
+                self._vp_open(str(active), *tab["focus_cell"], focus=True)
             return
         if key == "?":
             self._shortcuts_dialog()
@@ -1109,11 +1133,11 @@ class Basilisk(MainWindow):
 
     def _mount_editor(self, host, *, value: str = "", dialect: str = "StandardSQL",
                       read_only: bool = False, callbacks: dict | None = None,
-                      placeholder: str = "", label: str = "SQL editor"):
+                      placeholder: str = "", label: str = "SQL editor", **extra):
         proxies = {name: create_proxy(fn) for name, fn in (callbacks or {}).items()}
         self._proxies.extend(proxies.values())
         options = {"value": value, "dialect": dialect, "readOnly": read_only,
-                   "placeholder": placeholder, "label": label, **proxies}
+                   "placeholder": placeholder, "label": label, **extra, **proxies}
         return js.window.BkEditor.create(host, _jsobj(options))
 
     # ------------------------------------------------------------------
@@ -1146,7 +1170,7 @@ class Basilisk(MainWindow):
             return
         if tab["kind"] == "sql" and tab.get("manual"):
             _spawn(self._end_session(tab), "end session")
-        for key in ("grid", "cols_table", "idx_table", "fk_table", "con_table", "pager",
+        for key in ("vp", "grid", "cols_table", "idx_table", "fk_table", "con_table", "pager",
                     "plan_grid"):
             widget = tab.get(key)
             if widget is not None:
@@ -1210,6 +1234,7 @@ class Basilisk(MainWindow):
             "where": "", "order_by": "", "columns": [], "rows": [], "keys": [],
             "truncated": set(), "pending": {}, "new_counter": 0, "tdir": "asc",
             "sub": "data", "grid": None, "pager": None, "busy": False, "menu_col": None,
+            "vp": None, "focus_cell": None,
         }
         self._tabs[tid] = tab
         tab["pager"] = Pagination(PaginationConfig(page_size=100, page_sizes=PAGE_SIZES,
@@ -1276,12 +1301,16 @@ class Basilisk(MainWindow):
         <span class="mdi mdi-code-json"></span><span>JSON</span></button>
       <button type="button" class="bk-btn" data-bk="to_sql" title="Open this query in a SQL editor">
         <span class="mdi mdi-console-line"></span><span>SQL</span></button>
+      <button type="button" class="bk-btn" data-bk="value_panel"
+        title="Show the focused cell's whole value (F7; Shift+Enter on a cell)">
+        <span class="mdi mdi-dock-right"></span><span>Value</span></button>
       <span class="bk-spacer"></span>
       <span class="bk-note" id="{tid}-note"></span>
       <div class="bk-pager" id="{tid}-pager"></div>
     </div>
     <div class="bk-status" id="{tid}-status" hidden></div>
-    <div class="bk-results"><div class="bk-panel" id="{tid}-grid"></div></div>
+    <div class="bk-results"><div class="bk-panel bk-vp-grid" id="{tid}-grid"></div>
+      <div class="bk-vp" id="{tid}-vp" hidden></div></div>
     <div class="bk-foot"><code id="{tid}-sql"></code></div>
   </div>
   <div class="bk-sub" data-sub="columns" hidden>
@@ -1420,11 +1449,17 @@ class Basilisk(MainWindow):
                 cell_class_by=_CLS + f"c{i}", css=" ".join(css) or None,
             ))
         rows = [self._grid_row(tid, r, values) for r, values in enumerate(tab["rows"])]
-        if tab["grid"] is None:
+        first = tab["grid"] is None
+        if first:
             tab["grid"] = self._make_grid(tid, columns)
         else:
             tab["grid"].set_columns(columns)
         tab["grid"].set_rows(rows)
+        tab["focus_cell"] = None
+        if tab.get("vp") is not None:
+            tab["vp"].reset()
+        elif first and (self._settings.get("value_panel") or {}).get("open"):
+            self._vp(tid).open()
 
     def _grid_row(self, tid: str, index: int, values: list, row_id: str | None = None,
                   row_cls: str = "") -> dict:
@@ -1445,6 +1480,7 @@ class Basilisk(MainWindow):
         tab = self._tabs[tid]
         editable = bool((tab["info"] or {}).get("editable"))
         actions = [
+            TableAction("value", "View / edit value  (Shift+Enter)", "mdi-text-box-search-outline"),
             TableAction("copy", "Copy value", "mdi-content-copy"),
             TableAction("copy_row", "Copy row as JSON", "mdi-code-json"),
             TableAction("filter_eq", "Filter: column = value", "mdi-filter-outline"),
@@ -1470,17 +1506,7 @@ class Basilisk(MainWindow):
         grid.on_edit(lambda payload: self._on_cell_edit(tid, payload))
         grid.on_action(lambda payload: _spawn(self._on_grid_action(tid, payload), "grid action"))
         grid.on_sort(lambda payload: self._on_grid_sort(tid, payload))
-        # The context menu's payload has the row, not the column: remember
-        # which cell was right-clicked.
-        host = _el(f"{tid}-grid")
-
-        def _remember_cell(event) -> None:
-            cell = event.target.closest("td") if hasattr(event.target, "closest") else None
-            tab["menu_col"] = _attr(cell, "data-column-id") or None
-
-        proxy = create_proxy(_remember_cell)
-        self._proxies.append(proxy)
-        host.addEventListener("contextmenu", proxy, True)
+        self._watch_cells(tid, _el(f"{tid}-grid"))
         return grid
 
     def _on_grid_sort(self, tid: str, payload: dict) -> None:
@@ -1528,6 +1554,11 @@ class Basilisk(MainWindow):
 
     async def _discard_ok(self, tid: str) -> bool:
         pending = self._tabs[tid].get("pending") or {}
+        panel = self._tabs[tid].get("vp")
+        if not pending and panel is not None and panel.dirty:
+            return await message.confirm(
+                "Discard the change in the value panel that has not been applied?",
+                title="Unapplied change", ok_text="Discard", danger=True)
         if not pending:
             return True
         return await message.confirm(
@@ -1563,6 +1594,8 @@ class Basilisk(MainWindow):
                                "csv" if action == "export_csv" else "json")
         elif action == "to_sql":
             self._table_to_sql(tid)
+        elif action == "value_panel":
+            self._vp_toggle(tid)
         elif action == "copy_ddl":
             _spawn(self._copy_ddl(tid), "copy ddl")
         elif action == "ddl_sql":
@@ -1600,6 +1633,276 @@ class Basilisk(MainWindow):
                            "order_by": order_by, "format": fmt})
         _download(f"/bk/export/{conn_id}?{query}")
         self._toast(f"Exporting {name} as {fmt.upper()}…")
+
+    # -- the value panel (ui/value_panel.py) ---------------------------------
+
+    def _watch_cells(self, tid: str, host) -> None:
+        """
+        Which cell has focus (the value panel follows it), Shift+Enter on a
+        cell, and which cell was right-clicked: the context menu's payload has
+        the row but not the column.
+        """
+        tab = self._tabs[tid]
+
+        def _cell_of(event):
+            target = event.target
+            cell = target.closest("td[data-column-id]") if hasattr(target, "closest") else None
+            row = cell.closest("tr[data-row-id]") if cell else None
+            if not row:
+                return None, None
+            return _attr(row, "data-row-id"), _attr(cell, "data-column-id")
+
+        def _focus(event) -> None:
+            row_id, column = _cell_of(event)
+            if not row_id or tab.get("focus_cell") == (row_id, column):
+                return
+            tab["focus_cell"] = (row_id, column)
+            panel = tab.get("vp")
+            if panel is not None and panel.is_open:
+                _spawn(self._vp_follow(tid, row_id, column), "value panel")
+
+        def _menu(event) -> None:
+            _row, column = _cell_of(event)
+            tab["menu_col"] = column
+
+        def _key(event) -> None:
+            if str(event.key) != "Enter" or not event.shiftKey or event.ctrlKey or event.metaKey:
+                return
+            if str(event.target.tagName or "").lower() != "td":
+                return  # typing in a cell editor
+            row_id, column = _cell_of(event)
+            if row_id:
+                event.preventDefault()
+                event.stopPropagation()
+                self._vp_open(tid, row_id, column, focus=True)
+
+        for name, handler in (("focusin", _focus), ("click", _focus), ("contextmenu", _menu),
+                              ("keydown", _key)):
+            proxy = create_proxy(handler)
+            self._proxies.append(proxy)
+            host.addEventListener(name, proxy, True)
+
+    def _vp(self, tid: str):
+        """The tab's value panel, made on first use."""
+        tab = self._tabs.get(tid)
+        if tab is None:
+            return None
+        if tab.get("vp") is None:
+            host = _el(f"{tid}-vp")
+            if host is None:
+                return None
+            prefs = self._settings.get("value_panel") or {}
+            tab["vp"] = ValuePanel(self, host.parentElement, host,
+                                   width=int(prefs.get("width") or 420),
+                                   on_width=lambda width: self._vp_remember(width=width),
+                                   on_close=lambda: self._vp_remember(open=False),
+                                   spawn=_spawn)
+            if tab["kind"] == "sql":
+                shown = tab.get("shown")
+                tab["vp"].suppress(not (shown is not None and 0 <= shown < len(tab["results"])))
+        return tab["vp"]
+
+    def _vp_remember(self, **changes) -> None:
+        """Open or closed and the width are remembered per user, for the next tab."""
+        prefs = dict(self._settings.get("value_panel") or {})
+        if all(prefs.get(key) == value for key, value in changes.items()):
+            return
+        prefs.update(changes)
+        self._settings["value_panel"] = prefs
+        _spawn(UiStateService().set_async("settings", self._settings), "settings")
+
+    def _vp_toggle(self, tid: str) -> None:
+        panel = self._vp(tid)
+        if panel is None:
+            return
+        if panel.is_open:
+            panel.close()
+        else:
+            self._vp_open(tid)
+
+    def _vp_open(self, tid: str, row_id: str | None = None, column: str | None = None,
+                 focus: bool = False) -> None:
+        panel = self._vp(tid)
+        if panel is None:
+            return
+        if not panel.is_open:
+            panel.open()
+            self._vp_remember(open=True)
+        tab = self._tabs[tid]
+        if row_id is None:
+            row_id, column = tab.get("focus_cell") or (None, None)
+        else:
+            tab["focus_cell"] = (row_id, column)
+        if row_id and column:
+            _spawn(self._vp_follow(tid, row_id, column, focus=focus), "value panel")
+
+    async def _vp_follow(self, tid: str, row_id: str, column: str, focus: bool = False) -> None:
+        tab = self._tabs.get(tid)
+        panel = tab.get("vp") if tab else None
+        if panel is None or not panel.is_open or tab["grid"] is None:
+            return
+        ctx = (self._vp_table_ctx(tid, row_id, column) if tab["kind"] == "table"
+               else self._vp_result_ctx(tid, row_id, column))
+        if ctx is None:
+            return
+        if await panel.show(ctx) and focus:
+            panel.focus()
+
+    def _vp_refresh(self, tid: str, row_id: str, column: str) -> None:
+        """A cell changed outside the panel (grid edit, Set NULL): show its new value."""
+        panel = self._tabs[tid].get("vp")
+        if (panel is not None and panel.is_open and panel.current_key() == (row_id, column)
+                and not panel.dirty):
+            _spawn(self._vp_follow(tid, row_id, column), "value panel")
+
+    def _row_key(self, tid: str, row_id: str) -> dict | None:
+        tab = self._tabs[tid]
+        pending = tab["pending"].get(row_id)
+        if pending and pending.get("key"):
+            return pending["key"]
+        index = self._index_of(row_id)
+        pk = (tab["info"] or {}).get("pk") or []
+        if index is None or not pk or not tab["keys"]:
+            return None
+        return dict(zip(pk, tab["keys"][index]))
+
+    def _vp_table_ctx(self, tid: str, row_id: str, column: str) -> dict | None:
+        tab = self._tabs[tid]
+        try:
+            c = int(column[1:])
+            name = tab["columns"][c]
+        except (ValueError, IndexError):
+            return None
+        row = tab["grid"].get_row(row_id)
+        if not row:
+            return None
+        info = tab["info"] or {}
+        meta = next((col for col in info.get("columns") or [] if col["name"] == name), {})
+        type_name = str(meta.get("type") or "")
+        pending = tab["pending"].get(row_id)
+        changed = pending is not None and name in pending["values"]
+        index = self._index_of(row_id)
+        if changed:
+            text, cut = pending["values"][name], False
+        else:
+            text = row.get(column)
+            cut = index is not None and (index, c) in tab["truncated"]
+        key = self._row_key(tid, row_id) if index is not None else None
+        conn_id, db, schema = tab["loc"]
+        binary = tab["kinds"][c] == "bin" or _binary_type(type_name)
+        deleted = pending is not None and pending["op"] == "delete"
+        editable = bool(info.get("editable")) and not meta.get("computed") and not deleted
+        if info.get("read_only"):
+            reason = "Read-only connection."
+        elif info.get("kind") == "view":
+            reason = "Views are read-only here."
+        elif not info.get("pk"):
+            reason = "Read-only: the table has no primary key to find the row by."
+        elif meta.get("computed"):
+            reason = "A computed column cannot be edited."
+        elif deleted:
+            reason = "The row is marked for deletion."
+        else:
+            reason = ""
+        download = None
+        if key and not changed:
+            download = f"/bk/cell/{conn_id}?" + urlencode({
+                "table": tab["name"], "column": name, "key": json.dumps(key),
+                "database": db, "schema": schema})
+        load = None
+        if cut and key:
+            def load():
+                return SqlService().cell_value_async(conn_id, db, schema, tab["name"], key, name)
+        return {
+            "key": (row_id, column), "column": name, "type": type_name,
+            "pk": bool(meta.get("pk")), "nullable": meta.get("nullable"),
+            "binary": binary, "json": tab["kinds"][c] == "json" or "JSON" in type_name.upper(),
+            "text": text, "cut": cut, "load": load,
+            "cut_note": "Only the start of the value is shown: without a primary key the row "
+                        "cannot be read again.",
+            "editable": editable, "reason": reason,
+            "apply": lambda new, old: self._vp_apply(tid, row_id, column, new, old),
+            "download": download, "filename": f"{tab['name']}-{name}",
+        }
+
+    def _vp_result_ctx(self, tid: str, row_id: str, column: str) -> dict | None:
+        tab = self._tabs[tid]
+        shown = tab.get("shown")
+        if shown is None or not 0 <= shown < len(tab["results"]):
+            return None
+        entry = tab["results"][shown]
+        try:
+            c = int(column[1:])
+            name = entry["columns"][c]
+            r = int(row_id[1:])
+        except (ValueError, IndexError, TypeError):
+            return None
+        row = tab["grid"].get_row(row_id)
+        if not row:
+            return None
+        cut = any(int(cr) == r and int(cc) == c for cr, cc in entry.get("truncated") or [])
+        return {
+            "key": (row_id, column), "column": name, "type": "", "pk": False, "nullable": None,
+            "binary": entry["kinds"][c] == "bin", "json": entry["kinds"][c] == "json",
+            "text": row.get(column), "cut": cut, "load": None,
+            "cut_note": "A query result keeps only the start of long values; open the table "
+                        "to see the whole value.",
+            "editable": False, "reason": "", "apply": None, "download": None,
+            "filename": f"result-{shown + 1}-{name}",
+        }
+
+    def _vp_apply(self, tid: str, row_id: str, column: str, new, old) -> bool:
+        """The panel's Apply: a pending edit like any other, shown cut in the grid if long."""
+        tab = self._tabs.get(tid)
+        if tab is None or tab["grid"] is None:
+            return False
+        pending = self._pending_for(tid, row_id)
+        if pending["op"] == "delete":
+            return False
+        name = tab["columns"][int(column[1:])]
+        if name not in pending["orig"]:
+            pending["orig"][name] = old
+        tab["grid"].set_cell(row_id, column, grid_text(new))
+        self._set_pending_value(tid, row_id, column, new, from_panel=True)
+        return True
+
+    def _too_long(self, tid: str, row_id: str, c: int) -> bool:
+        """The grid has only the start of this cell's value, so it cannot be edited there."""
+        tab = self._tabs[tid]
+        name = tab["columns"][c]
+        pending = tab["pending"].get(row_id)
+        if pending is not None and name in pending["values"]:
+            value = pending["values"][name]
+            return isinstance(value, str) and len(value) > MAX_CELL_CHARS
+        index = self._index_of(row_id)
+        return index is not None and (index, c) in tab["truncated"]
+
+    async def _full_text(self, tid: str, row_id: str, column: str, shown):
+        """A cell's whole value as grid text, fetched when the grid has it cut."""
+        tab = self._tabs[tid]
+        try:
+            c = int(column[1:])
+        except ValueError:
+            return shown
+        name = tab["columns"][c]
+        pending = tab["pending"].get(row_id)
+        if pending is not None and name in pending["values"]:
+            return pending["values"][name]
+        index = self._index_of(row_id)
+        key = self._row_key(tid, row_id)
+        if index is None or (index, c) not in tab["truncated"] or not key:
+            return shown
+        conn_id, db, schema = tab["loc"]
+        result = await SqlService().cell_value_async(conn_id, db, schema, tab["name"], key, name)
+        if not result.get("ok") or result.get("too_large"):
+            self._toast(result.get("error") or "The value is too large to copy; save it to a "
+                        "file from the value panel.", kind="warning")
+            return shown
+        if result.get("null"):
+            return None
+        if result.get("binary"):
+            return "0x" + base64.b64decode(result.get("b64") or "").hex()
+        return result.get("text")
 
     # -- editing: changes stay pending until Save --------------------------
 
@@ -1649,9 +1952,10 @@ class Basilisk(MainWindow):
         old = payload.get("old_value")
         index = self._index_of(row_id)
         c = int(column[1:])
-        if index is not None and (index, c) in tab["truncated"]:
+        if self._too_long(tid, row_id, c):
             tab["grid"].set_cell(row_id, column, old)
-            tab["grid"].set_cell_error(row_id, column, "Too large to edit in the grid; use a SQL editor")
+            tab["grid"].set_cell_error(row_id, column,
+                                       "Too long to edit in the grid; use the value panel (Shift+Enter)")
             return
         pending = self._pending_for(tid, row_id)
         if pending["op"] == "delete":
@@ -1666,7 +1970,8 @@ class Basilisk(MainWindow):
             tab["grid"].set_cell(row_id, column, None)
         self._set_pending_value(tid, row_id, column, value)
 
-    def _set_pending_value(self, tid: str, row_id: str, column: str, value) -> None:
+    def _set_pending_value(self, tid: str, row_id: str, column: str, value,
+                           from_panel: bool = False) -> None:
         tab = self._tabs[tid]
         pending = self._pending_for(tid, row_id)
         name = tab["columns"][int(column[1:])]
@@ -1679,6 +1984,8 @@ class Basilisk(MainWindow):
             pending["values"].pop(name, None)
         if value is None:
             classes.append("bk-null")
+        elif isinstance(value, str) and len(value) > MAX_CELL_CHARS:
+            classes.append("bk-cut")
         self._cell_class(tid, row_id, column, " ".join(classes))
         if pending["op"] == "update" and not pending["values"]:
             tab["pending"].pop(row_id, None)
@@ -1686,6 +1993,8 @@ class Basilisk(MainWindow):
         elif pending["op"] == "update":
             self._row_class(tid, row_id, "bk-changed")
         self._sync_save(tid)
+        if not from_panel:
+            self._vp_refresh(tid, row_id, column)
 
     def _sync_save(self, tid: str) -> None:
         tab = self._tabs[tid]
@@ -1711,6 +2020,9 @@ class Basilisk(MainWindow):
             if value is not None:
                 pending["values"][tab["columns"][c]] = value
                 row[_CLS + f"c{c}"] = "bk-dirty"
+                if isinstance(value, str) and len(value) > MAX_CELL_CHARS:
+                    row[f"c{c}"] = grid_text(value)
+                    row[_CLS + f"c{c}"] = "bk-dirty bk-cut"
         tab["pending"][row_id] = pending
         rows = [row] + tab["grid"].get_rows()
         tab["grid"].set_rows(rows)
@@ -1735,12 +2047,16 @@ class Basilisk(MainWindow):
         meta = {col["name"]: col for col in (tab["info"] or {}).get("columns") or []}
         for row_id in ids:
             index = self._index_of(row_id)
-            if index is not None and any((index, c) in tab["truncated"]
-                                         for c in range(len(tab["columns"]))):
-                self._toast("A row with a value too large for the grid cannot be duplicated here.",
+            changed = (tab["pending"].get(row_id) or {}).get("values") or {}
+            if index is not None and any((index, c) in tab["truncated"] and name not in changed
+                                         for c, name in enumerate(tab["columns"])):
+                self._toast("A row with a value too long for the grid cannot be duplicated here.",
                             kind="warning")
                 continue
             values = self._current_values(tid, row_id)
+            for c, name in enumerate(tab["columns"]):
+                if name in changed:
+                    values[c] = changed[name]
             for c, name in enumerate(tab["columns"]):
                 if (meta.get(name) or {}).get("autoincrement") or (meta.get(name) or {}).get("computed"):
                     values[c] = None
@@ -1790,7 +2106,10 @@ class Basilisk(MainWindow):
         except (ValueError, IndexError):
             return
         value = row.get(column)
-        if action == "copy":
+        if action == "value":
+            self._vp_open(tid, row_id, column, focus=True)
+        elif action == "copy":
+            value = await self._full_text(tid, row_id, column, value)
             text = "NULL" if value is None else str(value)
             if await _copy(text):
                 self._toast("Copied.", kind="success")
@@ -1820,10 +2139,6 @@ class Basilisk(MainWindow):
 
     def _set_cell(self, tid: str, row_id: str, column: str, value) -> None:
         tab = self._tabs[tid]
-        index = self._index_of(row_id)
-        if index is not None and (index, int(column[1:])) in tab["truncated"]:
-            self._toast("Too large to edit in the grid; use a SQL editor.", kind="warning")
-            return
         pending = self._pending_for(tid, row_id)
         if pending["op"] == "delete":
             return
@@ -2051,6 +2366,7 @@ class Basilisk(MainWindow):
             "name": title, "engine": conn.get("engine") or "", "editor": None,
             "results": [], "shown": None, "run_id": None, "max_rows": 500,
             "grid": None, "fallback": None, "draft_timer": None, "restore_draft": not text,
+            "menu_col": None, "vp": None, "focus_cell": None,
             # Manual commit mode: the tab's server session (sessions.py) and
             # the last transaction state it reported.
             "manual": bool(self._settings.get("manual_commit")) and not conn.get("read_only"),
@@ -2148,10 +2464,14 @@ class Basilisk(MainWindow):
       title="Save the rows shown as CSV"><span class="mdi mdi-file-delimited-outline"></span><span>CSV</span></button>
     <button type="button" class="bk-btn" data-bk="res_export" id="{tid}-res-export" hidden
       title="Run this statement again and export every row"><span class="mdi mdi-database-export-outline"></span><span>Export all</span></button>
+    <button type="button" class="bk-btn" data-bk="value_panel" id="{tid}-res-value" hidden
+      title="Show the focused cell's whole value (F7; Shift+Enter on a cell)">
+      <span class="mdi mdi-dock-right"></span><span>Value</span></button>
   </div>
   <div class="bk-status" id="{tid}-status" hidden></div>
   <div class="bk-results">
-    <div class="bk-panel" id="{tid}-grid"></div>
+    <div class="bk-panel bk-vp-grid" id="{tid}-grid"></div>
+    <div class="bk-vp" id="{tid}-vp" hidden></div>
     <pre class="bk-panel bk-msgs" id="{tid}-msgs" hidden></pre>
     <div class="bk-panel bk-plan" id="{tid}-plan" hidden>
       <div class="bk-plan-bar">
@@ -2305,6 +2625,8 @@ class Basilisk(MainWindow):
             self._result_csv(tid)
         elif action == "res_export":
             _spawn(self._result_export(tid), "export")
+        elif action == "value_panel":
+            self._vp_toggle(tid)
 
     def _sql_busy(self, tid: str, busy: bool) -> None:
         for suffix in ("explain", "analyze"):
@@ -2781,6 +3103,9 @@ class Basilisk(MainWindow):
         grid_host, msgs = _el(f"{tid}-grid"), _el(f"{tid}-msgs")
         showing_rows = 0 <= index < len(tab["results"])
         grid_host.hidden = not showing_rows
+        _el(f"{tid}-res-value").hidden = not showing_rows
+        if tab.get("vp") is not None:
+            tab["vp"].suppress(not showing_rows)
         msgs.hidden = index != -1
         _el(f"{tid}-plan").hidden = index != -2
         _el(f"{tid}-res-csv").hidden = not showing_rows
@@ -2810,20 +3135,31 @@ class Basilisk(MainWindow):
             tab["grid"] = DataTable(DataTableConfig(
                 columns=columns, rows=rows, id_field=_ID, selection="multi",
                 resizable_columns=True, reorderable_columns=True, empty_text="No rows",
-                context_actions=[TableAction("copy_row", "Copy row as JSON", "mdi-code-json"),
-                                 TableAction("copy_rows", "Copy selected as TSV", "mdi-content-copy")],
+                context_actions=[
+                    TableAction("value", "View value  (Shift+Enter)", "mdi-text-box-search-outline"),
+                    TableAction("copy_row", "Copy row as JSON", "mdi-code-json"),
+                    TableAction("copy_rows", "Copy selected as TSV", "mdi-content-copy")],
             ), container=grid_host)
             tab["grid"].on_action(lambda payload: _spawn(self._result_action(tid, payload),
                                                          "result action"))
+            self._watch_cells(tid, grid_host)
+            if (self._settings.get("value_panel") or {}).get("open"):
+                self._vp(tid).open()
         else:
             tab["grid"].set_columns(columns)
             tab["grid"].set_rows(rows)
+        tab["focus_cell"] = None
+        if tab.get("vp") is not None:
+            tab["vp"].reset()
 
     async def _result_action(self, tid: str, payload: dict) -> None:
         tab = self._tabs[tid]
         entry = tab["results"][tab["shown"]]
         names = entry["columns"]
-        if payload.get("action") == "copy_row":
+        if payload.get("action") == "value":
+            self._vp_open(tid, str(payload.get("id") or ""), tab.get("menu_col") or "c0",
+                          focus=True)
+        elif payload.get("action") == "copy_row":
             row = payload.get("row") or {}
             data = {names[i]: row.get(f"c{i}") for i in range(len(names))}
             if await _copy(json.dumps(data, ensure_ascii=False, indent=2)):
@@ -3459,4 +3795,49 @@ td.bk-num{font-variant-numeric:tabular-nums;}
 .bk-kv td{padding:6px 0;}
 .bk-kv kbd{padding:2px 6px;border:1px solid var(--bk-line-2);border-radius:4px;background:var(--bk-bg);
   font:12px ui-monospace,Menlo,Consolas,monospace;}
+/* The value panel (ui/value_panel.py): the right side of a grid's box. */
+.bk-results.bk-vp-on > .bk-vp-grid{right:var(--bk-vp-w,420px);width:auto;}
+.bk-vp{position:absolute;top:0;bottom:0;right:0;width:var(--bk-vp-w,420px);display:flex;
+  min-width:0;background:var(--bk-panel);border-left:1px solid var(--bk-line-2);z-index:2;}
+.bk-vp [hidden]{display:none !important;}
+.bk-vp-grip{position:absolute;left:-4px;top:0;bottom:0;width:7px;cursor:col-resize;z-index:3;}
+.bk-vp-grip:hover,.bk-vp-dragging .bk-vp-grip{background:rgba(245,158,11,.35);}
+.bk-vp-dragging,.bk-vp-dragging *{user-select:none;}
+.bk-vp-inner{display:flex;flex-direction:column;flex:1 1 auto;min-width:0;min-height:0;}
+.bk-vp-head{display:flex;align-items:center;gap:6px;padding:4px 6px 4px 10px;font-size:12.5px;
+  border-bottom:1px solid var(--bk-line);}
+.bk-vp-head > .mdi{color:var(--bk-accent);font-size:15px;}
+.bk-vp-title{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;}
+.bk-vp-type{color:var(--bk-muted);font-size:11.5px;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;min-width:0;}
+.bk-vp-bar{display:flex;align-items:center;gap:6px;padding:4px 8px;flex-wrap:wrap;
+  border-bottom:1px solid var(--bk-line);}
+.bk-vp-bar .bk-seg{align-self:center;}
+.bk-vp-bar .bk-seg-btn{padding:3px 9px;font-size:12px;}
+.bk-vp-bar .bk-seg-btn:disabled{opacity:.35;cursor:not-allowed;background:transparent;}
+.bk-vp-small{padding:3px 8px;font-size:12px;}
+.bk-vp-icon{padding:5px 7px;}
+.bk-vp-wrap{display:flex;align-items:center;gap:4px;font-size:12px;color:var(--bk-muted);}
+.bk-vp-note{padding:5px 10px;font-size:12px;line-height:1.4;border-bottom:1px solid var(--bk-line);}
+.bk-vp-info{color:var(--bk-muted);}
+.bk-vp-ok{color:#86efac;}
+.bk-vp-warn,.bk-vp-warning{color:#fbbf24;}
+.bk-vp-error{color:#f87171;}
+.bk-vp-body{position:relative;flex:1 1 auto;min-height:0;background:var(--bk-deep);}
+.bk-vp-editor{position:absolute;inset:0;}
+.bk-vp-editor .cm-editor{height:100%;}
+.bk-vp-plain{width:100%;height:100%;box-sizing:border-box;padding:8px 10px;border:0;resize:none;
+  background:var(--bk-deep);color:var(--bk-text);font:12.5px ui-monospace,Menlo,Consolas,monospace;}
+.bk-vp-image{position:absolute;inset:0;overflow:auto;display:flex;align-items:center;
+  justify-content:center;padding:12px;box-sizing:border-box;background-color:#1e293b;
+  background-image:conic-gradient(#273449 25%,transparent 0 50%,#273449 0 75%,transparent 0);
+  background-size:16px 16px;}
+.bk-vp-image img{max-width:100%;max-height:100%;}
+.bk-vp-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  gap:6px;padding:16px;text-align:center;color:var(--bk-muted);font-size:12.5px;}
+.bk-vp-status{display:flex;gap:10px;padding:3px 10px;font-size:11.5px;color:var(--bk-muted);
+  border-top:1px solid var(--bk-line);white-space:nowrap;overflow:hidden;}
+.bk-vp-actions{display:flex;align-items:center;gap:6px;padding:6px 8px;
+  border-top:1px solid var(--bk-line);}
+.bk-vp-actions .bk-btn{padding:5px 9px;}
 """

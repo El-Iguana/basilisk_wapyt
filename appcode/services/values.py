@@ -24,6 +24,10 @@ from typing import Any
 # grid (the edit would save the cut text).
 MAX_CELL_CHARS = 20_000
 MAX_BINARY_BYTES = 2_048
+# The value panel shows and edits values up to this size (characters for
+# text, bytes for binary); a larger one can only be saved to a file. Binary
+# travels as hex when edited, and pytincture refuses requests over 16 MB.
+VIEW_MAX_BYTES = 4 * 1024 * 1024
 
 _TRUE = {"1", "t", "true", "y", "yes", "on"}
 _FALSE = {"0", "f", "false", "n", "no", "off"}
@@ -62,6 +66,37 @@ def cell(value: Any) -> tuple[Any, bool]:
     if len(text) > MAX_CELL_CHARS:
         return text[:MAX_CELL_CHARS] + "…", True
     return text, False
+
+
+def full_value(value: Any) -> dict:
+    """
+    One value for the value panel, uncut up to :data:`VIEW_MAX_BYTES`:
+    ``{"null", "binary", "text", "b64", "size", "too_large"}``. Binary comes
+    as base64; everything else as the same text the grid shows.
+    """
+    if value is None:
+        return {"null": True, "binary": False, "text": None, "b64": None, "size": 0,
+                "too_large": False}
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+        big = len(raw) > VIEW_MAX_BYTES
+        return {"null": False, "binary": True, "text": None,
+                "b64": None if big else base64.b64encode(raw).decode("ascii"),
+                "size": len(raw), "too_large": big}
+    text = full_text(value)
+    big = len(text) > VIEW_MAX_BYTES
+    return {"null": False, "binary": False, "text": None if big else text, "b64": None,
+            "size": len(text), "too_large": big}
+
+
+def full_text(value: Any) -> str:
+    """:func:`cell`'s text without the cut (not for binary)."""
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False, default=str)
+    if isinstance(value, (str, int, float, decimal.Decimal, bool, _dt.date, _dt.time,
+                          _dt.timedelta, uuid.UUID)):
+        return cell(value)[0] if not isinstance(value, str) else value
+    return str(value)
 
 
 def kind_of(value: Any) -> str:

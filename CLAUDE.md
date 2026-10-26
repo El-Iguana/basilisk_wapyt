@@ -44,12 +44,13 @@ appcode/                   # pytincture modules_path
     connection_service.py  #   BFF: profiles, test, disconnect
     sql_service.py         #   BFF: thin front for sqlops (tree, table, browse, save, execute…)
     user_service.py, ui_state_service.py, about*.py, release_check.py   # from Monguana
-    transfer.py            #   plain routes under /bk: table export (GET), query export (POST)
+    transfer.py            #   plain routes under /bk: table export (GET), query export (POST), one cell (GET)
+  ui/value_panel.py        #   the value panel (Pyodide; pure helpers at the top, tested in CPython)
   static/                  #   basilisk_avatar.webp: logo, login page, favicon, About
   vendor/codemirror/       #   the SQL editor bundle (built, committed), served at /vendor
 docs/basilisk.webp         # the README's picture (both cut from the original artwork, 1254 px)
 tools/codemirror/          # its recipe: pinned package.json, entry.js, build.sh
-tests/                     # test_units.py, test_plans.py, test_bff_state.py, test_live.py (needs the databases)
+tests/                     # test_units.py, test_plans.py, test_value_panel.py, test_bff_state.py, test_live.py (needs the databases)
 tests/smoke/               # seed_sample.py + ui_smoke.py (Playwright, all four engines)
 Containerfile, scripts/podman-run.sh   # image + dev container "basilisk"
 ```
@@ -90,13 +91,15 @@ podman run -d --name basilisk-mysql -p 127.0.0.1:53306:3306 -e MYSQL_ROOT_PASSWO
 podman run -d --name basilisk-mssql -p 127.0.0.1:51433:1433 -e ACCEPT_EULA=Y \
   -e MSSQL_SA_PASSWORD="$PW" -e MSSQL_PID=Developer mcr.microsoft.com/mssql/server:2022-latest
 uv run python tests/smoke/seed_sample.py          # the shop sample in all four (SQLite: data/sqlite/shop.db)
-uv run --group dev pytest -q tests/test_live.py   # 68 live tests
+uv run --group dev pytest -q tests/test_live.py   # 80 live tests
 BASILISK_PASS=… python3 tests/smoke/ui_smoke.py   # ~22 UI checks per engine
 ```
 
 Users: `postgres` / `root` / `sa`. The sample (`seed_sample.py`): customers,
 products (JSON, binary, a bigint past 2^53), orders (137 rows, uuid, time),
-order_items (composite key), `audit_log` (no primary key), view
+order_items (composite key), `audit_log` (no primary key), a real PNG in
+`products.photo` and a 32,000-character note on customer 11 (both for the
+value panel), view
 `order_totals`; PostgreSQL and SQL Server also have a `sales` schema.
 **Reseed before the smoke test**: `test_live.py` edits rows. The smoke test
 needs an admin whose password is not flagged (`manage.py reset-password`) and,
@@ -161,7 +164,8 @@ primary key, views and read-only profiles are read-only in the grid.
   stored the text as a JSON *string* (caught by a unit test). MySQL's BOOLEAN
   is TINYINT, so integer columns accept true/false.
 - Cells over 20,000 characters (binary over 2 KB) are cut for display, flagged
-  `bk-cut`, and refused for editing ("use a SQL editor").
+  `bk-cut`, and edited in the **value panel** instead of the grid
+  (`_too_long`).
 - Opening a NULL cell and leaving it empty keeps NULL; **Set NULL** and **Set
   empty text** are in the cell menu.
 - The DataTable's context menu payload has the row but not the column: a
@@ -172,6 +176,38 @@ primary key, views and read-only profiles are read-only in the grid.
   dialect) into ORDER BY and reloads; every column's `sort_by` is a rank key
   signed by the table's direction, so the widget's local sort keeps the
   server's order (Monguana's trick).
+
+### Value panel (`ui/value_panel.py`, milestone 2)
+
+A panel on the right of a table's Data grid and of SQL results (Value button,
+**F7**, **Shift+Enter** on a cell, or "View / edit value" in the cell menu),
+following the cell last clicked or focused. Open/closed and its width are
+remembered per user (`settings.value_panel`).
+
+- **Views**: Text, JSON (pretty, checked as you type), Hex (an `offset hex
+  ascii` dump, first 1 MB) and Image (PNG/JPEG/GIF/WebP/BMP/ICO sniffed from
+  the bytes; never SVG; a picture that fails to decode falls back to Hex).
+  Binary is edited in the Text view as hex.
+- **A cut cell is fetched whole** by primary key (`SqlService.cell_value` →
+  `sqlops.fetch_cell` → `values.full_value`, base64 for bytes) up to
+  `VIEW_MAX_BYTES` (4 MB: binary travels as hex when saved, and pytincture
+  refuses requests over 16 MB). Bigger values can only be saved to a file,
+  through `GET /bk/cell/<conn>`. Query results keep no key, so a cut result
+  value stays cut.
+- **Apply** (Ctrl+Enter) hands the value to the page as an ordinary pending
+  edit (`_vp_apply`); Save previews and writes it like any other. The grid
+  shows the start (`grid_text`). The panel never writes to the database.
+- **An unapplied change pins the panel** to its cell ("Apply or discard"),
+  and paging or refreshing asks before throwing it away.
+- The JSON view re-indents for reading; an edit that leaves the same JSON
+  keeps the stored text exactly, and a one-line value stays on one line
+  (`json_result`).
+- The Save preview cuts any statement over 4,000 characters
+  (`sqlops._preview`).
+- **A click on a wapyt grid cell does not focus it**, so Shift+Enter after a
+  click reaches the document: `_on_keydown` opens the panel on
+  `tab["focus_cell"]`, which a capture-phase click listener keeps
+  (`_watch_cells`).
 
 ### SQL editor
 

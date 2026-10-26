@@ -79,6 +79,12 @@ class SqlService:
         return self._call("save_changes", int(conn_id), database or "", schema or "", name,
                           list(changes or []), bool(dry_run))
 
+    def cell_value(self, conn_id: int, database: str, schema: str, name: str, key: dict,
+                   column: str) -> dict:
+        """One cell uncut, for the value panel: found by the row's primary key."""
+        return self._call("cell_value", int(conn_id), database or "", schema or "", name,
+                          dict(key or {}), str(column))
+
     def script(self, conn_id: int, database: str, schema: str, name: str, kind: str) -> dict:
         return self._call("script", int(conn_id), database or "", schema or "", name, kind)
 

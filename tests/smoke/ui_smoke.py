@@ -180,6 +180,99 @@ def table_checks(page: Page, engine: str) -> None:
 
 
 
+def panel_open(page: Page, view: str) -> bool:
+    return page.locator(f"{view} .bk-results.bk-vp-on").count() > 0
+
+
+def panel_state(page: Page) -> str:
+    return page.inner_text(".bk-vp:visible .bk-vp-status")
+
+
+def value_panel_checks(page: Page, engine: str) -> None:
+    """The value panel: a cut long text loads whole, an edit applies, saves and goes
+    back; JSON, image and hex views; the unapplied-change guard; F7."""
+    view = ".bk-view:visible"
+    vp = ".bk-vp:visible"
+    page.click(f'{view} [data-bk="clear"]')
+    page.wait_for_selector(f'{view} tr[data-row-id="r10"]', timeout=20000)
+    if not panel_open(page, view):
+        page.click(f'{view} [data-bk="value_panel"]')
+    check(panel_open(page, view), f"{engine}: Value opens the panel")
+    notes = f'{view} tr[data-row-id="r10"] td[data-column-id="c5"]'
+    try:
+        page.wait_for_selector(f"{notes}.bk-cut", timeout=10000)
+        check(True, f"{engine}: long note is cut in the grid")
+    except Exception:  # noqa: BLE001
+        check(False, f"{engine}: long note is cut in the grid")
+    page.click(notes)
+    ok = wait_text(page, f"{vp} .bk-vp-status", "K characters")
+    size = panel_state(page)
+    check(ok and "Changed" not in size, f"{engine}: panel loads the whole note ({size.split()[0:3]})")
+    shot(page, f"smoke-{engine}-5-value")
+    # Append a line, apply, save: the preview is cut, the saved value is whole.
+    page.click(f"{vp} .cm-content")
+    page.keyboard.press("Control+End")
+    page.keyboard.type("\nLine 0541: smoke.")
+    check(wait_text(page, f"{vp} .bk-vp-status", "Changed"), f"{engine}: typing marks a change")
+    page.keyboard.press("Control+Enter")
+    time.sleep(0.3)
+    classes = page.get_attribute(notes, "class") or ""
+    check("bk-dirty" in classes and "bk-cut" in classes, f"{engine}: Apply makes a pending edit")
+    page.click(f'{view} [data-bk="save"]')
+    page.wait_for_selector(f"{modal(page)} .bk-pre", timeout=10000)
+    preview = page.inner_text(f"{modal(page)} .bk-pre")
+    check("characters in all" in preview, f"{engine}: save preview is cut")
+    page.click(f'{modal(page)} [data-answer="yes"]')
+    time.sleep(2)
+    page.click(notes)
+    wait_text(page, f"{vp} .bk-vp-status", "K characters")
+    page.click(f"{vp} .cm-content")
+    page.keyboard.press("Control+End")
+    check(wait_text(page, f"{vp} .cm-content", "Line 0541: smoke."), f"{engine}: saved whole")
+    page.keyboard.press("Shift+Home")
+    page.keyboard.press("Backspace")
+    page.keyboard.press("Backspace")
+    page.keyboard.press("Control+Enter")
+    page.click(f'{view} [data-bk="save"]')
+    page.wait_for_selector(f"{modal(page)} .bk-pre", timeout=10000)
+    page.click(f'{modal(page)} [data-answer="yes"]')
+    time.sleep(2)
+    page.click(notes)
+    wait_text(page, f"{vp} .bk-vp-status", "K characters")
+    check(panel_state(page).split()[0:3] == size.split()[0:3], f"{engine}: note put back")
+
+    # products: JSON, a picture, bytes.
+    exact_tree_row(page, "products").first.dblclick()
+    page.wait_for_selector(f'{view} tr[data-row-id="r3"]', timeout=30000)
+    if not panel_open(page, view):
+        page.click(f'{view} [data-bk="value_panel"]')
+    page.click(f'{view} tr[data-row-id="r0"] td[data-column-id="c4"]')
+    ok = wait_text(page, f"{vp} .bk-vp-status", "Valid JSON")
+    pressed = page.get_attribute(f'{vp} [data-view="json"]', "aria-pressed")
+    check(ok and pressed == "true", f"{engine}: JSON opens in the JSON view")
+    page.click(f"{vp} .cm-content")
+    page.keyboard.press("Control+End")
+    page.keyboard.type("x")
+    check(wait_text(page, f"{vp} .bk-vp-status", "Invalid JSON"), f"{engine}: JSON checked as typed")
+    page.keyboard.press("Control+Enter")
+    check(wait_text(page, f"{vp} .bk-vp-note", "Invalid JSON"), f"{engine}: bad JSON not applied")
+    page.click(f'{view} tr[data-row-id="r1"] td[data-column-id="c4"]')
+    check(wait_text(page, f"{vp} .bk-vp-note", "Apply or discard"), f"{engine}: unapplied edit holds")
+    page.click(f'{vp} [data-vp="discard"]')
+    page.click(f'{view} tr[data-row-id="r0"] td[data-column-id="c5"]')
+    time.sleep(0.8)
+    natural = page.locator(f"{vp} img").evaluate("img => img.naturalWidth")
+    check(natural == 24, f"{engine}: a PNG shows as a picture ({natural} px)")
+    page.click(f'{view} tr[data-row-id="r3"] td[data-column-id="c5"]')
+    ok = wait_text(page, f"{vp} .cm-content", "00000000  00 01 02 03")
+    check(ok and "5,120 bytes" in panel_state(page), f"{engine}: bytes show as a hex dump")
+    shot(page, f"smoke-{engine}-6-hex")
+    page.click(f'{view} tr[data-row-id="r3"] td[data-column-id="c1"]')
+    page.keyboard.press("F7")
+    time.sleep(0.3)
+    check(not panel_open(page, view), f"{engine}: F7 closes the panel")
+
+
 def export_checks(page: Page, engine: str, conn_id: int) -> None:
     db = {"postgresql": "shop", "mysql": "shop", "mssql": "shop", "sqlite": ""}[engine]
     schema = {"postgresql": "public", "mssql": "dbo"}.get(engine, "")
@@ -214,6 +307,17 @@ def sql_checks(page: Page, engine: str) -> None:
     statuses = page.locator(f'{page_grid(tab)} tbody td[data-column-id="c0"]').all_inner_texts()
     check("paid" in statuses, f"{engine}: result rows ({statuses})")
     shot(page, f"smoke-{engine}-4-sql")
+    # The value panel on a result: read-only, and Shift+Enter opens it.
+    page.click(f'{page_grid(tab)} tr[data-row-id="r0"] td[data-column-id="c0"]')
+    page.keyboard.press("Shift+Enter")
+    ok = wait_text(page, ".bk-vp:visible .bk-vp-head", "status")
+    check(ok and not page.is_visible('.bk-vp:visible [data-vp="apply"]'),
+          f"{engine}: Shift+Enter opens a read-only panel on a result")
+    page.click(f'{page_grid(tab)} tr[data-row-id="r0"] td[data-column-id="c0"]')
+    page.keyboard.press("F7")
+    time.sleep(0.3)
+    check(not page.is_visible(".bk-vp:visible"), f"{engine}: F7 closes it")
+    page.click(f"{tab} .cm-content")
     page.keyboard.press("Control+Shift+Enter")
     if engine in ("sqlite", "mysql"):
         # SQLite and MySQL divide by zero to NULL, so the script succeeds.
@@ -377,6 +481,9 @@ def main() -> int:
                 create_connection(page, engine, name)
                 open_customers(page, engine, name)
                 table_checks(page, engine)
+                value_panel_checks(page, engine)
+                close_tabs(page)
+                open_customers(page, engine, name)
                 export_checks(page, engine, conn_id_of(page, name))
                 sql_checks(page, engine)
                 generate_check(page, engine)

@@ -27,8 +27,11 @@ test.
   for all four engines, one plan grid with own-cost shading, misestimate
   warnings, node details and the raw plan. Follow-ups: a graphical plan
   (boxes and arrows), and comparing two plans.
-- **Value viewer / editor panel** for long text, JSON (pretty) and binary
-  (hex), which also lifts the "too large to edit in the grid" limit.
+- ~~**Value viewer / editor panel**~~ — done (2026-10-25): a side panel on
+  table grids and SQL results (F7, Shift+Enter) with Text / JSON / Hex /
+  Image views; cut values fetched whole by primary key; edits are pending
+  grid edits; load from / save to a file. Follow-ups: editing a cut value in
+  a result set (needs the row's key), a wapyt DataTable "focus on click".
 - **More objects in the navigator**: functions / procedures, sequences,
   triggers, materialized views refresh, users/roles (read-only listing first).
 - **Object actions**: create/rename/drop table (with the generated DDL shown
