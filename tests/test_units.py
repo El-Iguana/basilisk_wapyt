@@ -135,3 +135,53 @@ def test_vendored_editor_matches_its_version_file():
     vendor = ROOT / "appcode" / "vendor" / "codemirror"
     digest = hashlib.sha256((vendor / "basilisk-editor.js").read_bytes()).hexdigest()
     assert f"sha256 {digest}" in (vendor / "VERSION").read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Navigator objects: pure helpers
+# ---------------------------------------------------------------------------
+
+def test_sqlite_trigger_head():
+    from services.engines.sqlite import _trigger_head
+
+    assert _trigger_head("CREATE TRIGGER t BEFORE UPDATE OF status ON orders BEGIN END") == {
+        "timing": "BEFORE", "events": "UPDATE OF status"}
+    assert _trigger_head("create temp trigger if not exists t after insert on x begin end") == {
+        "timing": "AFTER", "events": "INSERT"}
+    assert _trigger_head('CREATE TRIGGER "a b" INSTEAD  OF delete ON v BEGIN END') == {
+        "timing": "INSTEAD OF", "events": "DELETE"}
+    # No timing means BEFORE in SQLite.
+    assert _trigger_head("CREATE TRIGGER t DELETE ON x BEGIN END")["timing"] == "BEFORE"
+    assert _trigger_head(None) == {"timing": "", "events": ""}
+
+
+def test_call_sql_templates():
+    from services.sqlops import call_sql
+
+    scalar = {"params": [{"name": "a", "type": "integer", "mode": "IN"},
+                         {"name": "b", "type": "text", "mode": "OUT"}]}
+    assert call_sql("postgresql", "function", "s.f", scalar) == (
+        "SELECT s.f(\n  NULL /* a integer */\n);\n")       # OUT arguments are not passed
+    assert call_sql("postgresql", "function", "s.f", {"params": [], "sets": True}) == (
+        "SELECT * FROM s.f();\n")
+    assert call_sql("postgresql", "procedure", "s.p", scalar) == (
+        "CALL s.p(\n  NULL /* a integer */,\n  NULL /* OUT b text */\n);\n")
+    assert call_sql("mysql", "procedure", "d.p", scalar) == (
+        "CALL d.p(\n  NULL /* a integer */,\n  @b /* OUT b text */\n);\nSELECT @b;\n")
+    tsql = {"params": [{"name": "@a", "type": "int", "mode": "IN"},
+                       {"name": "@b", "type": "int", "mode": "OUTPUT"}]}
+    assert call_sql("mssql", "procedure", "dbo.p", tsql) == (
+        "DECLARE @out_b int;\nEXEC dbo.p\n  @a = NULL /* @a int */,\n"
+        "  @b = @out_b OUTPUT /* @b int */;\nSELECT @out_b;\n")
+    assert call_sql("mssql", "procedure", "dbo.p", {"params": []}) == "EXEC dbo.p;\n"
+
+
+def test_mysql_create_user_hides_the_hash():
+    from services.engines.mysql import _HASH
+
+    shown = ("CREATE USER `u`@`%` IDENTIFIED WITH 'caching_sha2_password' AS "
+             "'$A$005$a\\'b\\\\c' REQUIRE NONE")
+    assert _HASH.sub(r"\1'…'", shown) == (
+        "CREATE USER `u`@`%` IDENTIFIED WITH 'caching_sha2_password' AS '…' REQUIRE NONE")
+    hexed = "CREATE USER `u`@`%` IDENTIFIED WITH 'x' AS 0x24410A REQUIRE NONE"
+    assert _HASH.sub(r"\1'…'", hexed).endswith("AS '…' REQUIRE NONE")

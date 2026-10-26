@@ -161,11 +161,182 @@ def objects(user_id: int, conn_id: int, database: str = "", schema: str = "") ->
             estimates = spec.row_estimates(conn, target)
         except Exception:  # noqa: BLE001 - estimates are a nicety
             estimates = {}
+        extra, errors = _more_objects(conn, spec, target)
     return {
         "tables": [{"name": name, "rows": estimates.get(name)} for name in tables],
         "views": [{"name": name, "materialized": False} for name in views]
         + [{"name": name, "materialized": True} for name in materialized],
+        "groups": list(spec.object_groups), "errors": errors, **extra,
     }
+
+
+def _more_objects(conn: Any, spec: Any, target: Optional[str]) -> tuple[dict, dict]:
+    """
+    Routines, sequences and triggers of a schema. Each list fails on its own
+    (a missing privilege, say) without taking the tables down with it; on
+    PostgreSQL a savepoint keeps the transaction usable after a failure.
+    """
+    from contextlib import nullcontext
+
+    groups = spec.object_groups
+    wanted = [(key, method) for key, method, needed in (
+        ("routines", spec.list_routines, {"functions", "procedures"} & set(groups)),
+        ("sequences", spec.list_sequences, "sequences" in groups),
+        ("triggers", spec.list_triggers, "triggers" in groups),
+    ) if needed]
+    found: dict = {"routines": [], "sequences": [], "triggers": []}
+    errors: dict = {}
+    for key, method in wanted:
+        try:
+            with conn.begin_nested() if spec.savepoints else nullcontext():
+                found[key] = method(conn, target)
+        except Exception as exc:  # noqa: BLE001 - shown as the group's note
+            errors[key] = error_text(exc)
+    return found, errors
+
+
+# ---------------------------------------------------------------------------
+# Routines, sequences, triggers and roles (read-only object tabs)
+# ---------------------------------------------------------------------------
+
+OBJECT_KINDS = ("function", "procedure", "sequence", "trigger", "role")
+
+
+def object_info(user_id: int, conn_id: int, database: str, schema: str, kind: str,
+                ident: str, table: str = "") -> dict:
+    """
+    What an object tab shows (``engines.base.info``), plus ``qualified`` and,
+    for routines, ``call_sql``: a starting statement that calls it.
+    """
+    if kind not in OBJECT_KINDS:
+        raise OpError(f"Unknown object kind {kind!r}")
+    with connect(user_id, conn_id, database if kind != "role" else None) as (
+            conn, spec, _profile, _engine):
+        target = spec.schema_for(database, schema)
+        if kind == "role":
+            if not spec.has_roles:
+                raise OpError(f"{spec.label} has no users or roles to list")
+            found = spec.role_info(conn, ident)
+        elif kind in ("function", "procedure"):
+            found = spec.routine_info(conn, target, ident)
+        elif kind == "sequence":
+            found = spec.sequence_info(conn, target, ident)
+        else:
+            found = spec.trigger_info(conn, target, ident, table)
+        if found is None:
+            raise OpError(f"No {kind} named {ident!r} any more; refresh the navigator")
+        prep = conn.dialect.identifier_preparer
+        qualified = found["name"] if kind == "role" else prep.quote(found["name"])
+        # PostgreSQL trigger names belong to their table, not the schema.
+        if target and kind != "role" and not (kind == "trigger" and spec.name == "postgresql"):
+            qualified = f"{prep.quote_schema(target)}.{qualified}"
+        found["qualified"] = qualified
+        if kind in ("function", "procedure"):
+            found["call_sql"] = call_sql(spec.name, kind, qualified, found)
+    return found
+
+
+def call_sql(engine: str, kind: str, qualified: str, found: dict) -> str:
+    """A statement that calls a routine, NULL for every argument, types in comments."""
+    params = list(found.get("params") or [])
+    if kind == "function":
+        params = [p for p in params if p["mode"] not in ("OUT", "TABLE", "OUTPUT")]
+    declares, after = [], []
+    values = []
+    for p in params:
+        label = f"{p['name']} {p['type']}".strip()
+        if engine == "mysql" and p["mode"] in ("OUT", "INOUT"):
+            var = "@" + (p["name"] or f"out{len(after) + 1}")
+            values.append((var, f"{p['mode']} {label}"))
+            after.append(var)
+        elif engine == "mssql" and kind == "procedure":
+            name = p["name"] or f"@p{len(values) + 1}"
+            if p["mode"] == "OUTPUT":
+                var = f"@out_{name.lstrip('@')}"
+                declares.append(f"DECLARE {var} {p['type']};")
+                values.append((f"{name} = {var} OUTPUT", label))
+                after.append(var)
+            else:
+                values.append((f"{name} = NULL", label))
+        else:
+            values.append(("NULL", (p["mode"] + " " if p["mode"] not in ("IN",) else "") + label))
+    # Block comments, so a statement's closing ";" never ends up inside one.
+    lines = [f"  {value} /* {note} */{',' if i < len(values) - 1 else ''}"
+             for i, (value, note) in enumerate(values)]
+    if engine == "mssql" and kind == "procedure":
+        body = f"EXEC {qualified}" + ("\n" + "\n".join(lines) if lines else "") + ";"
+    else:
+        args = "(\n" + "\n".join(lines) + "\n)" if lines else "()"
+        if kind == "procedure":
+            body = f"CALL {qualified}{args};"
+        elif found.get("sets"):
+            body = f"SELECT * FROM {qualified}{args};"
+        else:
+            body = f"SELECT {qualified}{args};"
+    out = "\n".join(declares + [body])
+    if after:
+        out += "\nSELECT " + ", ".join(after) + ";"
+    return out + "\n"
+
+
+def roles(user_id: int, conn_id: int, show_system: bool = False) -> list:
+    with connect(user_id, conn_id) as (conn, spec, _profile, _engine):
+        if not spec.has_roles:
+            return []
+        return spec.list_roles(conn, bool(show_system))
+
+
+def refresh_matview(user_id: int, conn_id: int, database: str, schema: str, name: str,
+                    dry_run: bool = False) -> dict:
+    """
+    ``REFRESH MATERIALIZED VIEW`` (PostgreSQL), ``CONCURRENTLY`` when the
+    view allows it (populated, with a plain unique index), so reads go on
+    while it runs. ``dry_run`` answers the statement without running it.
+    """
+    from sqlalchemy import text
+
+    engine, spec, profile = pool.open(user_id, conn_id, database)
+    if spec.name != "postgresql":
+        raise OpError("Only PostgreSQL has materialized views to refresh")
+    with connect(user_id, conn_id, database) as (conn, spec, _p, _engine):
+        target = spec.schema_for(database, schema) or "public"
+        row = conn.execute(text(
+            "SELECT m.ispopulated, EXISTS (SELECT 1 FROM pg_index i "
+            "  WHERE i.indrelid = c.oid AND i.indisunique AND i.indisvalid "
+            "  AND i.indpred IS NULL AND i.indexprs IS NULL) "
+            "FROM pg_matviews m JOIN pg_namespace n ON n.nspname = m.schemaname "
+            "JOIN pg_class c ON c.relname = m.matviewname AND c.relnamespace = n.oid "
+            "WHERE m.schemaname = :schema AND m.matviewname = :name"),
+            {"schema": target, "name": name}).first()
+        prep = conn.dialect.identifier_preparer
+    if row is None:
+        raise OpError(f"No materialized view named {name!r}")
+    populated, unique = bool(row[0]), bool(row[1])
+    concurrent = populated and unique
+    qualified = f"{prep.quote_schema(target)}.{prep.quote(name)}"
+    sql = f"REFRESH MATERIALIZED VIEW {'CONCURRENTLY ' if concurrent else ''}{qualified};"
+    if concurrent:
+        note = "CONCURRENTLY: queries can read the old rows while it runs."
+    elif not populated:
+        note = "The view has never been filled, so it cannot be refreshed CONCURRENTLY."
+    else:
+        note = ("Reads of the view wait until it finishes: CONCURRENTLY needs a unique index "
+                "on plain columns.")
+    if dry_run:
+        return {"ok": True, "sql": sql, "concurrent": concurrent, "note": note}
+    if profile.get("read_only"):
+        raise OpError("This connection is read-only")
+    started = time.monotonic()
+    try:
+        with engine.connect() as conn:
+            dbapi = conn.connection.dbapi_connection
+            spec.set_timeout(dbapi, profile.get("timeout_s") or 300)
+            with conn.begin():
+                conn.execute(text(sql))
+            spec.set_timeout(dbapi, 0)
+    except Exception as exc:
+        raise OpError(error_text(exc)) from None
+    return {"ok": True, "sql": sql, "ms": int((time.monotonic() - started) * 1000)}
 
 
 # ---------------------------------------------------------------------------

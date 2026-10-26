@@ -32,8 +32,13 @@ test.
   Image views; cut values fetched whole by primary key; edits are pending
   grid edits; load from / save to a file. Follow-ups: editing a cut value in
   a result set (needs the row's key), a wapyt DataTable "focus on click".
-- **More objects in the navigator**: functions / procedures, sequences,
-  triggers, materialized views refresh, users/roles (read-only listing first).
+- ~~**More objects in the navigator**~~ — done (2026-10-26): functions and
+  procedures (overloads apart, Call… writes a call), sequences, triggers, a
+  read-only Users & roles group per server, PostgreSQL materialized view
+  refresh (concurrently when allowed). Follow-ups: triggers listed in a
+  table's own tab; SQL Server database users and MySQL/MariaDB events;
+  MariaDB sequences; role privileges (grants on objects); hiding
+  extension-owned PostgreSQL functions.
 - **Object actions**: create/rename/drop table (with the generated DDL shown
   first), truncate, create/drop index, add column — DBeaver's table designer
   in a modest form.

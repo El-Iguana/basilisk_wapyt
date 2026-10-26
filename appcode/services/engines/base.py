@@ -183,6 +183,47 @@ class Engine:
         return None
 
     # ------------------------------------------------------------------
+    # More navigator objects (sqlops.objects / object_info / roles)
+    # ------------------------------------------------------------------
+    # The extra groups a schema shows, in tree order: any of "functions",
+    # "procedures", "sequences", "triggers".
+    object_groups: tuple = ()
+    # A server-level "Users & roles" group (read-only listing).
+    has_roles = False
+    roles_label = "Users & roles"
+
+    def list_routines(self, conn: Any, schema: Optional[str]) -> list:
+        """``[{"id", "name", "kind": "function"|"procedure", "args", "returns"}]``."""
+        return []
+
+    def list_sequences(self, conn: Any, schema: Optional[str]) -> list:
+        """``[{"name"}]``."""
+        return []
+
+    def list_triggers(self, conn: Any, schema: Optional[str]) -> list:
+        """``[{"name", "table", "timing", "events"}]``."""
+        return []
+
+    def routine_info(self, conn: Any, schema: Optional[str], ident: str) -> Optional[dict]:
+        """See :func:`info`; ``params`` (name, type, mode) and ``returns`` too."""
+        return None
+
+    def sequence_info(self, conn: Any, schema: Optional[str], name: str) -> Optional[dict]:
+        return None
+
+    def trigger_info(self, conn: Any, schema: Optional[str], name: str,
+                     table: str) -> Optional[dict]:
+        return None
+
+    def list_roles(self, conn: Any, show_system: bool) -> list:
+        """``[{"id", "name", "login", "admin"}]``."""
+        return []
+
+    def role_info(self, conn: Any, ident: str) -> Optional[dict]:
+        return None
+
+
+    # ------------------------------------------------------------------
     # Scripts
     # ------------------------------------------------------------------
 
@@ -216,3 +257,34 @@ def _only_comments(text: str) -> bool:
 def strip_trailing_semicolon(text: str) -> str:
     """Drivers differ on a final ``;``; SQLite and PostgreSQL accept it, others may not."""
     return text.rstrip().rstrip(";").rstrip() if text.rstrip().endswith(";") else text
+
+
+def info(name: str, kind: str, properties: list, definition: str = "", native: bool = True,
+         **extra) -> dict:
+    """
+    What an object tab shows: ``properties`` as ``[label, value]`` pairs
+    (``None`` values are left out), the ``definition`` (source or DDL;
+    ``native`` when the server wrote it), and optional ``lists``
+    (``[{"title", "items"}]``), ``note``, ``params``, ``returns``, ``table``.
+    """
+    rows = [[label, _shown(value)] for label, value in properties if value not in (None, "")]
+    return {"name": name, "kind": kind, "properties": rows, "definition": definition or "",
+            "native": native, **extra}
+
+
+def _shown(value: Any) -> str:
+    import datetime as dt
+
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    if isinstance(value, dt.datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return str(value)
+
+
+def kind_words(type_desc: str) -> str:
+    """``SQL_STORED_PROCEDURE`` -> ``SQL stored procedure``."""
+    words = (type_desc or "").replace("_", " ").lower()
+    return "SQL" + words[3:] if words.startswith("sql") else words.capitalize()

@@ -9,11 +9,12 @@ root*, and :func:`resolve_file` checks it on save **and** on every open.
 from __future__ import annotations
 
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Optional
 
-from services.engines.base import Engine, EngineError, Field
+from services.engines.base import Engine, EngineError, Field, info
 
 SUFFIXES = (".db", ".sqlite", ".sqlite3", ".db3")
 
@@ -139,3 +140,48 @@ class SQLite(Engine):
             {"name": name}).all()
         return ";\n\n".join(row[0] for row in rows) + ";" if rows else None
 
+
+    # ------------------------------------------------------------------
+    # More navigator objects: SQLite has triggers, and nothing else here.
+    # ------------------------------------------------------------------
+    object_groups = ("triggers",)
+
+    def list_triggers(self, conn: Any, schema: Optional[str]) -> list:
+        from sqlalchemy import text
+
+        rows = conn.execute(text(
+            "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger' "
+            "ORDER BY tbl_name, name")).all()
+        return [{"name": name, "table": table, **_trigger_head(sql)} for name, table, sql in rows]
+
+    def trigger_info(self, conn: Any, schema: Optional[str], name: str,
+                     table: str) -> Optional[dict]:
+        from sqlalchemy import text
+
+        row = conn.execute(text(
+            "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = :name"),
+            {"name": name}).first()
+        if row is None:
+            return None
+        table, sql = row
+        head = _trigger_head(sql)
+        return info(name, "trigger", [
+            ("Table", table), ("Timing", head["timing"]), ("Events", head["events"]),
+            ("For each", "ROW"),
+        ], (sql or "").rstrip().rstrip(";") + ";", table=table)
+
+
+_TRIGGER_HEAD = re.compile(
+    r"CREATE\s+(?:TEMP(?:ORARY)?\s+)?TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?.+?\s+"
+    r"(BEFORE|AFTER|INSTEAD\s+OF)?\s*(DELETE|INSERT|UPDATE(?:\s+OF\s+.+?)?)\s+ON\s",
+    re.I | re.S)
+
+
+def _trigger_head(sql: Optional[str]) -> dict:
+    """Timing and event from a trigger's CREATE text (SQLite keeps no columns for them)."""
+    match = _TRIGGER_HEAD.match((sql or "").strip())
+    if not match:
+        return {"timing": "", "events": ""}
+    timing = re.sub(r"\s+", " ", (match.group(1) or "BEFORE").upper())
+    event = re.sub(r"\s+", " ", match.group(2))
+    return {"timing": timing, "events": event if " OF " in event.upper() else event.upper()}

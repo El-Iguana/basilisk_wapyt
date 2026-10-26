@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
-from services.engines.base import Engine, EngineError, Field, Piece, _only_comments
+from services.engines.base import Engine, EngineError, Field, Piece, _only_comments, info, kind_words
 
 ENCRYPTION = (
     ("request", "request (TLS when offered)"),
@@ -159,3 +159,248 @@ class SQLServer(Engine):
                 pieces.append(Piece(cursor + lead, cursor + lead + len(body), body))
             cursor = end
         return pieces
+
+    # ------------------------------------------------------------------
+    # More navigator objects
+    # ------------------------------------------------------------------
+    object_groups = ("functions", "procedures", "sequences", "triggers")
+    has_roles = True
+    roles_label = "Logins & roles"
+    _ROUTINE_TYPES = {"P": "procedure", "PC": "procedure", "FN": "function", "IF": "function",
+                      "TF": "function", "FS": "function", "FT": "function"}
+
+    def _params(self, conn: Any, schema: Optional[str], object_id: Optional[int] = None) -> dict:
+        from sqlalchemy import text
+
+        sql = ("SELECT p.object_id, p.parameter_id, p.name, TYPE_NAME(p.user_type_id), "
+               "p.max_length, p.precision, p.scale, p.is_output FROM sys.parameters p "
+               "JOIN sys.objects o ON o.object_id = p.object_id "
+               "JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = :schema")
+        binds: dict = {"schema": schema or "dbo"}
+        if object_id is not None:
+            sql += " AND p.object_id = :oid"
+            binds["oid"] = object_id
+        found: dict = {}
+        for oid, pos, name, type_name, length, precision, scale, output in conn.execute(
+                text(sql + " ORDER BY p.object_id, p.parameter_id"), binds).all():
+            entry = found.setdefault(oid, {"params": [], "returns": ""})
+            shown = _type_text(type_name, length, precision, scale)
+            if pos == 0:
+                entry["returns"] = shown
+            else:
+                entry["params"].append({"name": name or "", "type": shown,
+                                        "mode": "OUTPUT" if output else "IN"})
+        return found
+
+    def list_routines(self, conn: Any, schema: Optional[str]) -> list:
+        from sqlalchemy import text
+
+        rows = conn.execute(text(
+            "SELECT o.object_id, o.name, RTRIM(o.type) FROM sys.objects o "
+            "JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = :schema "
+            "AND o.type IN ('P', 'PC', 'FN', 'IF', 'TF', 'FS', 'FT') AND o.is_ms_shipped = 0 "
+            "ORDER BY o.name"), {"schema": schema or "dbo"}).all()
+        params = self._params(conn, schema)
+        out = []
+        for oid, name, kind in rows:
+            entry = params.get(oid, {"params": [], "returns": ""})
+            out.append({"id": str(oid), "name": name, "kind": self._ROUTINE_TYPES[kind],
+                        "args": ", ".join(_param_text(p) for p in entry["params"]),
+                        "returns": "TABLE" if kind in ("IF", "TF", "FT") else entry["returns"]})
+        return out
+
+    def routine_info(self, conn: Any, schema: Optional[str], ident: str) -> Optional[dict]:
+        from sqlalchemy import text
+
+        try:
+            oid = int(ident)
+        except (TypeError, ValueError):
+            return None
+        row = conn.execute(text(
+            "SELECT o.name, RTRIM(o.type), o.type_desc, o.create_date, o.modify_date, "
+            "OBJECT_DEFINITION(o.object_id), m.is_schema_bound, "
+            "USER_NAME(m.execute_as_principal_id), m.execute_as_principal_id "
+            "FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id "
+            "LEFT JOIN sys.sql_modules m ON m.object_id = o.object_id "
+            "WHERE o.object_id = :oid AND s.name = :schema"),
+            {"oid": oid, "schema": schema or "dbo"}).first()
+        if row is None or row[1] not in self._ROUTINE_TYPES:
+            return None
+        name, code, type_desc, created, modified, source, bound, run_as, run_as_id = row
+        entry = self._params(conn, schema, oid).get(oid, {"params": [], "returns": ""})
+        kind = self._ROUTINE_TYPES[code]
+        sets = code in ("IF", "TF", "FT")
+        returns = "TABLE" if sets else entry["returns"]
+        note = "" if source else (
+            "The source is hidden: the routine is encrypted, CLR, or you lack VIEW DEFINITION.")
+        return info(name, kind, [
+            ("Kind", kind_words(type_desc)),
+            ("Arguments", ", ".join(_param_text(p) for p in entry["params"]) or "(none)"),
+            ("Returns", returns if kind == "function" else None),
+            ("Schema bound", bool(bound) if bound is not None else None),
+            ("Runs as", "OWNER" if run_as_id == -2 else (run_as or "CALLER")),
+            ("Created", created), ("Modified", modified), ("Object id", oid),
+        ], (source or "").strip(), note=note, returns=returns, sets=sets, params=entry["params"])
+
+    def list_sequences(self, conn: Any, schema: Optional[str]) -> list:
+        from sqlalchemy import text
+
+        rows = conn.execute(text(
+            "SELECT q.name FROM sys.sequences q JOIN sys.schemas s ON s.schema_id = q.schema_id "
+            "WHERE s.name = :schema ORDER BY q.name"), {"schema": schema or "dbo"}).all()
+        return [{"name": row[0]} for row in rows]
+
+    def sequence_info(self, conn: Any, schema: Optional[str], name: str) -> Optional[dict]:
+        from sqlalchemy import text
+
+        target = schema or "dbo"
+        # The values are sql_variant, which the driver cannot read: cast them.
+        row = conn.execute(text(
+            "SELECT TYPE_NAME(q.user_type_id), q.precision, q.scale, "
+            "CAST(q.start_value AS NVARCHAR(50)), CAST(q.increment AS NVARCHAR(50)), "
+            "CAST(q.minimum_value AS NVARCHAR(50)), CAST(q.maximum_value AS NVARCHAR(50)), "
+            "q.is_cycling, q.is_cached, q.cache_size, CAST(q.current_value AS NVARCHAR(50)), "
+            "q.is_exhausted, q.create_date FROM sys.sequences q "
+            "JOIN sys.schemas s ON s.schema_id = q.schema_id "
+            "WHERE s.name = :schema AND q.name = :name"), {"schema": target, "name": name}).first()
+        if row is None:
+            return None
+        (type_name, precision, scale, start, step, low, high, cycle, cached, cache, current,
+         exhausted, created) = row
+        shown_type = _type_text(type_name, 0, precision, scale)
+        prep = conn.dialect.identifier_preparer
+        cache_text = (f"CACHE {cache}" if cache else "CACHE") if cached else "NO CACHE"
+        ddl = (f"CREATE SEQUENCE {prep.quote_schema(target)}.{prep.quote(name)}\n"
+               f"    AS {shown_type}\n    START WITH {start}\n    INCREMENT BY {step}\n"
+               f"    MINVALUE {low}\n    MAXVALUE {high}\n"
+               f"    {'CYCLE' if cycle else 'NO CYCLE'}\n    {cache_text};")
+        return info(name, "sequence", [
+            ("Type", shown_type), ("Current value", current), ("Start", start),
+            ("Increment", step), ("Minimum", low), ("Maximum", high), ("Cycles", bool(cycle)),
+            ("Cache", (cache or "default") if cached else "no cache"),
+            ("Exhausted", bool(exhausted)), ("Created", created),
+        ], ddl, native=False)
+
+    def _trigger_events(self, conn: Any, ids: list) -> dict:
+        from sqlalchemy import bindparam, text
+
+        if not ids:
+            return {}
+        events: dict = {}
+        for oid, event in conn.execute(text(
+                "SELECT object_id, type_desc FROM sys.trigger_events WHERE object_id IN :ids "
+                "ORDER BY object_id, type").bindparams(bindparam("ids", expanding=True)),
+                {"ids": ids}).all():
+            events.setdefault(oid, []).append(event)
+        return {oid: " OR ".join(found) for oid, found in events.items()}
+
+    def list_triggers(self, conn: Any, schema: Optional[str]) -> list:
+        from sqlalchemy import text
+
+        rows = conn.execute(text(
+            "SELECT t.object_id, t.name, tbl.name, t.is_instead_of_trigger FROM sys.triggers t "
+            "JOIN sys.objects tbl ON tbl.object_id = t.parent_id "
+            "JOIN sys.schemas s ON s.schema_id = tbl.schema_id "
+            "WHERE t.parent_class = 1 AND s.name = :schema ORDER BY tbl.name, t.name"),
+            {"schema": schema or "dbo"}).all()
+        events = self._trigger_events(conn, [row[0] for row in rows])
+        return [{"name": name, "table": table, "timing": "INSTEAD OF" if instead else "AFTER",
+                 "events": events.get(oid, "")} for oid, name, table, instead in rows]
+
+    def trigger_info(self, conn: Any, schema: Optional[str], name: str,
+                     table: str) -> Optional[dict]:
+        from sqlalchemy import text
+
+        row = conn.execute(text(
+            "SELECT t.object_id, tbl.name, t.is_instead_of_trigger, t.is_disabled, "
+            "OBJECT_DEFINITION(t.object_id), t.create_date, t.modify_date FROM sys.triggers t "
+            "JOIN sys.objects tbl ON tbl.object_id = t.parent_id "
+            "JOIN sys.schemas s ON s.schema_id = tbl.schema_id "
+            "WHERE t.parent_class = 1 AND s.name = :schema AND t.name = :name"),
+            {"schema": schema or "dbo", "name": name}).first()
+        if row is None:
+            return None
+        oid, table, instead, disabled, source, created, modified = row
+        return info(name, "trigger", [
+            ("Table", table), ("Timing", "INSTEAD OF" if instead else "AFTER"),
+            ("Events", self._trigger_events(conn, [oid]).get(oid, "")),
+            ("For each", "STATEMENT"), ("Enabled", not disabled),
+            ("Created", created), ("Modified", modified),
+        ], (source or "").strip(), table=table,
+            note="" if source else "The source is hidden (encrypted, or no VIEW DEFINITION).")
+
+    def list_roles(self, conn: Any, show_system: bool) -> list:
+        from sqlalchemy import text
+
+        rows = conn.execute(text(
+            "SELECT name, type, is_disabled, is_fixed_role, "
+            "IS_SRVROLEMEMBER('sysadmin', name) FROM sys.server_principals "
+            "WHERE type IN ('S', 'U', 'G', 'R', 'E', 'X') AND name NOT LIKE '##%' "
+            "ORDER BY name")).all()
+        return [{"id": name, "name": name, "login": kind != "R" and not disabled,
+                 "admin": admin == 1, "role": kind == "R"}
+                for name, kind, disabled, fixed, admin in rows
+                if show_system or not (fixed or name.upper().startswith("NT "))]
+
+    def role_info(self, conn: Any, ident: str) -> Optional[dict]:
+        from sqlalchemy import text
+
+        row = conn.execute(text(
+            "SELECT p.principal_id, p.type, p.type_desc, p.is_disabled, p.create_date, "
+            "p.modify_date, p.default_database_name, p.default_language_name, "
+            "l.is_policy_checked, l.is_expiration_checked, p.is_fixed_role "
+            "FROM sys.server_principals p LEFT JOIN sys.sql_logins l "
+            "ON l.principal_id = p.principal_id WHERE p.name = :name"), {"name": ident}).first()
+        if row is None:
+            return None
+        (pid, kind, type_desc, disabled, created, modified, database, language, policy,
+         expiry, fixed) = row
+        member_of = [r[0] for r in conn.execute(text(
+            "SELECT r.name FROM sys.server_role_members m JOIN sys.server_principals r "
+            "ON r.principal_id = m.role_principal_id WHERE m.member_principal_id = :id "
+            "ORDER BY 1"), {"id": pid}).all()]
+        members = [r[0] for r in conn.execute(text(
+            "SELECT r.name FROM sys.server_role_members m JOIN sys.server_principals r "
+            "ON r.principal_id = m.member_principal_id WHERE m.role_principal_id = :id "
+            "ORDER BY 1"), {"id": pid}).all()]
+        prep = conn.dialect.identifier_preparer
+        quoted = prep.quote_identifier(ident)
+        if kind == "R":
+            ddl = "-- A fixed server role" if fixed else f"CREATE SERVER ROLE {quoted};"
+        elif kind == "S":
+            ddl = (f"CREATE LOGIN {quoted} WITH PASSWORD = N'…' /* not shown */\n"
+                   f"    , DEFAULT_DATABASE = {prep.quote_identifier(database or 'master')}\n"
+                   f"    , CHECK_POLICY = {'ON' if policy else 'OFF'}\n"
+                   f"    , CHECK_EXPIRATION = {'ON' if expiry else 'OFF'};")
+        else:
+            ddl = f"CREATE LOGIN {quoted} FROM {'EXTERNAL PROVIDER' if kind in 'EX' else 'WINDOWS'};"
+        if disabled and kind != "R":
+            ddl += f"\n\nALTER LOGIN {quoted} DISABLE;"
+        for role in member_of:
+            ddl += f"\n\nALTER SERVER ROLE {prep.quote_identifier(role)} ADD MEMBER {quoted};"
+        return info(ident, "role", [
+            ("Kind", kind_words(type_desc)),
+            ("Can log in", None if kind == "R" else not disabled),
+            ("Default database", database), ("Default language", language),
+            ("Password policy", None if policy is None else bool(policy)),
+            ("Password expiry", None if expiry is None else bool(expiry)),
+            ("Created", created), ("Modified", modified),
+        ], ddl, native=False, lists=[{"title": "Member of", "items": member_of},
+                                     {"title": "Members", "items": members}])
+
+
+def _type_text(type_name: str, length: int, precision: int, scale: int) -> str:
+    name = (type_name or "").lower()
+    if name in ("varchar", "char", "varbinary", "binary", "nvarchar", "nchar"):
+        if length == -1:
+            return f"{name}(max)"
+        if length:
+            return f"{name}({length // 2 if name.startswith('n') else length})"
+    if name in ("decimal", "numeric"):
+        return f"{name}({precision}, {scale})"
+    return name
+
+
+def _param_text(param: dict) -> str:
+    out = " OUTPUT" if param["mode"] == "OUTPUT" else ""
+    return f"{param['name']} {param['type']}{out}".strip()

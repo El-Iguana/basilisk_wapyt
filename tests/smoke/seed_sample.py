@@ -2,7 +2,10 @@
 """
 Create the ``shop`` sample in every test database (CLAUDE.md, *Test
 databases*): customers, products, orders, order_items with foreign keys, a
-view, a table without a primary key, and one column of most types.
+view, a table without a primary key, and one column of most types; plus the
+navigator's other objects where the engine has them: functions (one
+overloaded, one returning a table), a procedure with an output argument, a
+sequence, a trigger and (PostgreSQL) a materialized view.
 
     uv run python tests/smoke/seed_sample.py            # all four
     uv run python tests/smoke/seed_sample.py postgresql # one
@@ -153,11 +156,81 @@ def load(engine, schema: str | None) -> None:
         conn.execute(text(VIEW.format(q=q)))
 
 
+# Routines, a sequence, a trigger and a materialized view, per dialect. The
+# trigger only refuses an empty status, so the tests' updates pass through.
+EXTRAS = {
+    "postgresql": [
+        "CREATE FUNCTION {q}order_total(p_order integer) RETURNS numeric LANGUAGE sql STABLE AS "
+        "$$ SELECT COALESCE(SUM(i.qty * pr.price), 0) FROM {q}order_items i "
+        "JOIN {q}products pr ON pr.sku = i.sku WHERE i.order_id = p_order $$",
+        "COMMENT ON FUNCTION {q}order_total(integer) IS 'Sum of an order''s lines'",
+        "CREATE FUNCTION {q}order_total(p_order integer, p_tax numeric) RETURNS numeric "
+        "LANGUAGE sql STABLE AS $$ SELECT {q}order_total(p_order) * (1 + p_tax) $$",
+        "CREATE FUNCTION {q}customer_orders(p_customer integer) "
+        "RETURNS TABLE(order_id integer, placed_at timestamp, status varchar) "
+        "LANGUAGE sql STABLE AS $$ SELECT id, placed_at, status FROM {q}orders "
+        "WHERE customer_id = p_customer ORDER BY id $$",
+        "CREATE FUNCTION {q}check_order_status() RETURNS trigger LANGUAGE plpgsql AS "
+        "$$ BEGIN IF NEW.status = '' THEN RAISE EXCEPTION 'status cannot be empty'; END IF; "
+        "RETURN NEW; END $$",
+        "CREATE TRIGGER orders_status_check BEFORE INSERT OR UPDATE OF status ON {q}orders "
+        "FOR EACH ROW EXECUTE FUNCTION {q}check_order_status()",
+        "CREATE PROCEDURE {q}archive_order(p_order integer, INOUT p_moved integer DEFAULT NULL) "
+        "LANGUAGE plpgsql AS $$ BEGIN INSERT INTO {q}audit_log (at, message) "
+        "VALUES (now(), 'archived order ' || p_order); p_moved := 1; END $$",
+        "CREATE SEQUENCE {q}invoice_no START WITH 1000",
+        "CREATE MATERIALIZED VIEW {q}product_sales AS SELECT pr.sku, pr.title, "
+        "COALESCE(SUM(i.qty), 0) AS sold FROM {q}products pr "
+        "LEFT JOIN {q}order_items i ON i.sku = pr.sku GROUP BY pr.sku, pr.title",
+        "CREATE UNIQUE INDEX product_sales_sku ON {q}product_sales (sku)",
+    ],
+    "mysql": [
+        "CREATE FUNCTION order_total(p_order INT) RETURNS DECIMAL(12,2) READS SQL DATA "
+        "DETERMINISTIC COMMENT 'Sum of an order''s lines' "
+        "RETURN (SELECT COALESCE(SUM(i.qty * pr.price), 0) FROM order_items i "
+        "JOIN products pr ON pr.sku = i.sku WHERE i.order_id = p_order)",
+        "CREATE PROCEDURE archive_order(IN p_order INT, OUT p_moved INT) BEGIN "
+        "INSERT INTO audit_log (at, message) VALUES (NOW(), CONCAT('archived order ', p_order)); "
+        "SET p_moved = 1; END",
+        "CREATE TRIGGER orders_status_check BEFORE UPDATE ON orders FOR EACH ROW BEGIN "
+        "IF NEW.status = '' THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'status cannot be empty'; "
+        "END IF; END",
+    ],
+    "mssql": [
+        "CREATE FUNCTION {q}order_total(@order int) RETURNS decimal(12, 2) AS BEGIN "
+        "RETURN (SELECT COALESCE(SUM(i.qty * pr.price), 0) FROM {q}order_items i "
+        "JOIN {q}products pr ON pr.sku = i.sku WHERE i.order_id = @order) END",
+        "CREATE FUNCTION {q}customer_orders(@customer int) RETURNS TABLE AS RETURN "
+        "(SELECT id AS order_id, placed_at, status FROM {q}orders WHERE customer_id = @customer)",
+        "CREATE PROCEDURE {q}archive_order @order int, @moved int OUTPUT AS BEGIN "
+        "SET NOCOUNT ON; INSERT INTO {q}audit_log (at, message) "
+        "VALUES (SYSDATETIME(), CONCAT('archived order ', @order)); SET @moved = 1; END",
+        "CREATE SEQUENCE {q}invoice_no AS bigint START WITH 1000",
+        "CREATE TRIGGER {q}orders_status_check ON {q}orders AFTER INSERT, UPDATE AS BEGIN "
+        "SET NOCOUNT ON; IF EXISTS (SELECT 1 FROM inserted WHERE status = '') "
+        "THROW 50000, 'status cannot be empty', 1; END",
+    ],
+    "sqlite": [
+        "CREATE TRIGGER orders_status_check BEFORE UPDATE OF status ON orders "
+        "WHEN NEW.status = '' BEGIN SELECT RAISE(ABORT, 'status cannot be empty'); END",
+    ],
+}
+
+
+def extras(engine, schema: str | None) -> None:
+    q = f"{schema}." if schema else ""
+    with engine.begin() as conn:
+        for sql in EXTRAS[engine.dialect.name]:
+            conn.execute(text(sql.format(q=q)))
+
+
 def seed(which: str) -> None:
     if which == "sqlite":
         path = sqlite_path()
         path.unlink(missing_ok=True)
-        load(create_engine(URL.create("sqlite", database=str(path))), None)
+        engine = create_engine(URL.create("sqlite", database=str(path)))
+        load(engine, None)
+        extras(engine, None)
         print(f"sqlite: {path}")
         return
     admin = create_engine(SERVERS[which], isolation_level="AUTOCOMMIT")
@@ -177,10 +250,12 @@ def seed(which: str) -> None:
     url = SERVERS[which].set(database="shop")
     engine = create_engine(url)
     load(engine, None)
+    extras(engine, None)
     if which in ("postgresql", "mssql"):
         with engine.begin() as conn:
             conn.execute(text("CREATE SCHEMA sales"))
         load(engine, "sales")
+        extras(engine, "sales")
     engine.dispose()
     print(f"{which}: shop")
 
