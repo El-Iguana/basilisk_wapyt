@@ -61,15 +61,47 @@ from wapyt import (
     TreeAction,
     TreeConfig,
     TreeItem,
+    progress_html,
 )
 
 from services.about import LICENSE as ABOUT_LICENSE, RELEASES_URL, REPO, REPO_URL, VERSION, WIKI_URL
 from services.about_service import AboutService
 from services.connection_service import ConnectionService
+from services.job_service import JobService
 from services.sql_service import SqlService
 from services.ui_state_service import UiStateService
 from services.user_service import UserService
 from services.values import MAX_CELL_CHARS
+from ui.grid_tools import (
+    FILTER_OPS,
+    MAX_FROZEN,
+    NO_VALUE_OPS,
+    apply_layout,
+    filter_label,
+    filter_rows,
+    foreign_key_for,
+    frozen_count,
+    insert_sql,
+    kind_for_type,
+    markdown_table,
+    merge_layout,
+    reference_where,
+    table_of_query,
+    where_with_filters,
+)
+from ui.import_tools import (
+    DELIMITERS,
+    ENCODINGS,
+    SAMPLE_BYTES,
+    auto_map,
+    decode_sample,
+    format_bytes,
+    guess_encoding,
+    parse_rows,
+    preview_cells,
+    sniff_delimiter,
+    source_columns,
+)
 from ui.value_panel import ValuePanel, grid_text
 
 # pytincture's MainWindow detection only knows dhxpyt; without this the app
@@ -281,6 +313,7 @@ class Basilisk(MainWindow):
                     TreeAction("sql", "New SQL editor", "mdi-console-line", kinds=location),
                     TreeAction("refresh", "Refresh", "mdi-refresh",
                                kinds=["database", "schema", "group", "roles"]),
+                    TreeAction("sessions", "Sessions…", "mdi-pulse", kinds=server),
                     TreeAction("disconnect", "Disconnect", "mdi-lan-disconnect", kinds=server),
                     TreeAction(separator=True),
                     TreeAction("edit_conn", "Edit connection…", "mdi-pencil", kinds=server),
@@ -317,6 +350,8 @@ class Basilisk(MainWindow):
                     TreeAction("create_index", "Create index…", "mdi-sort-ascending",
                                kinds=["table"]),
                     TreeAction("rename_table", "Rename…", "mdi-rename-box", kinds=["table"]),
+                    TreeAction("import_csv", "Import CSV…", "mdi-file-import-outline",
+                               kinds=["table"]),
                     TreeAction("truncate", "Truncate…", "mdi-table-remove", kinds=["table"],
                                danger=True),
                     TreeAction("drop", "Drop…", "mdi-delete", kinds=objects, danger=True),
@@ -396,6 +431,8 @@ class Basilisk(MainWindow):
             self._table_action(tid, action, button)
         elif tab["kind"] == "object":
             self._object_action(tid, action, button)
+        elif tab["kind"] == "sessions":
+            self._sessions_action(tid, action, button)
         else:
             self._sql_action(tid, action, button)
 
@@ -408,6 +445,15 @@ class Basilisk(MainWindow):
             return
         role = _attr(target, "data-role")
         tab = self._tabs[tid]
+        if tab["kind"] == "sessions":
+            if role == "s_auto":
+                tab["auto"] = bool(target.checked)
+                if tab["auto"]:
+                    _spawn(self._load_sessions(tid), "sessions")
+            elif role == "s_idle":
+                tab["idle"] = bool(target.checked)
+                _spawn(self._load_sessions(tid), "sessions")
+            return
         if tab["kind"] == "sql":
             if role == "database":
                 _spawn(self._sql_switch_db(tid, str(target.value), target), "database")
@@ -918,6 +964,7 @@ class Basilisk(MainWindow):
             "create_index": lambda: self._create_index(self._loc(data), name),
             "rename_table": lambda: self._rename_table(self._loc(data), name),
             "truncate": lambda: self._truncate(self._loc(data), name),
+            "import_csv": lambda: self._import_dialog(self._loc(data), name),
             "drop": lambda: self._drop(self._loc(data), name, data.get("kind") or "table"),
         }
         if action == "sql":
@@ -928,6 +975,8 @@ class Basilisk(MainWindow):
             self._open_table(self._loc(data), name, "table" if kind == "table" else "view", sub)
         elif action == "open_obj":
             self._open_object(data)
+        elif action == "sessions":
+            self._open_sessions(conn_id)
         elif action == "trigger_table":
             self._open_table(self._loc(data), data.get("table") or "", "table")
         elif action == "export_csv":
@@ -1357,11 +1406,16 @@ class Basilisk(MainWindow):
     # Table tabs: Data | Columns | Keys & indexes | DDL
     # ------------------------------------------------------------------
 
-    def _open_table(self, loc: tuple, name: str, kind: str = "table", sub: str = "data") -> str:
+    def _open_table(self, loc: tuple, name: str, kind: str = "table", sub: str = "data",
+                    where: str | None = None) -> str:
+        """Open (or bring forward) a table's tab; ``where`` replaces its filter."""
         for tid, tab in self._tabs.items():
             if tab["kind"] == "table" and tab["loc"] == loc and tab["name"] == name:
                 self.tabs.set_active(tid)
                 self._show_sub(tid, sub)
+                if where is not None:
+                    _el(f"{tid}-where").value = where
+                    self._apply_filter(tid)
                 return tid
         conn = self._conn(loc[0]) or {}
         icon = "mdi-table" if kind == "table" else "mdi-eye-outline"
@@ -1371,12 +1425,14 @@ class Basilisk(MainWindow):
             "tid": tid, "kind": "table", "conn": loc[0], "db": loc[1], "loc": loc, "name": name,
             "object_kind": kind, "engine": conn.get("engine") or "", "info": None,
             "page": 1, "page_size": 100, "total": None, "exact": False,
-            "where": "", "order_by": "", "columns": [], "rows": [], "keys": [],
+            "where": where or "", "order_by": "", "columns": [], "rows": [], "keys": [],
             "truncated": set(), "pending": {}, "new_counter": 0, "tdir": "asc",
             "sub": "data", "grid": None, "pager": None, "busy": False, "menu_col": None,
-            "vp": None, "focus_cell": None,
+            "vp": None, "focus_cell": None, "filters": [], "layout": None, "layout_gen": 0,
         }
         self._tabs[tid] = tab
+        if where:
+            _el(f"{tid}-where").value = where
         tab["pager"] = Pagination(PaginationConfig(page_size=100, page_sizes=PAGE_SIZES,
                                                    label="Rows"),
                                   container=_el(f"{tid}-pager"))
@@ -1413,9 +1469,10 @@ class Basilisk(MainWindow):
         spellcheck="false" autocomplete="off" placeholder="{quote_hint} DESC">
       <button type="button" class="bk-btn bk-primary" data-bk="apply" title="Apply (Enter)">
         <span class="mdi mdi-filter"></span><span>Apply</span></button>
-      <button type="button" class="bk-btn" data-bk="clear" title="Clear the filter and order">
+      <button type="button" class="bk-btn" data-bk="clear" title="Clear the filter, column filters and order">
         <span class="mdi mdi-filter-remove-outline"></span></button>
     </div>
+    <div class="bk-chips" id="{tid}-chips" hidden></div>
     <div class="bk-bar">
       <button type="button" class="bk-btn" data-bk="add" data-write="1" title="Add a row">
         <span class="mdi mdi-table-row-plus-after"></span><span>Add row</span></button>
@@ -1433,17 +1490,28 @@ class Basilisk(MainWindow):
       <span class="bk-bar-sep"></span>
       <button type="button" class="bk-btn" data-bk="refresh" title="Reload this page">
         <span class="mdi mdi-refresh"></span></button>
-      <button type="button" class="bk-btn" data-bk="count" title="Count every matching row">
+      <button type="button" class="bk-btn" data-bk="count" data-compact="1" title="Count every matching row">
         <span class="mdi mdi-counter"></span><span>Count</span></button>
-      <button type="button" class="bk-btn" data-bk="export_csv" title="Export every matching row as CSV">
+      <button type="button" class="bk-btn" data-bk="export_csv" data-compact="1" title="Export every matching row as CSV">
         <span class="mdi mdi-file-delimited-outline"></span><span>CSV</span></button>
-      <button type="button" class="bk-btn" data-bk="export_json" title="Export every matching row as JSON">
+      <button type="button" class="bk-btn" data-bk="export_json" data-compact="1" title="Export every matching row as JSON">
         <span class="mdi mdi-code-json"></span><span>JSON</span></button>
-      <button type="button" class="bk-btn" data-bk="to_sql" title="Open this query in a SQL editor">
+      <button type="button" class="bk-btn" data-bk="to_sql" data-compact="1" title="Open this query in a SQL editor">
         <span class="mdi mdi-console-line"></span><span>SQL</span></button>
-      <button type="button" class="bk-btn" data-bk="value_panel"
+      <button type="button" class="bk-btn" data-bk="value_panel" data-compact="1"
         title="Show the focused cell's whole value (F7; Shift+Enter on a cell)">
         <span class="mdi mdi-dock-right"></span><span>Value</span></button>
+      <span class="bk-bar-sep"></span>
+      <button type="button" class="bk-btn" data-bk="col_filter" data-compact="1" title="Filter by a column">
+        <span class="mdi mdi-filter-plus-outline"></span><span>Filter</span></button>
+      <button type="button" class="bk-btn" data-bk="columns" data-compact="1" title="Show, hide and freeze columns">
+        <span class="mdi mdi-view-column-outline"></span><span>Columns</span></button>
+      <button type="button" class="bk-btn" data-bk="freeze" id="{tid}-freeze" aria-pressed="false"
+        title="Freeze the first column while scrolling sideways">
+        <span class="mdi mdi-pin-outline"></span></button>
+      <button type="button" class="bk-btn" data-bk="import_csv" data-compact="1" data-ddl-bar="1" hidden
+        title="Import rows from a CSV file">
+        <span class="mdi mdi-file-import-outline"></span><span>Import</span></button>
       <span class="bk-spacer"></span>
       <span class="bk-note" id="{tid}-note"></span>
       <div class="bk-pager" id="{tid}-pager"></div>
@@ -1532,6 +1600,11 @@ class Basilisk(MainWindow):
         self._render_properties(tid)
         if tab["sub"] == "ddl":
             await self._render_ddl(tid)
+        saved = await UiStateService().get_async(self._layout_key(tab))
+        if tid not in self._tabs:
+            return
+        if saved.get("ok") and isinstance(saved.get("value"), dict):
+            tab["layout"] = saved["value"]
         await self._browse(tid, with_count=True)
 
     # -- browsing ---------------------------------------------------------
@@ -1549,7 +1622,7 @@ class Basilisk(MainWindow):
         offset = (tab["page"] - 1) * tab["page_size"]
         try:
             result = await SqlService().browse_async(
-                conn_id, db, schema, tab["name"], tab["where"], tab["order_by"], offset,
+                conn_id, db, schema, tab["name"], self._where(tid), tab["order_by"], offset,
                 tab["page_size"], tab["info"].get("pk") or [], with_count)
         finally:
             if tid in self._tabs:
@@ -1588,35 +1661,47 @@ class Basilisk(MainWindow):
 
     def _render_grid(self, tid: str) -> None:
         tab = self._tabs[tid]
-        info = tab["info"] or {}
-        meta = {col["name"]: col for col in info.get("columns") or []}
-        editable = bool(info.get("editable"))
-        columns = []
-        for i, name in enumerate(tab["columns"]):
-            col = meta.get(name) or {}
-            css = []
-            if col.get("pk"):
-                css.append("bk-pkcol")
-            if tab["kinds"][i] == "num":
-                css.append("bk-num")
-            columns.append(ColumnConfig(
-                id=f"c{i}", header=name, width=_column_width(name),
-                align="right" if tab["kinds"][i] == "num" else None,
-                sort_by=_RANK, editable=editable and not col.get("computed"),
-                cell_class_by=_CLS + f"c{i}", css=" ".join(css) or None,
-            ))
+        columns = self._grid_columns(tid)
         rows = [self._grid_row(tid, r, values) for r, values in enumerate(tab["rows"])]
         first = tab["grid"] is None
         if first:
             tab["grid"] = self._make_grid(tid, columns)
         else:
             tab["grid"].set_columns(columns)
+        self._set_frozen(tid, frozen_count((tab.get("layout") or {}).get("frozen")))
         tab["grid"].set_rows(rows)
         tab["focus_cell"] = None
         if tab.get("vp") is not None:
             tab["vp"].reset()
         elif first and (self._settings.get("value_panel") or {}).get("open"):
             self._vp(tid).open()
+
+    def _grid_columns(self, tid: str) -> list:
+        tab = self._tabs[tid]
+        info = tab["info"] or {}
+        meta = {col["name"]: col for col in info.get("columns") or []}
+        fk_columns = {name for fk in info.get("foreign_keys") or [] for name in fk["columns"]}
+        editable = bool(info.get("editable"))
+        index = {name: i for i, name in enumerate(tab["columns"])}
+        columns = []
+        # The saved layout (order, widths, hidden), per table and user.
+        for name, width, hidden in apply_layout(tab["columns"], tab.get("layout")):
+            i = index[name]
+            col = meta.get(name) or {}
+            css = []
+            if col.get("pk"):
+                css.append("bk-pkcol")
+            if name in fk_columns:
+                css.append("bk-fkcol")
+            if tab["kinds"][i] == "num":
+                css.append("bk-num")
+            columns.append(ColumnConfig(
+                id=f"c{i}", header=name, width=width or _column_width(name),
+                align="right" if tab["kinds"][i] == "num" else None,
+                sort_by=_RANK, editable=editable and not col.get("computed"),
+                cell_class_by=_CLS + f"c{i}", css=" ".join(css) or None, hidden=hidden,
+            ))
+        return columns
 
     def _grid_row(self, tid: str, index: int, values: list, row_id: str | None = None,
                   row_cls: str = "") -> dict:
@@ -1643,6 +1728,14 @@ class Basilisk(MainWindow):
             TableAction("filter_eq", "Filter: column = value", "mdi-filter-outline"),
             TableAction("filter_ne", "Filter: column <> value", "mdi-filter-minus-outline"),
         ]
+        actions += [
+            TableAction("filter_col", "Filter column…", "mdi-filter-plus-outline"),
+            TableAction("fk_open", "Open the referenced row", "mdi-link-variant"),
+            TableAction(separator=True),
+            TableAction("copy_insert", "Copy as INSERT", "mdi-database-import-outline"),
+            TableAction("copy_md", "Copy as Markdown", "mdi-language-markdown-outline"),
+            TableAction("hide_col", "Hide this column", "mdi-eye-off-outline"),
+        ]
         if editable:
             actions += [
                 TableAction(separator=True),
@@ -1663,6 +1756,7 @@ class Basilisk(MainWindow):
         grid.on_edit(lambda payload: self._on_cell_edit(tid, payload))
         grid.on_action(lambda payload: _spawn(self._on_grid_action(tid, payload), "grid action"))
         grid.on_sort(lambda payload: self._on_grid_sort(tid, payload))
+        grid.on_columns(lambda payload: self._on_columns(tid, payload))
         self._watch_cells(tid, _el(f"{tid}-grid"))
         return grid
 
@@ -1731,6 +1825,8 @@ class Basilisk(MainWindow):
         elif action == "clear":
             _el(f"{tid}-where").value = ""
             _el(f"{tid}-order").value = ""
+            tab["filters"] = []
+            self._draw_chips(tid)
             self._apply_filter(tid)
         elif action == "refresh":
             _spawn(self._refresh_table(tid), "refresh")
@@ -1747,7 +1843,7 @@ class Basilisk(MainWindow):
         elif action == "revert":
             self._revert(tid)
         elif action in ("export_csv", "export_json"):
-            self._export_table(tab["loc"], tab["name"], tab["where"], tab["order_by"],
+            self._export_table(tab["loc"], tab["name"], self._where(tid), tab["order_by"],
                                "csv" if action == "export_csv" else "json")
         elif action == "to_sql":
             self._table_to_sql(tid)
@@ -1760,6 +1856,10 @@ class Basilisk(MainWindow):
             self._open_sql(tab["conn"], tab["db"], info.get("ddl") or "")
         elif action in ("col_add", "col_rename", "col_drop", "ix_create", "ix_drop"):
             _spawn(self._tab_ddl(tid, action), action)
+        elif action in ("col_filter", "columns", "freeze", "unfilter", "clear_filters"):
+            self._grid_tool(tid, action, button)
+        elif action == "import_csv":
+            _spawn(self._import_dialog(tab["loc"], tab["name"]), "import")
 
     async def _refresh_table(self, tid: str) -> None:
         if await self._discard_ok(tid):
@@ -1768,7 +1868,7 @@ class Basilisk(MainWindow):
     async def _count_rows(self, tid: str) -> None:
         tab = self._tabs[tid]
         conn_id, db, schema = tab["loc"]
-        result = await SqlService().count_async(conn_id, db, schema, tab["name"], tab["where"])
+        result = await SqlService().count_async(conn_id, db, schema, tab["name"], self._where(tid))
         if not result.get("ok"):
             self._toast(result.get("error", "Could not count"), kind="error")
             return
@@ -1780,8 +1880,9 @@ class Basilisk(MainWindow):
         tab = self._tabs[tid]
         info = tab.get("info") or {}
         text = f"SELECT *\nFROM {info.get('qualified') or tab['name']}"
-        if tab["where"]:
-            text += f"\nWHERE {tab['where']}"
+        where = self._where(tid)
+        if where:
+            text += f"\nWHERE {where}"
         if tab["order_by"]:
             text += f"\nORDER BY {tab['order_by']}"
         self._open_sql(tab["conn"], tab["db"], text + ";\n")
@@ -1792,6 +1893,432 @@ class Basilisk(MainWindow):
                            "order_by": order_by, "format": fmt})
         _download(f"/bk/export/{conn_id}?{query}")
         self._toast(f"Exporting {name} as {fmt.upper()}…")
+
+    # -- column layout, column filters, copy as, foreign keys (milestone 2) --
+    # A table's layout (order, widths, hidden, frozen) is saved per table and
+    # user; a query result's columns are not (its shape changes with the SQL),
+    # but its frozen count is a setting. A table's column filters are WHERE
+    # conditions run by the server; a result's filter the fetched rows.
+
+    @staticmethod
+    def _layout_key(tab: dict) -> str:
+        conn_id, db, schema = tab["loc"]
+        return f"columns:{conn_id}:{db}:{schema}:{tab['name']}"
+
+    def _shown_entry(self, tid: str) -> dict | None:
+        tab = self._tabs[tid]
+        shown = tab.get("shown")
+        results = tab.get("results") or []
+        return results[shown] if isinstance(shown, int) and 0 <= shown < len(results) else None
+
+    def _column_names(self, tid: str) -> list:
+        """The shown grid's column names, by column index (ids are "c<i>")."""
+        tab = self._tabs[tid]
+        if tab["kind"] == "table":
+            return tab["columns"]
+        entry = self._shown_entry(tid)
+        return entry["columns"] if entry else []
+
+    def _column_kinds(self, tid: str) -> list:
+        tab = self._tabs[tid]
+        if tab["kind"] == "table":
+            return tab.get("kinds") or []
+        entry = self._shown_entry(tid)
+        return entry["kinds"] if entry else []
+
+    def _engine_of(self, tid: str) -> str:
+        return (self._conn(self._tabs[tid]["conn"]) or {}).get("engine") or ""
+
+    def _on_columns(self, tid: str, payload: dict) -> None:
+        """A column was resized, moved, hidden or shown: remember it (saved after a pause)."""
+        tab = self._tabs.get(tid)
+        if tab is None:
+            return
+        names = tab["columns"]
+        state = []
+        for col in payload.get("columns") or []:
+            cid = str(col.get("id") or "")
+            try:
+                name = names[int(cid[1:])]
+            except (ValueError, IndexError):
+                continue
+            state.append({"id": name, "width": col.get("width"), "hidden": bool(col.get("hidden"))})
+        tab["layout"] = merge_layout(tab.get("layout"), state)
+        self._save_layout(tid)
+
+    def _save_layout(self, tid: str) -> None:
+        tab = self._tabs[tid]
+        tab["layout_gen"] += 1
+        _spawn(self._save_layout_later(tid, tab["layout_gen"]), "save column layout")
+
+    async def _save_layout_later(self, tid: str, generation: int) -> None:
+        # One save per burst of changes, not one per dragged pixel.
+        await asyncio.sleep(0.4)
+        tab = self._tabs.get(tid)
+        if tab is None or tab["layout_gen"] != generation:
+            return
+        result = await UiStateService().set_async(self._layout_key(tab), tab["layout"] or {})
+        if not result.get("ok"):
+            js.console.warn(f"[basilisk] column layout not saved: {result.get('error')}")
+
+    async def _reset_layout(self, tid: str) -> None:
+        tab = self._tabs[tid]
+        tab["layout"] = None
+        tab["layout_gen"] += 1
+        result = await UiStateService().clear_async(self._layout_key(tab))
+        if not result.get("ok"):
+            self._toast(result.get("error", "Could not reset the columns"), kind="error")
+            return
+        if tab["grid"] is not None:
+            tab["grid"].set_columns(self._grid_columns(tid))
+            self._set_frozen(tid, 0)
+        self._toast("Columns are back to the table's own order and widths.")
+
+    def _set_frozen(self, tid: str, count: int) -> None:
+        tab = self._tabs[tid]
+        if tab["grid"] is None:
+            return
+        tab["grid"].set_frozen_columns(count)
+        tab["frozen"] = count
+        button = _el(f"{tid}-freeze")
+        if button:
+            button.setAttribute("aria-pressed", "true" if count else "false")
+
+    def _change_frozen(self, tid: str, count: int) -> None:
+        tab = self._tabs[tid]
+        count = frozen_count(count)
+        self._set_frozen(tid, count)
+        if tab["kind"] == "table":
+            layout = dict(tab.get("layout") or {})
+            if count:
+                layout["frozen"] = count
+            else:
+                layout.pop("frozen", None)
+            tab["layout"] = layout
+            self._save_layout(tid)
+        else:
+            self._settings["freeze_results"] = count
+            _spawn(UiStateService().set_async("settings", self._settings), "settings")
+
+    def _visible_columns(self, tid: str) -> list:
+        grid = self._tabs[tid]["grid"]
+        return [col for col in grid.get_column_state() if not col.get("hidden")]
+
+    def _hide_column(self, tid: str, column: str) -> None:
+        tab = self._tabs[tid]
+        if tab["grid"] is None:
+            return
+        if len(self._visible_columns(tid)) <= 1:
+            self._toast("At least one column stays shown.", kind="warning")
+            return
+        tab["grid"].hide_column(column)
+        self._toast("Column hidden; Columns shows it again.")
+
+    def _grid_tool(self, tid: str, action: str, button) -> None:
+        tab = self._tabs[tid]
+        if tab["grid"] is None:
+            self._toast("Nothing is shown yet.", kind="warning")
+            return
+        if action == "col_filter":
+            self._filter_dialog(tid)
+        elif action == "columns":
+            self._columns_dialog(tid)
+        elif action == "freeze":
+            self._change_frozen(tid, 0 if tab.get("frozen") else 1)
+        elif action == "unfilter":
+            filters = list(self._filters_of(tab))
+            try:
+                filters.pop(int(_attr(button, "data-i")))
+            except (ValueError, IndexError):
+                return
+            _spawn(self._change_filters(tid, filters), "filter")
+        elif action == "clear_filters":
+            _spawn(self._change_filters(tid, []), "filter")
+
+    @staticmethod
+    def _filters_of(tab: dict) -> list:
+        return tab.get("filters" if tab["kind"] == "table" else "rfilters") or []
+
+    def _where(self, tid: str) -> str:
+        """A table's typed WHERE with its column filters, as the server runs it."""
+        tab = self._tabs[tid]
+        kinds = {col["name"]: kind_for_type(col["type"])
+                 for col in (tab.get("info") or {}).get("columns") or []}
+        return where_with_filters(tab["engine"], tab["where"], tab.get("filters") or [], kinds)
+
+    async def _change_filters(self, tid: str, filters: list) -> None:
+        tab = self._tabs.get(tid)
+        if tab is None:
+            return
+        if tab["kind"] == "table":
+            if not await self._discard_ok(tid):
+                return
+            tab["filters"] = filters
+            self._draw_chips(tid)
+            tab["page"] = 1
+            tab["pager"].set_page(1)
+            await self._browse(tid, with_count=True)
+            return
+        entry = self._shown_entry(tid)
+        tab["rfilters"] = filters
+        self._draw_chips(tid)
+        if entry is None or tab["grid"] is None:
+            return
+        tab["grid"].set_rows(self._result_rows(tid, entry))
+        self._result_summary(tid)
+        tab["focus_cell"] = None
+        if tab.get("vp") is not None:
+            tab["vp"].reset()
+
+    def _draw_chips(self, tid: str) -> None:
+        tab = self._tabs[tid]
+        host = _el(f"{tid}-chips")
+        if not host:
+            return
+        filters = self._filters_of(tab)
+        if tab["kind"] != "table" and self._shown_entry(tid) is None:
+            host.hidden = True
+            return
+        host.hidden = not filters
+        chips = "".join(
+            f'<span class="bk-chip"><span class="mdi mdi-filter-outline"></span>'
+            f'<span class="bk-chip-text">{_esc(filter_label(flt))}</span>'
+            f'<button type="button" class="bk-chip-x" data-bk="unfilter" data-i="{i}" '
+            f'title="Remove this filter" aria-label="Remove this filter">'
+            f'<span class="mdi mdi-close"></span></button></span>'
+            for i, flt in enumerate(filters))
+        if len(filters) > 1:
+            chips += ('<button type="button" class="bk-btn bk-mini" data-bk="clear_filters">'
+                      'Clear filters</button>')
+        host.innerHTML = chips
+
+    def _small_modal(self, title: str, inner: str, width: int, height: int, handlers: dict):
+        """A dialog whose body events go to ``handlers`` ({event name: callable(event)})."""
+        modal = ModalWindow(ModalConfig(dispose_on_close=True, title=title, width=width,
+                                        height=height))
+        modal.body.innerHTML = inner
+        for event_name, handler in handlers.items():
+            proxy = create_proxy(handler)
+            self._proxies.append(proxy)
+            modal.body.addEventListener(event_name, proxy)
+        modal.show()
+        return modal
+
+    def _filter_dialog(self, tid: str, column: str | None = None, value=None) -> None:
+        """Add a column filter: column, operator, value."""
+        tab = self._tabs[tid]
+        names = self._column_names(tid)
+        if not names:
+            return
+        from_cell = column is not None    # the cell menu: start from that cell's value
+        column = column if column in names else names[0]
+        op = ("null" if value is None else "eq") if from_cell else "contains"
+        options = "".join(f'<option value="{_esc(name)}"{" selected" if name == column else ""}>'
+                          f'{_esc(name)}</option>' for name in names)
+        ops = "".join(f'<option value="{key}"{" selected" if key == op else ""}>{_esc(label)}</option>'
+                      for key, label in FILTER_OPS)
+        where = ("Filters every row of the table (added to WHERE)."
+                 if tab["kind"] == "table" else "Filters the rows this result fetched.")
+        inner = (
+            '<div class="bk-dialog bk-ddl">'
+            f'<div class="bk-hint">{_esc(where)}</div>'
+            '<div class="bk-ddl-fields bk-filter-fields">'
+            + self._field("Column", f'<select class="bk-input" data-f="column">{options}</select>')
+            + self._field("Is", f'<select class="bk-input" data-f="op">{ops}</select>')
+            + self._field("Value", '<input class="bk-input" data-f="value" spellcheck="false" '
+                          f'autocomplete="off" value="{_esc("" if value is None else value)}">')
+            + '</div><div class="bk-hint" data-f="error"></div>'
+            '<div class="bk-actions">'
+            '<button type="button" class="bk-btn" data-answer="no">Cancel</button>'
+            '<button type="button" class="bk-btn bk-primary" data-answer="yes">'
+            '<span class="mdi mdi-filter-plus-outline"></span>Add filter</button></div></div>')
+        holder: dict = {}
+
+        def _field(key: str):
+            return holder["modal"].body.querySelector(f'[data-f="{key}"]')
+
+        def _sync(_event=None) -> None:
+            no_value = str(_field("op").value) in NO_VALUE_OPS
+            _field("value").disabled = no_value
+
+        def _add() -> None:
+            flt = {"column": str(_field("column").value), "op": str(_field("op").value)}
+            if flt["op"] not in NO_VALUE_OPS:
+                flt["value"] = str(_field("value").value)
+                if flt["value"] == "" and flt["op"] not in ("eq", "ne"):
+                    error = _field("error")
+                    error.textContent = "Type a value, or choose is NULL."
+                    error.setAttribute("data-kind", "error")
+                    return
+            holder["modal"].close()
+            _spawn(self._change_filters(tid, self._filters_of(tab) + [flt]), "filter")
+
+        def _on_click(event) -> None:
+            which = event.target.closest("[data-answer]")
+            if not which:
+                return
+            if _attr(which, "data-answer") == "yes":
+                _add()
+            else:
+                holder["modal"].close()
+
+        def _on_key(event) -> None:
+            if str(event.key) == "Enter" and _attr(event.target, "data-f") == "value":
+                event.preventDefault()
+                _add()
+
+        holder["modal"] = self._small_modal("Filter by a column", inner, 560, 330, {
+            "click": _on_click, "change": _sync, "keydown": _on_key})
+        _sync()
+        target = _field("value") if not _field("value").disabled else _field("op")
+        target.focus()
+        if hasattr(target, "select"):
+            target.select()
+
+    def _columns_dialog(self, tid: str) -> None:
+        """Show / hide columns, how many to freeze, and (tables) reset the saved layout."""
+        tab = self._tabs[tid]
+        grid = tab["grid"]
+        names = self._column_names(tid)
+        rows = []
+        for col in grid.get_column_state():
+            cid = str(col.get("id") or "")
+            try:
+                name = names[int(cid[1:])]
+            except (ValueError, IndexError):
+                continue
+            rows.append(
+                f'<label class="bk-check bk-col-check"><input type="checkbox" data-col="{_esc(cid)}"'
+                f'{"" if col.get("hidden") else " checked"}><span>{_esc(name)}</span></label>')
+        freeze = "".join(f'<option value="{n}"{" selected" if n == tab.get("frozen", 0) else ""}>'
+                         f'{"None" if n == 0 else n}</option>' for n in range(MAX_FROZEN + 1))
+        table = tab["kind"] == "table"
+        hint = ("Saved for this table: order and widths too (drag a header to move it, its "
+                "edge to resize)." if table else
+                "For this result only; the frozen count is remembered.")
+        inner = (
+            '<div class="bk-dialog bk-ddl">'
+            f'<div class="bk-hint">{_esc(hint)}</div>'
+            f'<div class="bk-col-list">{"".join(rows)}</div>'
+            '<div class="bk-actions">'
+            f'<label class="bk-inline-label">Freeze the first <select class="bk-input '
+            f'bk-mini-select" data-c="freeze">{freeze}</select> columns</label>'
+            '<span class="bk-spacer"></span>'
+            '<button type="button" class="bk-btn" data-c="all">Show all</button>'
+            + ('<button type="button" class="bk-btn" data-c="reset">Reset layout</button>'
+               if table else '')
+            + '<button type="button" class="bk-btn bk-primary" data-c="close">Close</button>'
+            '</div></div>')
+        holder: dict = {}
+
+        def _on_change(event) -> None:
+            target = event.target
+            if _attr(target, "data-c") == "freeze":
+                self._change_frozen(tid, int(target.value or 0))
+                return
+            cid = _attr(target, "data-col")
+            if not cid or tid not in self._tabs:
+                return
+            if not target.checked and len(self._visible_columns(tid)) <= 1:
+                target.checked = True
+                self._toast("At least one column stays shown.", kind="warning")
+                return
+            grid.set_column_hidden(cid, not target.checked)
+
+        def _on_click(event) -> None:
+            which = event.target.closest("[data-c]")
+            if not which or str(which.tagName).lower() != "button":
+                return
+            what = _attr(which, "data-c")
+            if what == "close":
+                holder["modal"].close()
+            elif what == "all":
+                for box in holder["modal"].body.querySelectorAll("[data-col]"):
+                    if not box.checked:
+                        box.checked = True
+                        grid.set_column_hidden(_attr(box, "data-col"), False)
+            elif what == "reset":
+                holder["modal"].close()
+                _spawn(self._reset_layout(tid), "reset columns")
+
+        height = min(620, 220 + 30 * ((len(rows) + 2) // 3))
+        holder["modal"] = self._small_modal("Columns", inner, 640, height, {
+            "change": _on_change, "click": _on_click})
+
+    async def _copy_rows(self, tid: str, payload: dict, action: str) -> None:
+        """The clicked row, or the selection it is part of, as INSERTs or a Markdown table."""
+        tab = self._tabs[tid]
+        grid = tab["grid"]
+        row_id = str(payload.get("id") or "")
+        selected = [str(item) for item in (payload.get("selected") or [])]
+        ids = selected if row_id in selected else [row_id]
+        visible = [str(col["id"]) for col in self._visible_columns(tid)]
+        names_all, kinds_all = self._column_names(tid), self._column_kinds(tid)
+        index = [int(cid[1:]) for cid in visible]
+        names = [names_all[i] for i in index]
+        kinds = [kinds_all[i] if i < len(kinds_all) else "text" for i in index]
+        entry = self._shown_entry(tid) if tab["kind"] != "table" else None
+        cut_cells = {(int(r), int(c)) for r, c in (entry or {}).get("truncated") or []}
+        rows, cut = [], 0
+        for rid in ids:
+            live = grid.get_row(rid) or {}
+            values = []
+            for cid, i in zip(visible, index):
+                value = live.get(cid)
+                if tab["kind"] == "table":
+                    value = await self._full_text(tid, rid, cid, value)
+                elif (self._index_of(rid), i) in cut_cells:
+                    cut += 1
+                values.append(value)
+            rows.append(values)
+        engine = self._engine_of(tid)
+        note = ""
+        if action == "copy_md":
+            text, what = markdown_table(names, rows, kinds), "a Markdown table"
+        else:
+            if tab["kind"] == "table":
+                target = (tab.get("info") or {}).get("qualified") or tab["name"]
+            else:
+                target = table_of_query(entry["sql"] if entry else "") or "table_name"
+                if target == "table_name":
+                    note = " The query reads no single table: replace table_name."
+            text, what = insert_sql(engine, target, names, rows, kinds), "INSERT statements"
+        if cut:
+            note += f" {cut} value{'s were' if cut != 1 else ' was'} cut short in the result."
+        if await _copy(text):
+            plural = "s" if len(rows) != 1 else ""
+            self._toast(f"Copied {len(rows)} row{plural} as {what}.{note}",
+                        kind="warning" if cut else "success")
+        else:
+            self._toast("The browser refused the clipboard.", kind="error")
+
+    def _reference_loc(self, tid: str, ref_schema: str) -> tuple:
+        """Where a foreign key's referenced table lives, from this table's location."""
+        tab = self._tabs[tid]
+        conn = self._conn(tab["conn"]) or {}
+        levels = conn.get("levels") or []
+        conn_id, db, schema = tab["loc"]
+        if conn.get("engine") == "mysql":
+            return (conn_id, ref_schema or db, "")
+        if "schema" in levels:
+            return (conn_id, db, ref_schema or schema)
+        return (conn_id, db, schema)
+
+    def _open_fk_row(self, tid: str, column: str, row: dict) -> None:
+        """Open the row a foreign-key cell points at: its table, filtered to that key."""
+        tab = self._tabs[tid]
+        fk = foreign_key_for((tab.get("info") or {}).get("foreign_keys") or [], column)
+        if fk is None:
+            self._toast(f"{column} is not part of a foreign key.", kind="warning")
+            return
+        values = {name: row.get(f"c{i}") for i, name in enumerate(tab["columns"])}
+        kinds = {name: tab["kinds"][i] for i, name in enumerate(tab["columns"])}
+        where = reference_where(tab["engine"], fk, values, kinds)
+        if where is None:
+            self._toast("The key is NULL: this row references nothing.", kind="warning")
+            return
+        self._open_table(self._reference_loc(tid, fk.get("ref_schema") or ""), fk["ref_table"],
+                         "table", where=where)
 
     # -- the value panel (ui/value_panel.py) ---------------------------------
 
@@ -2286,6 +2813,14 @@ class Basilisk(MainWindow):
             current = str(where.value or "").strip()
             where.value = f"({current}) AND {clause}" if current else clause
             await self._apply_filter_async(tid)
+        elif action == "filter_col":
+            self._filter_dialog(tid, name, value)
+        elif action == "fk_open":
+            self._open_fk_row(tid, name, row)
+        elif action in ("copy_insert", "copy_md"):
+            await self._copy_rows(tid, payload, action)
+        elif action == "hide_col":
+            self._hide_column(tid, column)
         elif action == "set_null":
             self._set_cell(tid, row_id, column, None)
         elif action == "set_empty":
@@ -2469,19 +3004,9 @@ class Basilisk(MainWindow):
             selection="none", empty_text="None"), container=_el(f"{tid}-cons"))
 
     def _open_reference(self, tid: str, payload: dict) -> None:
-        tab = self._tabs[tid]
         row = payload.get("row") or {}
-        conn = self._conn(tab["conn"]) or {}
-        levels = conn.get("levels") or []
-        conn_id, db, schema = tab["loc"]
-        ref_schema = row.get("schema") or ""
-        if conn.get("engine") == "mysql":
-            loc = (conn_id, ref_schema or db, "")
-        elif "schema" in levels:
-            loc = (conn_id, db, ref_schema or schema)
-        else:
-            loc = (conn_id, db, schema)
-        self._open_table(loc, row.get("table"), "table")
+        self._open_table(self._reference_loc(tid, row.get("schema") or ""), row.get("table"),
+                         "table")
 
     async def _render_ddl(self, tid: str) -> None:
         tab = self._tabs.get(tid)
@@ -2710,6 +3235,643 @@ class Basilisk(MainWindow):
             kind = self._tabs[tid]["object_kind"]
             self._close_tab(tid)
             self._open_table(loc, name, kind, was or sub)
+
+    # ------------------------------------------------------------------
+    # Session manager (milestone 2): what runs on a server now, refreshed
+    # every few seconds, with Cancel query and End session. One tab per
+    # connection; stopping is refused on read-only profiles (sqlops).
+    # ------------------------------------------------------------------
+
+    SESSIONS_REFRESH_S = 5
+
+    def _open_sessions(self, conn_id: int) -> str | None:
+        conn = self._conn(conn_id) or {}
+        if not conn.get("has_sessions"):
+            self._toast(f"{conn.get('engine_label') or 'This database'} has no server sessions "
+                        "to list.", kind="warning")
+            return None
+        for tid, tab in self._tabs.items():
+            if tab["kind"] == "sessions" and tab["conn"] == conn_id:
+                self.tabs.set_active(tid)
+                return tid
+        tid, container = self._new_tab(f"Sessions · {conn.get('name', '?')}", "mdi-pulse")
+        container.innerHTML = f"""
+<div class="bk-view" data-tab="{tid}">
+  <div class="bk-head">{self._crumbs(conn, "", "", "Sessions", "mdi-pulse")}
+    <span class="bk-head-stats" id="{tid}-stats"></span></div>
+  <div class="bk-bar">
+    <button type="button" class="bk-btn" data-bk="s_refresh" title="Refresh now">
+      <span class="mdi mdi-refresh"></span><span>Refresh</span></button>
+    <label class="bk-check"><input type="checkbox" data-role="s_auto" checked>
+      <span>Every {self.SESSIONS_REFRESH_S} s</span></label>
+    <label class="bk-check"><input type="checkbox" data-role="s_idle">
+      <span>Show idle sessions</span></label>
+    <span class="bk-bar-sep"></span>
+    <button type="button" class="bk-btn" data-bk="s_cancel" id="{tid}-s-cancel"
+      title="Stop the selected sessions' statements; the sessions stay">
+      <span class="mdi mdi-stop-circle-outline"></span><span>Cancel query</span></button>
+    <button type="button" class="bk-btn bk-danger-text" data-bk="s_kill"
+      title="End the selected sessions (their open transactions roll back)">
+      <span class="mdi mdi-close-octagon-outline"></span><span>End session</span></button>
+    <button type="button" class="bk-btn" data-bk="s_sql" title="Open the selected session's statement in a SQL editor">
+      <span class="mdi mdi-console-line"></span><span>SQL</span></button>
+    <span class="bk-spacer"></span>
+    <span class="bk-note" id="{tid}-note"></span>
+  </div>
+  <div class="bk-status" id="{tid}-status" hidden></div>
+  <div class="bk-results"><div class="bk-panel" id="{tid}-grid"></div></div>
+  <div class="bk-foot"><code id="{tid}-sql">Double-click a session for its whole statement.</code></div>
+</div>"""
+        self._tabs[tid] = {
+            "tid": tid, "kind": "sessions", "conn": conn_id, "db": "", "loc": (conn_id, "", ""),
+            "name": "Sessions", "grid": None, "auto": True, "idle": False, "rows": {},
+            "busy": False, "can_cancel": True, "again": False,
+        }
+        grid = DataTable(DataTableConfig(
+            columns=[
+                ColumnConfig(id="id", header="Session", width=86, align="right", sort_by="id_n"),
+                ColumnConfig(id="user", header="User", width=120),
+                ColumnConfig(id="database", header="Database", width=120),
+                ColumnConfig(id="client", header="Client", width=130),
+                ColumnConfig(id="application", header="Application", width=130),
+                ColumnConfig(id="state", header="State", width=150),
+                ColumnConfig(id="duration", header="For", width=90, align="right",
+                             sort_by="secs_n"),
+                ColumnConfig(id="wait", header="Waiting on", width=130),
+                ColumnConfig(id="blocked", header="Blocked by", width=96),
+                ColumnConfig(id="query", header="Statement", width=520),
+            ],
+            id_field="rid", selection="multi", resizable_columns=True, reorderable_columns=True,
+            frozen_columns=1, row_class_by="cls", empty_text="Nothing is running.",
+            loading_text="Loading…",
+            context_actions=[
+                TableAction("show", "Show the statement", "mdi-text-box-search-outline"),
+                TableAction("sql", "Open in a SQL editor", "mdi-console-line"),
+                TableAction("copy", "Copy the statement", "mdi-content-copy"),
+                TableAction(separator=True),
+                TableAction("cancel", "Cancel query", "mdi-stop-circle-outline"),
+                TableAction("kill", "End session", "mdi-close-octagon-outline", danger=True),
+            ],
+        ), container=_el(f"{tid}-grid"))
+        grid.on_activate(lambda payload: self._session_dialog(tid, str(payload.get("id") or "")))
+        grid.on_action(lambda payload: self._session_menu(tid, payload))
+        self._tabs[tid]["grid"] = grid
+        self.tabs.set_active(tid)
+        _spawn(self._poll_sessions(tid), "sessions")
+        return tid
+
+    @staticmethod
+    def _duration(seconds) -> str:
+        if seconds is None:
+            return ""
+        seconds = float(seconds)
+        if seconds < 60:
+            return f"{seconds:.1f} s"
+        minutes, secs = divmod(int(seconds), 60)
+        if minutes < 60:
+            return f"{minutes} min {secs} s"
+        hours, minutes = divmod(minutes, 60)
+        if hours < 48:
+            return f"{hours} h {minutes} min"
+        return f"{hours // 24} d {hours % 24} h"
+
+    async def _poll_sessions(self, tid: str) -> None:
+        """Refresh now, then every few seconds while the tab is open and auto is on."""
+        await self._load_sessions(tid)
+        while tid in self._tabs:
+            await asyncio.sleep(self.SESSIONS_REFRESH_S)
+            tab = self._tabs.get(tid)
+            if tab is None:
+                return
+            visible = str(self.tabs.get_active() or "") == tid
+            if tab["auto"] and visible and not tab["busy"]:
+                await self._load_sessions(tid)
+
+    async def _load_sessions(self, tid: str) -> None:
+        tab = self._tabs.get(tid)
+        if tab is None:
+            return
+        if tab["busy"]:
+            tab["again"] = True     # a change while listing: list once more after
+            return
+        tab["busy"] = True
+        tab["again"] = False
+        try:
+            result = await SqlService().sessions_async(tab["conn"], tab["idle"])
+        finally:
+            tab["busy"] = False
+        if tid not in self._tabs:
+            return
+        if tab.get("again"):
+            _spawn(self._load_sessions(tid), "sessions")
+        if not result.get("ok"):
+            self._status(tid, result.get("error", "Could not list the sessions"))
+            return
+        self._status(tid, "")
+        tab["can_cancel"] = bool(result.get("can_cancel"))
+        cancel = _el(f"{tid}-s-cancel")
+        if cancel:
+            cancel.hidden = not tab["can_cancel"]
+        selected = set(tab["grid"].get_selected_ids())
+        rows, tab["rows"] = [], {}
+        for row in result["sessions"]:
+            rid = f"s{row['id']}"
+            tab["rows"][rid] = row
+            query = " ".join((row.get("query") or "").split())
+            classes = " ".join(cls for cls, on in (
+                ("bk-own", row.get("own")), ("bk-blocked", row.get("blocked_by")),
+                ("bk-active", str(row.get("state") or "").lower().startswith(
+                    ("active", "running", "query", "suspended", "runnable")))) if on)
+            rows.append({
+                "rid": rid, "id": str(row["id"]) + (" ★" if row.get("own") else ""),
+                "id_n": row["id"], "user": row["user"], "database": row["database"],
+                "client": row["client"], "application": row["application"],
+                "state": row["state"] + (" · in transaction" if row.get("txn")
+                                         and "transaction" not in row["state"] else ""),
+                "duration": self._duration(row.get("seconds")), "secs_n": row.get("seconds") or 0,
+                "wait": row["wait"], "blocked": ", ".join(str(pid) for pid in row["blocked_by"]),
+                "query": query[:400], "cls": classes,
+            })
+        tab["grid"].set_rows(rows)
+        keep = [rid for rid in selected if rid in tab["rows"]]
+        if keep:
+            tab["grid"].select(keep)
+        active = sum(1 for row in rows if "bk-active" in row["cls"])
+        _el(f"{tid}-stats").textContent = (f"{len(rows)} session{'s' if len(rows) != 1 else ''}"
+                                           f" · {active} running")
+        _el(f"{tid}-note").textContent = (
+            "★ is this browser's own connection · " if any(r.get("own") for r in result["sessions"])
+            else "") + f"listed in {result.get('ms', 0)} ms"
+
+    def _sessions_action(self, tid: str, action: str, button) -> None:
+        tab = self._tabs[tid]
+        ids = tab["grid"].get_selected_ids()
+        if action == "s_refresh":
+            _spawn(self._load_sessions(tid), "sessions")
+        elif action in ("s_cancel", "s_kill"):
+            _spawn(self._stop_sessions(tid, ids, "cancel" if action == "s_cancel" else "terminate"),
+                   "stop sessions")
+        elif action == "s_sql":
+            if not ids:
+                self._toast("Select a session first.", kind="warning")
+                return
+            self._session_to_sql(tid, ids[0])
+
+    def _session_menu(self, tid: str, payload: dict) -> None:
+        rid = str(payload.get("id") or "")
+        selected = [str(item) for item in payload.get("selected") or []]
+        ids = selected if rid in selected else [rid]
+        action = payload.get("action")
+        if action == "show":
+            self._session_dialog(tid, rid)
+        elif action == "sql":
+            self._session_to_sql(tid, rid)
+        elif action == "copy":
+            row = self._tabs[tid]["rows"].get(rid) or {}
+            _spawn(self._copy_text(row.get("query") or "", "Copied the statement."), "copy")
+        elif action in ("cancel", "kill"):
+            _spawn(self._stop_sessions(tid, ids, "cancel" if action == "cancel" else "terminate"),
+                   "stop sessions")
+
+    async def _copy_text(self, text: str, done: str) -> None:
+        if await _copy(text):
+            self._toast(done, kind="success")
+
+    def _session_to_sql(self, tid: str, rid: str) -> None:
+        tab = self._tabs[tid]
+        row = tab["rows"].get(rid)
+        if not row or not row.get("query"):
+            self._toast("That session has no statement to show.", kind="warning")
+            return
+        conn = self._conn(tab["conn"]) or {}
+        db = row.get("database") if "database" in (conn.get("levels") or []) else ""
+        self._open_sql(tab["conn"], db or "", row["query"].rstrip() + "\n")
+
+    def _session_dialog(self, tid: str, rid: str) -> None:
+        tab = self._tabs.get(tid)
+        row = (tab or {}).get("rows", {}).get(rid)
+        if not row:
+            return
+        facts = [("Session", row["id"]), ("User", row["user"]), ("Database", row["database"]),
+                 ("Client", row["client"]), ("Application", row["application"]),
+                 ("State", row["state"]), ("Since", row.get("started")),
+                 ("For", self._duration(row.get("seconds"))), ("Waiting on", row["wait"]),
+                 ("Blocked by", ", ".join(str(pid) for pid in row["blocked_by"])),
+                 ("In a transaction", "yes" if row.get("txn") else "")]
+        props = "".join(f"<dt>{_esc(label)}</dt><dd>{_esc(value)}</dd>"
+                        for label, value in facts if value not in (None, ""))
+        modal = ModalWindow(ModalConfig(dispose_on_close=True, title=f"Session {row['id']}",
+                                        width=820, height=560))
+        modal.body.innerHTML = (
+            '<div class="bk-dialog bk-fill">'
+            f'<dl class="bk-session-facts">{props}</dl>'
+            f'<pre class="bk-pre bk-grow-box">{_esc(row.get("query") or "(no statement)")}</pre>'
+            '<div class="bk-actions"><button type="button" class="bk-btn" data-s="sql">'
+            '<span class="mdi mdi-console-line"></span>Open in a SQL editor</button>'
+            '<span class="bk-spacer"></span>'
+            '<button type="button" class="bk-btn bk-primary" data-s="close">Close</button></div></div>')
+
+        def _on_click(event) -> None:
+            which = event.target.closest("[data-s]")
+            if not which:
+                return
+            modal.close()
+            if _attr(which, "data-s") == "sql":
+                self._session_to_sql(tid, rid)
+
+        proxy = create_proxy(_on_click)
+        self._proxies.append(proxy)
+        modal.body.addEventListener("click", proxy)
+        modal.show()
+
+    async def _stop_sessions(self, tid: str, ids: list, mode: str) -> None:
+        tab = self._tabs.get(tid)
+        if tab is None:
+            return
+        conn = self._conn(tab["conn"]) or {}
+        if conn.get("read_only"):
+            self._toast("This connection is read-only: it does not stop sessions.", kind="warning")
+            return
+        if mode == "cancel" and not tab["can_cancel"]:
+            self._toast(f"{conn.get('engine_label')} can only end a session.", kind="warning")
+            return
+        rows = [tab["rows"][rid] for rid in ids if rid in tab["rows"]]
+        own = [row for row in rows if row.get("own")]
+        rows = [row for row in rows if not row.get("own")]
+        if not rows:
+            self._toast("Select a session first." if not own else
+                        "That is this browser's own connection.", kind="warning")
+            return
+        verb = "Cancel the statement of" if mode == "cancel" else "End"
+        lines = [f"-- session {row['id']} · {row['user'] or '?'} · {row['state']}\n"
+                 + (" ".join((row.get("query") or "").split())[:300] or "(no statement)")
+                 for row in rows]
+        note = (f"{verb} {len(rows)} session{'s' if len(rows) != 1 else ''}?"
+                + (" Their open transactions are rolled back." if mode == "terminate" else
+                   " The sessions stay; a transaction may be left to roll back."))
+        if not await self._confirm_sql(
+                "Cancel query" if mode == "cancel" else "End session", lines, note,
+                prod=conn.get("env") == "prod", danger=True,
+                ok_text="Cancel query" if mode == "cancel" else "End session"):
+            return
+        failed = []
+        for row in rows:
+            result = await SqlService().kill_session_async(tab["conn"], row["id"], mode)
+            if not result.get("ok"):
+                failed.append(f"{row['id']}: {result.get('error', 'failed')}")
+        if failed:
+            self._toast("Not stopped: " + "; ".join(failed), kind="error")
+        else:
+            self._toast(f"{'Cancelled' if mode == 'cancel' else 'Ended'} {len(rows)} "
+                        f"session{'s' if len(rows) != 1 else ''}.", kind="success")
+        await asyncio.sleep(0.3)
+        await self._load_sessions(tid)
+
+    # ------------------------------------------------------------------
+    # Import CSV (milestone 2): pick a file, map its columns, then upload it
+    # to /bk/import/<plan>, which runs services/csv_import.py as a job in
+    # one transaction. The console follows the job; closing it does not stop it.
+    # ------------------------------------------------------------------
+
+    async def _import_dialog(self, loc: tuple, name: str) -> None:
+        conn_id, db, schema = loc
+        if not self._writable(conn_id) or self._edits_pending(loc, name):
+            return
+        info = await SqlService().table_info_async(conn_id, db, schema, name)
+        if not info.get("ok"):
+            self._toast(info.get("error", "Could not read the table"), kind="error")
+            return
+        if info["kind"] != "table":
+            self._toast(f"{name} is a view; import into a table.", kind="warning")
+            return
+        conn = self._conn(conn_id) or {}
+        prod = conn.get("env") == "prod"
+        columns = info["columns"]
+        state: dict = {"file": None, "raw": b"", "cut": False, "rows": [], "mapping": {},
+                       "busy": False}
+
+        def select(key: str, options, value: str) -> str:
+            items = "".join(f'<option value="{_esc(v)}"{" selected" if v == value else ""}>'
+                            f'{_esc(label)}</option>' for v, label in options)
+            return f'<select class="bk-input" data-i="{key}">{items}</select>'
+
+        warn = ('<div class="bk-warn"><span class="mdi mdi-alert-octagon-outline"></span> '
+                "This is a <b>production</b> connection.</div>") if prod else ""
+        opts = (
+            self._field("Delimiter", select("delimiter", DELIMITERS, ","))
+            + self._field("Quote", select("quote", (('"', 'Double "'), ("'", "Single '"),
+                                                    ("", "None")), '"'))
+            + self._field("Encoding", select("encoding", ENCODINGS, "utf-8"))
+            + self._field("NULL marker", '<input class="bk-input bk-code" data-i="null_text" '
+                          'placeholder="e.g. NULL or \\N" spellcheck="false" autocomplete="off">')
+            + self._field("Existing rows", select("mode", (
+                ("append", "Keep, add to them"), ("replace", "Delete them first")), "append"))
+            + self._field("A bad value", select("on_error", (
+                ("stop", "Stops: import nothing"), ("skip", "Skips its row")), "stop")))
+        checks = ('<label class="bk-check"><input type="checkbox" data-i="header" checked>'
+                  "<span>First row is the header</span></label>"
+                  '<label class="bk-check"><input type="checkbox" data-i="empty" checked>'
+                  "<span>Empty fields are NULL</span></label>")
+        modal = ModalWindow(ModalConfig(dispose_on_close=True, title=f"Import CSV into {name}",
+                                        width=980, height=700))
+        body = modal.body
+        body.innerHTML = (
+            '<div class="bk-dialog bk-import">' + warn +
+            '<div class="bk-import-file">'
+            '<label class="bk-btn bk-primary"><span class="mdi mdi-file-upload-outline"></span>'
+            '<span>Choose a CSV file…</span><input type="file" data-i="file" hidden '
+            'accept=".csv,.tsv,.tab,.txt,text/csv,text/plain,text/tab-separated-values"></label>'
+            '<span class="bk-note" data-i="fname">No file chosen yet.</span></div>'
+            f'<div class="bk-import-opts">{opts}</div>'
+            f'<div class="bk-import-checks">{checks}</div>'
+            '<div class="bk-import-main">'
+            '<div class="bk-import-map" data-i="map"></div>'
+            '<div class="bk-import-preview" data-i="preview"></div></div>'
+            '<div class="bk-hint" data-i="note">The whole file is imported in one transaction: '
+            "if anything fails, the table is left as it was.</div>"
+            '<div class="bk-import-progress" data-i="progress" hidden></div>'
+            '<div class="bk-actions">'
+            '<button type="button" class="bk-btn" data-answer="no">Cancel</button>'
+            f'<button type="button" class="bk-btn {"bk-danger" if prod else "bk-primary"}" '
+            'data-answer="yes" disabled><span class="mdi mdi-database-import-outline"></span>'
+            '<span data-i="go">Import</span></button></div></div>')
+
+        def el(key: str):
+            return body.querySelector(f'[data-i="{key}"]')
+
+        def value(key: str) -> str:
+            return str(el(key).value)
+
+        def render() -> None:
+            rows, header = state["rows"], bool(el("header").checked)
+            sources = source_columns(rows, header)
+            lines = []
+            for col in columns:
+                if col.get("computed"):
+                    continue
+                picked = state["mapping"].get(col["name"])
+                options = ['<option value="">— not imported (its default) —</option>'] + [
+                    f'<option value="{i}"{" selected" if picked == i else ""}>{_esc(label)}</option>'
+                    for i, label in sources]
+                flags = []
+                if col.get("pk"):
+                    flags.append('<span class="mdi mdi-key" title="Primary key"></span>')
+                if col.get("autoincrement"):
+                    flags.append('<small title="Numbered by the database when not imported">'
+                                 "auto</small>")
+                needs = (picked is None and not col.get("nullable") and col.get("default") is None
+                         and not col.get("autoincrement"))
+                if needs:
+                    flags.append('<span class="mdi mdi-alert" title="NOT NULL with no default: '
+                                 'map it, or every row is refused"></span>')
+                lines.append(
+                    f'<tr><td class="bk-import-col">{"".join(flags)}<span>{_esc(col["name"])}</span></td>'
+                    f'<td class="bk-code bk-import-type" title="{_esc(col["type"])}">{_esc(col["type"])}</td>'
+                    f'<td><select class="bk-input" data-map="{_esc(col["name"])}">'
+                    f'{"".join(options)}</select></td></tr>')
+            el("map").innerHTML = (
+                '<table class="bk-import-table"><thead><tr><th>Column</th><th>Type</th>'
+                f'<th>From the file</th></tr></thead><tbody>{"".join(lines)}</tbody></table>')
+            mapped = [col["name"] for col in columns if col["name"] in state["mapping"]]
+            if not rows:
+                el("preview").innerHTML = ('<div class="bk-vp-empty">Choose a file to see its first '
+                                           "rows here.</div>")
+            elif not mapped:
+                el("preview").innerHTML = ('<div class="bk-vp-empty">No column of the file is '
+                                           "mapped yet.</div>")
+            else:
+                cells = preview_cells(rows, header, state["mapping"], mapped,
+                                      value("null_text"), bool(el("empty").checked))
+                head = "".join(f"<th>{_esc(n)}</th>" for n in mapped)
+                body_rows = "".join(
+                    "<tr>" + "".join(
+                        '<td class="bk-null"></td>' if kind == "null" else
+                        f'<td title="{_esc(text)}">{_esc(text)}</td>' for kind, text in row) + "</tr>"
+                    for row in cells)
+                el("preview").innerHTML = (
+                    f'<table class="bk-import-table bk-import-rows"><thead><tr>{head}</tr></thead>'
+                    f"<tbody>{body_rows}</tbody></table>")
+            go = body.querySelector('[data-answer="yes"]')
+            go.disabled = state["file"] is None or not state["mapping"] or state["busy"]
+            replace = value("mode") == "replace"
+            el("go").textContent = "Delete the rows and import" if replace else "Import"
+            go.classList.toggle("bk-danger", replace or prod)
+            go.classList.toggle("bk-primary", not (replace or prod))
+
+        def reparse(remap: bool) -> None:
+            text = decode_sample(state["raw"], value("encoding"), state["cut"])
+            state["rows"] = parse_rows(text, value("delimiter"), value("quote"))
+            if remap:
+                state["mapping"] = auto_map(columns, state["rows"], bool(el("header").checked))
+            render()
+
+        async def read_file(chosen) -> None:
+            state["file"] = chosen
+            size = int(chosen.size)
+            buffer = await chosen.slice(0, SAMPLE_BYTES).arrayBuffer()
+            state["raw"] = js.Uint8Array.new(buffer).to_bytes()
+            state["cut"] = size > SAMPLE_BYTES
+            el("fname").textContent = f"{chosen.name} · {format_bytes(size)}"
+            el("encoding").value = guess_encoding(state["raw"])
+            text = decode_sample(state["raw"], value("encoding"), state["cut"])
+            el("delimiter").value = ("\t" if str(chosen.name).lower().endswith((".tsv", ".tab"))
+                                     else sniff_delimiter(text))
+            reparse(True)
+
+        def on_change(event) -> None:
+            target = event.target
+            key = _attr(target, "data-i")
+            if key == "file":
+                files = target.files
+                if files and files.length:
+                    _spawn(read_file(files.item(0)), "read csv")
+            elif _attr(target, "data-map"):
+                column = _attr(target, "data-map")
+                if str(target.value) == "":
+                    state["mapping"].pop(column, None)
+                else:
+                    state["mapping"][column] = int(target.value)
+                render()
+            elif key in ("delimiter", "quote", "encoding", "header"):
+                reparse(key == "header" or not state["mapping"])
+            elif key in ("empty", "null_text", "mode", "on_error"):
+                render()
+
+        def on_input(event) -> None:
+            if _attr(event.target, "data-i") == "null_text":
+                render()
+
+        async def start() -> None:
+            note = el("note")
+            options = {
+                "delimiter": value("delimiter"), "quote": value("quote"),
+                "encoding": value("encoding"), "header": bool(el("header").checked),
+                "empty": "null" if el("empty").checked else "empty",
+                "null_text": value("null_text"), "mode": value("mode"),
+                "on_error": value("on_error"),
+                "mapping": [[col, index] for col, index in state["mapping"].items()],
+            }
+            state["busy"] = True
+            render()
+            try:
+                planned = await JobService().plan_import_async(conn_id, db, schema, name, options)
+                if not planned.get("ok"):
+                    note.textContent = planned.get("error", "Cannot import")
+                    note.setAttribute("data-kind", "error")
+                    return
+                bar = el("progress")
+                bar.hidden = False
+                size = int(state["file"].size)
+
+                def on_progress(done: int, total: int) -> None:
+                    bar.innerHTML = progress_html(done, total or size or 1, label="Uploading",
+                                                  text=f"{format_bytes(done)} / "
+                                                       f"{format_bytes(total or size)}")
+
+                on_progress(0, size)
+                status, payload = await self._upload(f"/bk/import/{planned['plan']}",
+                                                     state["file"], on_progress)
+                if status != 200 or not payload.get("job"):
+                    bar.hidden = True
+                    note.textContent = payload.get("detail") or (
+                        "The upload failed." if status == 0 else f"The upload failed ({status}).")
+                    note.setAttribute("data-kind", "error")
+                    return
+            finally:
+                state["busy"] = False
+            modal.close()
+            await self._job_console(payload["job"], f"Import into {name}", loc, name)
+
+        def on_click(event) -> None:
+            which = event.target.closest("[data-answer]")
+            if not which or which.disabled:
+                return
+            if _attr(which, "data-answer") == "yes":
+                if not state["busy"]:
+                    _spawn(start(), "import")
+            else:
+                modal.close()
+
+        for event_name, handler in (("change", on_change), ("input", on_input),
+                                    ("click", on_click)):
+            proxy = create_proxy(handler)
+            self._proxies.append(proxy)
+            body.addEventListener(event_name, proxy)
+        modal.show()
+        render()
+
+    async def _upload(self, url: str, body, on_progress) -> tuple:
+        """
+        POST a file with upload progress. XMLHttpRequest, not fetch: fetch
+        reports nothing while a request body is being sent. Returns
+        ``(status, parsed JSON or {})``; status 0 means the network failed.
+        """
+        future = asyncio.get_event_loop().create_future()
+        xhr = js.XMLHttpRequest.new()
+        xhr.open("POST", url)
+        xhr.withCredentials = True
+        xhr.setRequestHeader("X-CSRF-Token", _csrf_token())
+        xhr.setRequestHeader("Content-Type", "text/csv")
+
+        def _progress(event) -> None:
+            if event.lengthComputable:
+                on_progress(int(event.loaded), int(event.total))
+
+        def _settle(*_args) -> None:
+            if not future.done():
+                future.set_result(None)
+
+        proxies = [create_proxy(_progress), create_proxy(_settle)]
+        self._proxies.extend(proxies)
+        xhr.upload.addEventListener("progress", proxies[0])
+        for event_name in ("load", "error", "abort", "timeout"):
+            xhr.addEventListener(event_name, proxies[1])
+        xhr.send(body)
+        await future
+        try:
+            payload = json.loads(str(xhr.responseText or "{}"))
+        except ValueError:
+            payload = {}
+        return int(xhr.status), payload if isinstance(payload, dict) else {}
+
+    async def _job_console(self, job_id: str, title: str, loc: tuple, name: str) -> None:
+        """Follow an import: its bar, the log, Cancel; then the summary and a refreshed tab."""
+        modal = ModalWindow(ModalConfig(dispose_on_close=True, title=title, width=700,
+                                        height=480))
+        modal.body.innerHTML = (
+            '<div class="bk-dialog bk-console">'
+            '<div class="bk-console-head"><span class="bk-console-state" data-state="running">'
+            '<span class="mdi mdi-progress-clock"></span><span>Running…</span></span>'
+            '<span class="bk-note" data-j="elapsed"></span></div>'
+            '<div data-j="items"></div>'
+            '<pre class="bk-pre bk-console-log" data-j="log"></pre>'
+            '<div class="bk-actions">'
+            '<button type="button" class="bk-btn bk-danger" data-job="cancel">'
+            '<span class="mdi mdi-stop"></span><span>Cancel</span></button>'
+            '<button type="button" class="bk-btn" data-job="close">Close</button></div></div>')
+        body = modal.body
+        items_el, log_el = body.querySelector('[data-j="items"]'), body.querySelector('[data-j="log"]')
+        state_el = body.querySelector(".bk-console-state")
+        cancel_el = body.querySelector('[data-job="cancel"]')
+
+        def _on_click(event) -> None:
+            which = event.target.closest("[data-job]")
+            if not which:
+                return
+            if _attr(which, "data-job") == "close":
+                modal.close()
+            elif not which.disabled:
+                which.disabled = True
+                _spawn(JobService().cancel_async(job_id), "cancel job")
+
+        proxy = create_proxy(_on_click)
+        self._proxies.append(proxy)
+        body.addEventListener("click", proxy)
+        modal.show()
+        bar_state = {"running": "active", "done": "done", "failed": "error", "cancelled": "paused"}
+        seen = 0
+        while True:
+            status = await JobService().status_async(job_id, seen)
+            if not status.get("ok"):
+                state_el.setAttribute("data-state", "failed")
+                state_el.textContent = status.get("error", "The job is gone")
+                return
+            seen = status["log_total"]
+            bars = []
+            for item in status["items"]:
+                total, done = item.get("total") or 0, item.get("done") or 0
+                bars.append(progress_html(done if total else (0 if item["state"] == "running" else 1),
+                                          total or 1, label=item["label"],
+                                          text=item.get("note") or format_bytes(done),
+                                          state=bar_state.get(item["state"], "active")))
+            items_el.innerHTML = "".join(bars) or '<div class="bk-hint">Starting…</div>'
+            if status["log"]:
+                log_el.textContent = str(log_el.textContent) + "\n".join(status["log"]) + "\n"
+                log_el.scrollTop = log_el.scrollHeight
+            body.querySelector('[data-j="elapsed"]').textContent = f"{status['elapsed']:.0f} s"
+            state = status["state"]
+            label = {
+                "running": "Cancelling…" if status.get("cancelling") else "Running…",
+                "done": "Done", "failed": f"Failed: {status.get('error', '')}",
+                "cancelled": "Cancelled: nothing was imported (rolled back)",
+            }.get(state, state)
+            icon = {"running": "mdi-progress-clock", "done": "mdi-check-circle",
+                    "failed": "mdi-alert-circle", "cancelled": "mdi-stop-circle"}.get(state, "mdi-circle")
+            state_el.setAttribute("data-state", state)
+            state_el.innerHTML = f'<span class="mdi {icon}"></span><span>{_esc(label)}</span>'
+            cancel_el.hidden = state != "running"
+            if state != "running":
+                break
+            await asyncio.sleep(0.5)
+        if state == "done":
+            result = status.get("result") or {}
+            skipped = result.get("skipped") or 0
+            self._toast(f"Imported {_count(result.get('inserted'))} rows into {name}"
+                        + (f"; skipped {_count(skipped)}" if skipped else "") + ".",
+                        kind="warning" if skipped else "success")
+            for tid in self._tabs_of(loc, name):
+                if not self._tabs[tid].get("pending"):
+                    _spawn(self._browse(tid, with_count=True), "refresh after import")
 
     async def _reload_location(self, loc: tuple) -> None:
         conn_id, db, schema = loc
@@ -3222,7 +4384,17 @@ class Basilisk(MainWindow):
     <button type="button" class="bk-btn" data-bk="value_panel" id="{tid}-res-value" hidden
       title="Show the focused cell's whole value (F7; Shift+Enter on a cell)">
       <span class="mdi mdi-dock-right"></span><span>Value</span></button>
+    <span class="bk-res-tools" id="{tid}-res-tools" hidden>
+      <button type="button" class="bk-btn" data-bk="col_filter" title="Filter the rows by a column">
+        <span class="mdi mdi-filter-plus-outline"></span></button>
+      <button type="button" class="bk-btn" data-bk="columns" title="Show, hide and freeze columns">
+        <span class="mdi mdi-view-column-outline"></span></button>
+      <button type="button" class="bk-btn" data-bk="freeze" id="{tid}-freeze" aria-pressed="false"
+        title="Freeze the first column while scrolling sideways">
+        <span class="mdi mdi-pin-outline"></span></button>
+    </span>
   </div>
+  <div class="bk-chips" id="{tid}-chips" hidden></div>
   <div class="bk-status" id="{tid}-status" hidden></div>
   <div class="bk-results">
     <div class="bk-panel bk-vp-grid" id="{tid}-grid"></div>
@@ -3382,6 +4554,8 @@ class Basilisk(MainWindow):
             _spawn(self._result_export(tid), "export")
         elif action == "value_panel":
             self._vp_toggle(tid)
+        elif action in ("col_filter", "columns", "freeze", "unfilter", "clear_filters"):
+            self._grid_tool(tid, action, button)
 
     def _sql_busy(self, tid: str, busy: bool) -> None:
         for suffix in ("explain", "analyze"):
@@ -3787,6 +4961,7 @@ class Basilisk(MainWindow):
         tab = self._tabs[tid]
         entries = result.get("results") or []
         tab["results"] = [entry for entry in entries if entry.get("columns")]
+        tab["rfilters"] = []
         lines = []
         for entry in entries:
             first = entry["sql"].strip().splitlines()[0][:120] if entry["sql"].strip() else ""
@@ -3851,6 +5026,8 @@ class Basilisk(MainWindow):
 
     def _show_result(self, tid: str, index: int) -> None:
         tab = self._tabs[tid]
+        if tab.get("shown") != index and 0 <= index < len(tab.get("results") or []):
+            tab["rfilters"] = []        # another result: its own columns
         tab["shown"] = index
         for button in js.document.querySelectorAll(f'#{tid}-restabs .bk-restab'):
             button.setAttribute("aria-selected",
@@ -3865,27 +5042,18 @@ class Basilisk(MainWindow):
         _el(f"{tid}-plan").hidden = index != -2
         _el(f"{tid}-res-csv").hidden = not showing_rows
         _el(f"{tid}-res-export").hidden = not showing_rows
+        _el(f"{tid}-res-tools").hidden = not showing_rows
+        self._draw_chips(tid)
         summary = _el(f"{tid}-summary")
         if not showing_rows:
             summary.textContent = ""
             return
         entry = tab["results"][index]
-        summary.textContent = (f"{_count(entry['rowcount'])} rows"
-                               + (" · more not fetched" if entry.get("more") else "")
-                               + f" · {entry['ms']} ms")
         columns = [ColumnConfig(id=f"c{i}", header=name, width=_column_width(name),
                                 align="right" if entry["kinds"][i] == "num" else None,
                                 cell_class_by=_CLS + f"c{i}")
                    for i, name in enumerate(entry["columns"])]
-        cut = {(r, c) for r, c in entry.get("truncated") or []}
-        rows = []
-        for r, values in enumerate(entry["rows"]):
-            row = {_ID: f"r{r}"}
-            for c, value in enumerate(values):
-                row[f"c{c}"] = value
-                row[_CLS + f"c{c}"] = " ".join(
-                    cls for cls, on in (("bk-null", value is None), ("bk-cut", (r, c) in cut)) if on)
-            rows.append(row)
+        rows = self._result_rows(tid, entry)
         if tab["grid"] is None:
             tab["grid"] = DataTable(DataTableConfig(
                 columns=columns, rows=rows, id_field=_ID, selection="multi",
@@ -3893,7 +5061,12 @@ class Basilisk(MainWindow):
                 context_actions=[
                     TableAction("value", "View value  (Shift+Enter)", "mdi-text-box-search-outline"),
                     TableAction("copy_row", "Copy row as JSON", "mdi-code-json"),
-                    TableAction("copy_rows", "Copy selected as TSV", "mdi-content-copy")],
+                    TableAction("copy_rows", "Copy selected as TSV", "mdi-content-copy"),
+                    TableAction("copy_insert", "Copy as INSERT", "mdi-database-import-outline"),
+                    TableAction("copy_md", "Copy as Markdown", "mdi-language-markdown-outline"),
+                    TableAction(separator=True),
+                    TableAction("filter_col", "Filter column…", "mdi-filter-plus-outline"),
+                    TableAction("hide_col", "Hide this column", "mdi-eye-off-outline")],
             ), container=grid_host)
             tab["grid"].on_action(lambda payload: _spawn(self._result_action(tid, payload),
                                                          "result action"))
@@ -3903,9 +5076,34 @@ class Basilisk(MainWindow):
         else:
             tab["grid"].set_columns(columns)
             tab["grid"].set_rows(rows)
+        self._set_frozen(tid, frozen_count(self._settings.get("freeze_results")))
+        self._result_summary(tid)
         tab["focus_cell"] = None
         if tab.get("vp") is not None:
             tab["vp"].reset()
+
+    def _result_rows(self, tid: str, entry: dict) -> list:
+        """The shown result's grid rows that pass the column filters; ids keep the row number."""
+        tab = self._tabs[tid]
+        cut = {(r, c) for r, c in entry.get("truncated") or []}
+        rows = []
+        for r in filter_rows(entry["rows"], entry["columns"], tab.get("rfilters") or []):
+            row = {_ID: f"r{r}"}
+            for c, value in enumerate(entry["rows"][r]):
+                row[f"c{c}"] = value
+                row[_CLS + f"c{c}"] = " ".join(
+                    cls for cls, on in (("bk-null", value is None), ("bk-cut", (r, c) in cut)) if on)
+            rows.append(row)
+        tab["rshown"] = len(rows)
+        return rows
+
+    def _result_summary(self, tid: str) -> None:
+        tab = self._tabs[tid]
+        entry = tab["results"][tab["shown"]]
+        shown = (f"{_count(tab.get('rshown'))} of {_count(entry['rowcount'])} rows"
+                 if tab.get("rfilters") else f"{_count(entry['rowcount'])} rows")
+        _el(f"{tid}-summary").textContent = (
+            shown + (" · more not fetched" if entry.get("more") else "") + f" · {entry['ms']} ms")
 
     async def _result_action(self, tid: str, payload: dict) -> None:
         tab = self._tabs[tid]
@@ -3919,6 +5117,17 @@ class Basilisk(MainWindow):
             data = {names[i]: row.get(f"c{i}") for i in range(len(names))}
             if await _copy(json.dumps(data, ensure_ascii=False, indent=2)):
                 self._toast("Copied the row as JSON.", kind="success")
+        elif payload.get("action") in ("copy_insert", "copy_md"):
+            await self._copy_rows(tid, payload, str(payload.get("action")))
+        elif payload.get("action") == "filter_col":
+            column = tab.get("menu_col") or "c0"
+            try:
+                name = names[int(column[1:])]
+            except (ValueError, IndexError):
+                return
+            self._filter_dialog(tid, name, (payload.get("row") or {}).get(column))
+        elif payload.get("action") == "hide_col":
+            self._hide_column(tid, tab.get("menu_col") or "c0")
         elif payload.get("action") == "copy_rows":
             rows = tab["grid"].get_selected_rows() or [payload.get("row") or {}]
             lines = ["\t".join(names)] + [
@@ -4641,4 +5850,81 @@ td.bk-num{font-variant-numeric:tabular-nums;}
 .bk-vp-actions{display:flex;align-items:center;gap:6px;padding:6px 8px;
   border-top:1px solid var(--bk-line);}
 .bk-vp-actions .bk-btn{padding:5px 9px;}
+
+/* A narrow table tab: the less-used buttons keep their icon and tooltip only. */
+@container (max-width: 1300px){.bk-bar .bk-btn[data-compact] > span:not(.mdi){display:none;}}
+/* Grid tools: column filter chips, the Columns dialog, frozen toggle, FK headers. */
+.bk-chips{display:flex;flex-wrap:wrap;align-items:center;gap:6px;flex:0 0 auto;padding:6px 10px;
+  background:var(--bk-panel);border-bottom:1px solid var(--bk-line);}
+.bk-chip{display:inline-flex;align-items:center;gap:5px;max-width:420px;padding:2px 4px 2px 9px;
+  border:1px solid var(--bk-accent-strong);border-radius:999px;background:rgba(245,158,11,.1);
+  color:var(--bk-text);font:12px ui-monospace,Menlo,Consolas,monospace;}
+.bk-chip .mdi{font-size:13px;color:var(--bk-accent);}
+.bk-chip-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.bk-chip-x{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;
+  padding:0;border:0;border-radius:50%;background:transparent;color:var(--bk-muted);cursor:pointer;}
+.bk-chip-x:hover,.bk-chip-x:focus-visible{background:#1e293b;color:var(--bk-text);outline:none;}
+.bk-btn[aria-pressed="true"]{color:var(--bk-accent);border-color:var(--bk-accent-strong);
+  background:#1e293b;}
+.bk-res-tools{display:inline-flex;gap:6px;}
+.bk-col-list{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:4px 12px;
+  flex:1 1 auto;min-height:0;overflow:auto;padding:4px 2px;align-content:start;}
+.bk-col-check span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.bk-mini-select{padding:3px 6px;margin:0 4px;font-family:system-ui,sans-serif;}
+.bk-inline-label{display:inline-flex;align-items:center;color:var(--bk-muted);font-size:12.5px;
+  white-space:nowrap;}
+.bk-filter-fields{display:grid;grid-template-columns:1fr 1fr 1.3fr;align-items:end;}
+th.bk-fkcol .wapyt-datatable-header-label::before,th.bk-fkcol > span:first-child::before{
+  content:"\\F0339";font-family:"Material Design Icons";color:#7dd3fc;margin-right:4px;}
+@container (max-width: 640px){.bk-col-list{grid-template-columns:repeat(2,minmax(0,1fr));}}
+
+/* Import CSV: options, the column mapping beside the preview, the job console. */
+.bk-import{height:100%;box-sizing:border-box;}
+.bk-import-file{display:flex;align-items:center;gap:10px;flex:0 0 auto;}
+.bk-import-file .bk-btn{cursor:pointer;}
+.bk-import-opts{display:grid;grid-template-columns:.9fr .8fr 1.1fr 1fr 1.15fr 1.15fr;gap:8px;
+  flex:0 0 auto;}
+.bk-import-opts .bk-input{width:100%;min-width:0;}
+.bk-import-checks{display:flex;gap:18px;flex:0 0 auto;}
+.bk-import-main{display:flex;gap:10px;flex:1 1 auto;min-height:0;}
+.bk-import-map{flex:0 0 46%;min-width:0;overflow:auto;border:1px solid var(--bk-line);border-radius:6px;}
+.bk-import-preview{position:relative;flex:1 1 auto;min-width:0;overflow:auto;
+  border:1px solid var(--bk-line);border-radius:6px;background:var(--bk-deep);}
+.bk-import-table{border-collapse:collapse;width:100%;font-size:12.5px;}
+.bk-import-table th{position:sticky;top:0;z-index:1;text-align:left;padding:5px 8px;
+  background:var(--bk-panel);color:var(--bk-muted);font:600 11px system-ui,sans-serif;
+  border-bottom:1px solid var(--bk-line);white-space:nowrap;}
+.bk-import-table td{padding:3px 8px;border-bottom:1px solid var(--bk-line);}
+.bk-import-table td .bk-input{width:100%;padding:3px 6px;}
+.bk-import-col{white-space:nowrap;}
+.bk-import-col .mdi{margin-right:4px;}
+.bk-import-col .mdi-key{color:#fbbf24;}
+.bk-import-col .mdi-alert{color:#f87171;}
+.bk-import-col small{margin-right:5px;padding:0 5px;border-radius:4px;background:#1e293b;
+  color:var(--bk-muted);font-size:10.5px;}
+.bk-import-type{max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  color:var(--bk-muted);}
+.bk-import-rows td{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  font-family:ui-monospace,Menlo,Consolas,monospace;}
+.bk-import-progress{flex:0 0 auto;}
+.bk-console{height:100%;box-sizing:border-box;}
+.bk-console-head{display:flex;align-items:center;justify-content:space-between;flex:0 0 auto;}
+.bk-console-state{display:inline-flex;align-items:center;gap:6px;font-weight:600;}
+.bk-console-state[data-state="done"]{color:#86efac;}
+.bk-console-state[data-state="failed"]{color:#fca5a5;}
+.bk-console-state[data-state="cancelled"]{color:#fbbf24;}
+.bk-console-log{min-height:120px;white-space:pre-wrap;word-break:break-word;font-size:12px;}
+@container (max-width: 760px){.bk-import-opts{grid-template-columns:repeat(3,minmax(0,1fr));}
+  .bk-import-main{flex-direction:column;}.bk-import-map{flex-basis:auto;max-height:45%;}}
+
+/* Session manager. */
+tr.bk-active td:first-child{box-shadow:inset 3px 0 0 #22c55e;}
+tr.bk-blocked td{background:rgba(245,158,11,.1);}
+tr.bk-blocked td:first-child{box-shadow:inset 3px 0 0 #f59e0b;}
+tr.bk-own td{color:var(--bk-muted);}
+.bk-danger-text{color:#fca5a5;}
+.bk-session-facts{display:grid;grid-template-columns:max-content 1fr;gap:3px 14px;margin:0;
+  flex:0 0 auto;font-size:12.5px;}
+.bk-session-facts dt{color:var(--bk-muted);}
+.bk-session-facts dd{margin:0;word-break:break-word;}
 """

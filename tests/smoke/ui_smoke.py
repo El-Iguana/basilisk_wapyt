@@ -523,6 +523,180 @@ def object_action_checks(page: Page, engine: str, name: str) -> None:
           f"{engine}: Drop removes the table and its tab")
 
 
+def clipboard(page: Page) -> str:
+    return str(page.evaluate("() => navigator.clipboard.readText()"))
+
+
+def menu(page: Page, cell, label: str) -> None:
+    cell.click(button="right")
+    page.click(f'.wapyt-datatable-menu [data-action-id]:has-text("{label}")')
+    time.sleep(0.4)
+
+
+def headers(page: Page, view: str) -> list:
+    return [t.strip() for t in page.locator(f"{view} .bk-vp-grid thead th").all_inner_texts()]
+
+
+def grid_tool_checks(page: Page, engine: str, name: str) -> None:
+    """Column layout memory, freeze, column filters, copy as, open a foreign key's row."""
+    view = ".bk-view:visible"
+    email = page.locator(f'{view} tr[data-row-id="r0"] td[data-column-id="c2"]')
+    menu(page, email, "Hide this column")
+    check("email" not in headers(page, view), f"{engine}: a column hides from the cell menu")
+    page.click(f'{view} [data-bk="freeze"]')
+    frozen = page.get_attribute(f'{view} [data-bk="freeze"]', "aria-pressed") == "true"
+    check(frozen and page.locator(f"{view} [data-frozen]").count() > 0,
+          f"{engine}: the first column freezes")
+    time.sleep(1)               # the layout is saved after a pause
+    close_tabs(page)
+    exact_tree_row(page, "customers").first.dblclick()
+    page.wait_for_selector(f'{view} tr[data-row-id="r0"]', timeout=30000)
+    time.sleep(0.5)
+    kept = "email" not in headers(page, view) and page.get_attribute(
+        f'{view} [data-bk="freeze"]', "aria-pressed") == "true"
+    check(kept, f"{engine}: hidden and frozen columns are remembered for the table")
+    page.click(f'{view} [data-bk="columns"]')
+    page.wait_for_selector(f"{modal(page)} [data-col]", timeout=10000)
+    shot(page, f"smoke-{engine}-11-columns")
+    page.click(f'{modal(page)} [data-c="reset"]')
+    time.sleep(1.5)
+    check("email" in headers(page, view) and page.get_attribute(
+        f'{view} [data-bk="freeze"]', "aria-pressed") == "false",
+          f"{engine}: Reset layout brings the columns back")
+
+    # A column filter is a WHERE condition the server runs.
+    page.click(f'{view} [data-bk="col_filter"]')
+    page.wait_for_selector(f'{modal(page)} [data-f="value"]', timeout=10000)
+    page.select_option(f'{modal(page)} [data-f="column"]', "name")
+    page.select_option(f'{modal(page)} [data-f="op"]', "starts")
+    page.fill(f'{modal(page)} [data-f="value"]', "a")
+    page.keyboard.press("Enter")
+    time.sleep(1.5)
+    names = page.locator(f'{view} tbody tr td[data-column-id="c1"]').all_inner_texts()
+    chip = page.inner_text(f"{view} .bk-chips")
+    check(len(names) == 2 and all(n.startswith("A") for n in names) and "starts with" in chip,
+          f"{engine}: a column filter narrows the rows ({names}, {chip!r})")
+    check("LIKE" in page.inner_text(f"{view} .bk-foot").upper(), f"{engine}: the filter is SQL")
+    shot(page, f"smoke-{engine}-12-filter")
+    page.click(f'{view} [data-bk="unfilter"]')
+    time.sleep(1.5)
+    check(page.locator(f"{view} .bk-vp-grid tbody tr").count() > 2
+          and not page.is_visible(f"{view} .bk-chips"),
+          f"{engine}: removing the chip shows every row")
+
+    # Copy as Markdown / INSERT.
+    first = page.locator(f'{view} tr[data-row-id="r0"] td[data-column-id="c1"]')
+    menu(page, first, "Copy as Markdown")
+    text = clipboard(page)
+    check(text.startswith("| id | name") and "|---:|" in text, f"{engine}: Copy as Markdown")
+    menu(page, first, "Copy as INSERT")
+    text = clipboard(page)
+    check(text.startswith("INSERT INTO") and "customers" in text and "VALUES (1," in text,
+          f"{engine}: Copy as INSERT ({text[:60]!r})")
+
+    # A foreign-key cell opens the row it points at.
+    exact_tree_row(page, "orders").first.dblclick()
+    page.wait_for_selector(f'{view} .bk-head:has-text("orders") ~ * tr[data-row-id="r0"], '
+                           f'{view} tr[data-row-id="r0"]', timeout=30000)
+    wait_text(page, f"{view} .bk-head", "orders")
+    time.sleep(1)
+    column = page.locator(f'{view} .bk-vp-grid th:has-text("customer_id")').first \
+        .get_attribute("data-column-id")
+    target = page.locator(f'{view} tr[data-row-id="r0"] td[data-column-id="{column}"]')
+    wanted = target.inner_text().strip()
+    menu(page, target, "Open the referenced row")
+    ok = wait_text(page, f"{view} .bk-head", "customers")
+    time.sleep(1.5)
+    where = page.input_value(f'{view} [data-role="where"]')
+    rows = page.locator(f"{view} .bk-vp-grid tbody tr").count()
+    check(ok and rows == 1 and wanted in where,
+          f"{engine}: a foreign key opens its row ({where}, {rows} rows)")
+    shot(page, f"smoke-{engine}-13-fk")
+
+
+def import_checks(page: Page, engine: str) -> None:
+    """Import a CSV file into a new table from its tree menu."""
+    page.click('.wapyt-toolbar [data-id="sql"]')
+    page.wait_for_selector(".bk-sqltab:visible .cm-content", timeout=30000)
+    tab = ".bk-sqltab:visible"
+    text_type = "nvarchar(40)" if engine == "mssql" else "varchar(40)"
+    run_sql(page, tab, f"CREATE TABLE smoke_import (id int PRIMARY KEY, label {text_type}, "
+                       "price numeric(8,2))")
+    page.click('.wapyt-toolbar [data-id="refresh"]')
+    page.wait_for_selector('.wapyt-tree-row:has(.wapyt-tree-label:text-is("smoke_import"))',
+                           timeout=30000)
+    exact_tree_row(page, "smoke_import").first.click(button="right")
+    page.click('.wapyt-tree-menu [data-action-id]:has-text("Import CSV")')
+    page.wait_for_selector(f'{modal(page)} [data-i="file"]', state="attached", timeout=15000)
+    body = "ID;Label;Price\n1;one;1.5\n2;\"two; quoted\";2\n3;three;\n"
+    page.set_input_files(f'{modal(page)} [data-i="file"]', files=[{
+        "name": "smoke.csv", "mimeType": "text/csv", "buffer": body.encode()}])
+    ok = wait_text(page, f'{modal(page)} [data-i="preview"]', "two; quoted", 10000)
+    picked = page.input_value(f'{modal(page)} [data-i="delimiter"]')
+    mapped = page.input_value(f'{modal(page)} [data-map="price"]')
+    check(ok and picked == ";" and mapped == "2",
+          f"{engine}: Import reads the file, guesses ; and maps by header")
+    shot(page, f"smoke-{engine}-13-import")
+    page.click(f'{modal(page)} [data-answer="yes"]')
+    done = wait_text(page, f"{modal(page)} .bk-console-state", "Done", 30000)
+    log = page.inner_text(f"{modal(page)} .bk-console-log") if done else ""
+    check(done and "Imported 3 rows" in log, f"{engine}: the import job finishes ({log[-60:]!r})")
+    page.click(f'{modal(page)} [data-job="close"]')
+    run_sql(page, tab, "SELECT COUNT(*) AS n, SUM(price) AS total FROM smoke_import")
+    cells = page.locator(f'{page_grid(tab)} tr[data-row-id="r0"] td[data-column-id]') \
+        .all_inner_texts()
+    check(cells[:1] == ["3"] and cells[1].startswith("3.5"), f"{engine}: imported rows ({cells})")
+    run_sql(page, tab, "DROP TABLE smoke_import")
+    result_grid_checks(page, engine, tab)
+
+
+def result_grid_checks(page: Page, engine: str, tab: str) -> None:
+    """A query result: a column filter on the fetched rows, freeze, Copy as INSERT."""
+    run_sql(page, tab, "SELECT id, name FROM customers ORDER BY id")
+    grid = page_grid(tab)
+    page.click(f'{tab} [data-bk="col_filter"]')
+    page.wait_for_selector(f'{modal(page)} [data-f="value"]', timeout=10000)
+    page.select_option(f'{modal(page)} [data-f="column"]', "name")
+    page.fill(f'{modal(page)} [data-f="value"]', "an")
+    page.click(f'{modal(page)} [data-answer="yes"]')
+    time.sleep(0.8)
+    names = page.locator(f'{grid} tbody td[data-column-id="c1"]').all_inner_texts()
+    summary = page.inner_text(f"{tab} [id$='-summary']")
+    check(names and all("an" in n.lower() for n in names) and "of 14 rows" in summary,
+          f"{engine}: a result filters by a column ({len(names)}; {summary})")
+    page.click(f'{tab} [data-bk="freeze"]')
+    check(page.locator(f"{grid} [data-frozen]").count() > 0, f"{engine}: a result freezes")
+    page.click(f'{tab} [data-bk="freeze"]')
+    shot(page, f"smoke-{engine}-15-result")
+    menu(page, page.locator(f'{grid} tr[data-row-id] td[data-column-id="c1"]').first,
+         "Copy as INSERT")
+    text = clipboard(page)
+    check(text.startswith("INSERT INTO customers (") and "VALUES (" in text,
+          f"{engine}: a result copies as INSERT into its table ({text[:50]!r})")
+
+
+def session_checks(page: Page, engine: str, name: str) -> None:
+    """The server's sessions in their own tab."""
+    exact_tree_row(page, name).first.click(button="right")
+    page.click('.wapyt-tree-menu [data-action-id]:has-text("Sessions")')
+    if engine == "sqlite":
+        check(wait_text(page, "body", "no server sessions"), "sqlite: no sessions to list")
+        return
+    view = ".bk-view:visible"
+    ok = wait_text(page, f"{view} .bk-head-stats", "session", 20000)
+    rows = page.locator(f"{view} tbody tr").count()
+    check(ok and rows >= 1 and wait_text(page, f"{view} tbody", "★"),
+          f"{engine}: Sessions lists the server's sessions ({rows})")
+    page.check(f'{view} [data-role="s_idle"]')
+    time.sleep(1.5)
+    check(page.locator(f"{view} tbody tr").count() >= rows, f"{engine}: idle sessions show too")
+    page.locator(f"{view} tbody tr").first.dblclick()
+    check(wait_text(page, f"{modal(page)} .bk-session-facts", "User"),
+          f"{engine}: a session opens its details")
+    shot(page, f"smoke-{engine}-14-sessions")
+    page.click(f'{modal(page)} [data-s="close"]')
+
+
 def close_tabs(page: Page) -> None:
     for _ in range(10):
         close = page.locator(".wapyt-tab-close").first
@@ -552,7 +726,9 @@ def main() -> int:
     engines = sys.argv[1:] or list(ENGINES)
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
-        page = browser.new_page(viewport={"width": 1440, "height": 900})
+        context = browser.new_context(viewport={"width": 1440, "height": 900})
+        context.grant_permissions(["clipboard-read", "clipboard-write"])
+        page = context.new_page()
         page.on("console", lambda m: console.append(f"{m.type}: {m.text}")
                 if m.type == "error" else None)
         page.on("pageerror", lambda e: console.append(f"pageerror: {e}"))
@@ -578,6 +754,13 @@ def main() -> int:
                 navigator_checks(page, engine)
                 close_tabs(page)
                 object_action_checks(page, engine, name)
+                close_tabs(page)
+                open_customers(page, engine, name)
+                grid_tool_checks(page, engine, name)
+                close_tabs(page)
+                import_checks(page, engine)
+                close_tabs(page)
+                session_checks(page, engine, name)
             except Exception as exc:  # noqa: BLE001 - report and carry on
                 check(False, f"{engine}: {type(exc).__name__}: {str(exc).splitlines()[0]}")
                 shot(page, f"smoke-{engine}-error")

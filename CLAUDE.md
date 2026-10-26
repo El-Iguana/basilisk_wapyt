@@ -41,18 +41,25 @@ appcode/                   # pytincture modules_path
     sessions.py            #   manual commit mode: pinned connection per SQL tab, idle reaper — plain module
     sqlops.py              #   everything done to a database; the running-statement registry
     ddl.py                 #   object actions' statements (create/rename/drop/truncate, columns, indexes) — pure
+    csv_import.py          #   CSV import: option checks, the import job — plain module
+    jobs.py                #   background jobs with progress (from Monguana) + import plans — plain module
+    job_service.py         #   BFF: plan an import, follow / cancel a job
     values.py              #   driver values <-> grid text; lossless row keys; typed coercion
     plans.py               #   explain plans from every engine in one tree shape (pure parsers)
     connection_service.py  #   BFF: profiles, test, disconnect
     sql_service.py         #   BFF: thin front for sqlops (tree, table, browse, save, execute…)
     user_service.py, ui_state_service.py, about*.py, release_check.py   # from Monguana
-    transfer.py            #   plain routes under /bk: table export (GET), query export (POST), one cell (GET)
+    transfer.py            #   plain routes under /bk: table export (GET), query export (POST), one cell (GET),
+                           #   CSV import upload (POST)
   ui/value_panel.py        #   the value panel (Pyodide; pure helpers at the top, tested in CPython)
+  ui/grid_tools.py         #   grids: column layouts, column filters, copy as INSERT / Markdown, FK rows — pure
+  ui/import_tools.py       #   the Import CSV dialog: sniffing, preview, column matching — pure
   static/                  #   basilisk_avatar.webp: logo, login page, favicon, About
   vendor/codemirror/       #   the SQL editor bundle (built, committed), served at /vendor
 docs/basilisk.webp         # the README's picture (both cut from the original artwork, 1254 px)
 tools/codemirror/          # its recipe: pinned package.json, entry.js, build.sh
-tests/                     # test_units.py, test_plans.py, test_value_panel.py, test_bff_state.py, test_live.py (needs the databases)
+tests/                     # test_units.py, test_plans.py, test_value_panel.py, test_grid_tools.py,
+                           # test_import_tools.py, test_bff_state.py, test_live.py (needs the databases)
 tests/smoke/               # seed_sample.py + ui_smoke.py (Playwright, all four engines)
 Containerfile, scripts/podman-run.sh   # image + dev container "basilisk"
 ```
@@ -80,6 +87,7 @@ python manage.py reset-password admin                    # clears the change-pas
 | `BASILISK_BIND` | `0.0.0.0` | listen address (`.env.example` sets 127.0.0.1) |
 | `BASILISK_CANONICAL_ORIGIN`, `_ALLOWED_HOSTS` | loopback | behind a TLS proxy |
 | `BASILISK_UPDATE_CHECK` | on | GitHub latest-release check in About |
+| `BASILISK_IMPORT_MAX_BYTES` | 1 GiB | largest CSV file an import accepts |
 
 ### Test databases
 
@@ -93,8 +101,8 @@ podman run -d --name basilisk-mysql -p 127.0.0.1:53306:3306 -e MYSQL_ROOT_PASSWO
 podman run -d --name basilisk-mssql -p 127.0.0.1:51433:1433 -e ACCEPT_EULA=Y \
   -e MSSQL_SA_PASSWORD="$PW" -e MSSQL_PID=Developer mcr.microsoft.com/mssql/server:2022-latest
 uv run python tests/smoke/seed_sample.py          # the shop sample in all four (SQLite: data/sqlite/shop.db)
-uv run --group dev pytest -q tests/test_live.py   # 100 live tests
-BASILISK_PASS=… python3 tests/smoke/ui_smoke.py   # ~31 UI checks per engine
+uv run --group dev pytest -q tests/test_live.py   # 108 live tests
+BASILISK_PASS=… python3 tests/smoke/ui_smoke.py   # ~80 UI checks per engine
 ```
 
 Users: `postgres` / `root` / `sa`. The sample (`seed_sample.py`): customers,
@@ -276,6 +284,77 @@ remembered per user (`settings.value_panel`).
   The Columns and Keys & indexes pages have the buttons for any table on a
   writable connection (no primary key needed).
 
+### Grids: layouts, column filters, copy as, foreign keys (milestone 2)
+
+Pure helpers in `ui/grid_tools.py`; the page draws.
+
+- **Column layout** per table and user in `ui_state` (`columns:<conn>:<db>:<schema>:<table>`):
+  `{order, widths, hidden, frozen}` by column **name** (grid ids are `c<i>`
+  by result position). wapyt's `columns` event (resize, reorder, hide, show)
+  feeds `merge_layout`, saved 0.4 s after the last change; `apply_layout`
+  orders the next page's columns, skipping gone ones and appending new ones,
+  and never hides them all. Columns… shows / hides, sets how many to freeze
+  and resets. Query results are not saved (their shape follows the SQL); their
+  frozen count is a setting (`settings.freeze_results`).
+- **Column filters** are chips. On a table they become WHERE conditions
+  (`filter_sql`, ANDed with the typed WHERE by `where_with_filters`), so they
+  filter every row, count, export and "SQL" too; values are always literals
+  (`literal`: a "number" that is not one is quoted). Contains / starts with
+  use `LIKE … ESCAPE '!'` (PostgreSQL `ILIKE` on `CAST(… AS TEXT)`, SQL
+  Server `CAST(… AS NVARCHAR(MAX))`, whose `[` is also escaped). **MySQL
+  string literals double backslashes** (`text_literal`). On a result,
+  `filter_rows` filters the fetched rows; row ids keep their row number, so
+  the value panel still finds its cell.
+- **Copy as INSERT / Markdown**: the clicked row or the selection it is in,
+  visible columns in display order. Tables fetch cut values whole
+  (`_full_text`); a result says how many were cut. A result's INSERT target
+  is `table_of_query` (one plain `FROM t`, quoted names and strings masked
+  before looking for keywords, so `"Order Items"` is no ORDER BY), else
+  `table_name`.
+- **Open the referenced row**: `foreign_key_for` (single-column keys first)
+  and `reference_where` build `ref_col = value` for the referenced table,
+  opened (or refiltered) with that WHERE. FK columns get a link icon in the
+  header (`bk-fkcol`).
+
+### Import CSV (`csv_import.py`, milestone 2)
+
+- The dialog reads the first 256 KB in the browser (`File.slice`), guesses
+  encoding (UTF-16 BOM, UTF-8, else Windows-1252) and delimiter, maps columns
+  by header name (case, spaces, underscores ignored) or by position, and
+  previews what will be stored. `JobService.plan_import` checks everything
+  against the reflected table **before the upload** and keeps a plan
+  (`jobs.put_plan`, per user, 15 minutes, used once); `POST /bk/import/<plan>`
+  takes the raw file (XHR, for upload progress), writes it to `data/jobs`
+  and starts the job; the console polls `JobService.status`.
+- `csv_import.run` coerces each field with `values.coerce` (the grid's rules)
+  and inserts 500 rows per `executemany`, all in **one transaction**: a
+  field that does not convert (unless "skip its row"), a row the database
+  refuses (named by its rows in the file) or Cancel rolls everything back.
+  "Delete them first" is a `DELETE` in the same transaction (not TRUNCATE,
+  which MySQL commits). An empty field in a non-text column is NULL even when
+  empty fields are kept as empty text.
+- Self-numbering columns: `import_wrappers` gives SQL Server
+  `SET IDENTITY_INSERT … ON/OFF` when one is mapped, and PostgreSQL a
+  `setval(pg_get_serial_sequence(…), MAX + 1, false)` afterwards so the next
+  insert does not collide. MySQL and SQLite move on by themselves.
+- `csv.reader` gives `[]` for a blank line but `['']` for a line that is
+  just `""`, a real empty value: only `[]` is skipped.
+
+### Session manager (milestone 2)
+
+A **Sessions** tab per server (navigator menu): `Engine.list_sessions`
+(`pg_stat_activity` client backends; `SHOW FULL PROCESSLIST`;
+`sys.dm_exec_sessions` + requests + `dm_exec_sql_text`) normalised by
+`sqlops.sessions`; idle sessions hidden unless asked (SQL Server shows
+sleeping ones holding a transaction, which every pymssql connection does).
+Refreshed every 5 s while the tab is in front. The asking connection is
+marked ★ and cannot be stopped. **Cancel query**: `pg_cancel_backend`,
+`KILL QUERY`; **End session**: `pg_terminate_backend`, `KILL`. SQL Server
+has only `KILL`, which refuses to run inside a transaction: it runs on a raw
+auto-commit connection that is then thrown away. Refused on read-only
+profiles; production asks in red. The pool pre-pings, so ending one of
+Basilisk's own pooled connections costs nothing but that statement.
+
 ### SQL editor
 
 CodeMirror 6 + `@codemirror/lang-sql` (dialect per engine, schema completion
@@ -389,6 +468,11 @@ pins each parser on captured output.
   script leaves pymssql's state behind; use the Commit button.
 - **MySQL commits implicitly on DDL** (CREATE, ALTER, DROP…), even in manual
   mode; the indicator, which counts statements, cannot tell.
+- **A multi-select DataTable's first cell is its checkbox**: in tests, find
+  cells by `data-column-id`, never by position. A tab's hidden sub-pages hold
+  grids too, so scope row counts to `.bk-vp-grid`.
+- **`io.TextIOWrapper` needs a buffered stream**: a counting wrapper is an
+  `io.RawIOBase` inside `io.BufferedReader`.
 
 ## Conventions
 

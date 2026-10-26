@@ -126,6 +126,62 @@ class SQLServer(Engine):
         finally:
             raw.invalidate()
 
+    has_sessions = True
+    can_cancel_query = False    # KILL ends the session; there is no "cancel the query" of another
+
+    def list_sessions(self, conn: Any, include_idle: bool) -> list:
+        from sqlalchemy import text
+
+        rows = conn.execute(text(
+            "SELECT s.session_id, s.login_name, DB_NAME(COALESCE(r.database_id, s.database_id)), "
+            "  COALESCE(NULLIF(s.host_name, ''), c.client_net_address), s.program_name, "
+            "  COALESCE(r.status, s.status), COALESCE(r.start_time, s.last_request_end_time), "
+            "  DATEDIFF(SECOND, COALESCE(r.start_time, s.last_request_end_time), GETDATE()), "
+            "  r.wait_type, NULLIF(r.blocking_session_id, 0), "
+            "  CAST(t.text AS NVARCHAR(MAX)), CASE WHEN s.session_id = @@SPID THEN 1 ELSE 0 END, "
+            "  s.open_transaction_count "
+            "FROM sys.dm_exec_sessions s "
+            "LEFT JOIN sys.dm_exec_requests r ON r.session_id = s.session_id "
+            "OUTER APPLY (SELECT TOP 1 x.client_net_address, x.most_recent_sql_handle "
+            "  FROM sys.dm_exec_connections x WHERE x.session_id = s.session_id) c "
+            "OUTER APPLY sys.dm_exec_sql_text(COALESCE(r.sql_handle, c.most_recent_sql_handle)) t "
+            "WHERE s.is_user_process = 1 "
+            + ("" if include_idle else
+               "AND (r.session_id IS NOT NULL OR s.open_transaction_count > 0) ")
+            + "ORDER BY CASE WHEN r.session_id IS NULL THEN 1 ELSE 0 END, r.start_time")).all()
+        return [{
+            "id": row[0], "user": row[1], "database": row[2], "client": row[3],
+            "application": row[4], "state": row[5], "started": row[6], "seconds": row[7],
+            "wait": row[8], "blocked_by": [row[9]] if row[9] else [], "query": row[10],
+            "own": bool(row[11]), "txn": bool(row[12]),
+        } for row in rows]
+
+    def kill_session(self, engine: Any, conn: Any, session_id: int, mode: str) -> str:
+        # KILL refuses to run inside a transaction, and pymssql always has one
+        # open: a raw connection in auto-commit, thrown away after.
+        sql = f"KILL {int(session_id)}"
+        raw = engine.raw_connection()
+        try:
+            raw.dbapi_connection.autocommit(True)
+            cur = raw.cursor()
+            cur.execute(sql)
+            cur.close()
+        finally:
+            raw.invalidate()
+        return sql
+
+    def import_wrappers(self, conn: Any, prep: Any, schema: Optional[str], table: str,
+                        columns: list) -> tuple:
+        from sqlalchemy import text
+
+        name = self.qualified(prep, schema or "dbo", table)
+        numbered = conn.execute(text(
+            "SELECT name FROM sys.identity_columns WHERE object_id = OBJECT_ID(:table)"),
+            {"table": name}).scalar()
+        if numbered is None or numbered not in columns:
+            return [], []
+        return [f"SET IDENTITY_INSERT {name} ON"], [f"SET IDENTITY_INSERT {name} OFF"]
+
     def list_databases(self, conn: Any) -> list:
         from sqlalchemy import text
 

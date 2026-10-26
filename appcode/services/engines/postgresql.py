@@ -94,6 +94,55 @@ class PostgreSQL(Engine):
         # Thread-safe: sends a cancel request on a side channel.
         dbapi_conn.cancel_safe(timeout=5)
 
+    def import_wrappers(self, conn: Any, prep: Any, schema: Optional[str], table: str,
+                        columns: list) -> tuple:
+        """After explicit values in a serial or identity column, move its sequence past them."""
+        from sqlalchemy import text
+
+        name = self.qualified(prep, schema, table)
+        after = []
+        for column in columns:
+            sequence = conn.execute(text("SELECT pg_get_serial_sequence(:table, :column)"),
+                                    {"table": name, "column": column}).scalar()
+            if sequence:
+                quoted = "'" + sequence.replace("'", "''") + "'"
+                after.append(f"SELECT setval({quoted}, COALESCE(MAX({prep.quote(column)}), 0) + 1, "
+                             f"false) FROM {name}")
+        return [], after
+
+    has_sessions = True
+
+    def list_sessions(self, conn: Any, include_idle: bool) -> list:
+        from sqlalchemy import text
+
+        rows = conn.execute(text(
+            "SELECT pid, usename, datname, "
+            "  COALESCE(host(client_addr), CASE WHEN client_port = -1 THEN 'local socket' END), "
+            "  application_name, state, "
+            "  CASE WHEN state = 'active' THEN query_start ELSE state_change END, "
+            "  EXTRACT(EPOCH FROM clock_timestamp() - "
+            "    CASE WHEN state = 'active' THEN query_start ELSE state_change END), "
+            "  CASE WHEN wait_event IS NOT NULL THEN wait_event_type || ': ' || wait_event END, "
+            "  pg_blocking_pids(pid), query, pid = pg_backend_pid(), xact_start IS NOT NULL "
+            "FROM pg_stat_activity WHERE backend_type = 'client backend' "
+            + ("" if include_idle else "AND state IS DISTINCT FROM 'idle' ")
+            + "ORDER BY state = 'active' DESC, query_start NULLS LAST")).all()
+        return [{
+            "id": row[0], "user": row[1], "database": row[2], "client": row[3],
+            "application": row[4], "state": row[5], "started": row[6], "seconds": row[7],
+            "wait": row[8], "blocked_by": list(row[9] or []), "query": row[10], "own": row[11],
+            "txn": bool(row[12]),
+        } for row in rows]
+
+    def kill_session(self, engine: Any, conn: Any, session_id: int, mode: str) -> str:
+        from sqlalchemy import text
+
+        function = "pg_cancel_backend" if mode == "cancel" else "pg_terminate_backend"
+        done = conn.execute(text(f"SELECT {function}(:pid)"), {"pid": int(session_id)}).scalar()
+        if not done:
+            raise EngineError(f"Session {session_id} is gone, or this login may not stop it")
+        return f"SELECT {function}({int(session_id)})"
+
     def list_databases(self, conn: Any) -> list:
         from sqlalchemy import text
 

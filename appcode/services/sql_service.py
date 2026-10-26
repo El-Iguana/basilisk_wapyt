@@ -107,6 +107,14 @@ class SqlService:
     def script(self, conn_id: int, database: str, schema: str, name: str, kind: str) -> dict:
         return self._call("script", int(conn_id), database or "", schema or "", name, kind)
 
+    # Session manager ----------------------------------------------------------
+
+    def sessions(self, conn_id: int, include_idle: bool = False) -> dict:
+        return self._call("sessions", int(conn_id), bool(include_idle))
+
+    def kill_session(self, conn_id: int, session_id: int, mode: str = "cancel") -> dict:
+        return self._call("kill_session", int(conn_id), int(session_id), str(mode or ""))
+
     # SQL editor --------------------------------------------------------------
 
     def execute(self, conn_id: int, database: str, sql: str, mode: str = "script",

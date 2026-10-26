@@ -25,6 +25,16 @@ running in Pyodide) and the wapyt widget set.
   one transaction), add / duplicate / delete rows, Set NULL, filter by a
   cell's value; columns, keys, indexes, foreign keys (double-click to follow)
   and DDL.
+- **Grids**: column filters (shown as chips; on a table they filter every row
+  on the server), hide, move and resize columns (remembered per table),
+  freeze the first columns, copy rows as INSERT statements or a Markdown
+  table, and open the row a foreign-key cell points at.
+- **Import CSV** into a table: the delimiter and encoding are guessed,
+  columns are matched by name, a preview shows what will be stored. The whole
+  file goes in one transaction, with a progress bar and Cancel.
+- **Sessions**: what is running on a PostgreSQL, MySQL / MariaDB or SQL
+  Server server, refreshed every few seconds, with Cancel query and End
+  session.
 - **Value panel** (F7, or Shift+Enter on a cell): the whole value of the
   focused cell beside the grid, as text, pretty JSON, a hex dump or a
   picture. Edit long text, JSON and binary there, load a value from a file or
