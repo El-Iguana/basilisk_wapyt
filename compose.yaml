@@ -1,0 +1,79 @@
+# Basilisk with Docker Compose or Podman Compose, on Linux, Windows or macOS.
+# Full instructions: INSTALL.md.
+#
+#   cp .env.example .env        # then set BASILISK_ADMIN_PASS
+#   docker compose up -d --build        (or: podman compose up -d --build)
+#   open http://127.0.0.1:8768/basilisk
+#
+# Optional PostgreSQL to try it with (profile "postgres"; host "postgres",
+# port 5432, user "postgres"):
+#   docker compose --profile postgres up -d --build
+
+name: basilisk
+
+services:
+
+  basilisk:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: localhost/basilisk:latest
+    container_name: basilisk
+    hostname: basilisk
+    labels:
+      app: Basilisk
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      BASILISK_DATA_DIR: /data
+      # The browser-facing origin. Loopback only unless you put TLS in front
+      # (INSTALL.md, "Reaching Basilisk from other machines").
+      BASILISK_CANONICAL_ORIGIN: ${BASILISK_CANONICAL_ORIGIN:-http://${BASILISK_HOST:-127.0.0.1}:${BASILISK_PORT:-8768}}
+      BASILISK_ALLOWED_HOSTS: ${BASILISK_ALLOWED_HOSTS:-}
+      # Inside the container it listens everywhere; the published port below
+      # is what keeps it on this computer.
+      BASILISK_BIND: 0.0.0.0
+    ports:
+      # Loopback on purpose: pytincture only serves authenticated plain HTTP
+      # to a loopback address, and Basilisk holds credentials for your
+      # databases.
+      - "${BASILISK_HOST:-127.0.0.1}:${BASILISK_PORT:-8768}:8768"
+    extra_hosts:
+      # "host.docker.internal" reaches database servers on this computer.
+      # Docker Desktop and Podman provide it already; this adds it on Docker
+      # Engine (Linux).
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - basilisk-data:/data
+      # SQLite and DuckDB files live in /data/sqlite, on the volume. To open
+      # files from this computer instead, mount a folder over it (INSTALL.md,
+      # "SQLite and DuckDB files"), e.g.:
+      # - ./databases:/data/sqlite:z
+    healthcheck:
+      test: ["CMD", "python", "manage.py", "health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
+
+  # A PostgreSQL to try Basilisk with. Only started with --profile postgres.
+  # In Basilisk, add a connection: PostgreSQL, host "postgres", port 5432,
+  # user "postgres", password POSTGRES_PASSWORD from .env (default
+  # "change-me-too").
+  postgres:
+    profiles: ["postgres"]
+    image: docker.io/library/postgres:17
+    container_name: basilisk-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-too}
+    volumes:
+      - basilisk-postgres:/var/lib/postgresql/data
+
+volumes:
+  basilisk-data:
+    # Named explicitly so it is the same whatever folder this was cloned into.
+    name: basilisk-data
+  basilisk-postgres:
+    name: basilisk-postgres

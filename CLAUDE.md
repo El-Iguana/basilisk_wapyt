@@ -71,6 +71,10 @@ tests/                     # test_units.py, test_plans.py, test_value_panel.py, 
                            # test_bff_state.py, test_live.py (needs the databases)
 tests/smoke/               # seed_sample.py + ui_smoke.py (Playwright, all four engines)
 Containerfile, scripts/podman-run.sh   # image + dev container "basilisk"
+compose.yaml, compose.host-network.yaml   # users' installs (INSTALL.md); volume basilisk-data
+INSTALL.md, docs/UPGRADE_TEST.md       # the install guide; the hand test for an in-place update
+tools/windows/             # native Windows install: build.py, launcher.py, basilisk.iss, basilisk.ico
+.github/workflows/windows.yml          # Windows: unit tests, build setup.exe, install/start/stop/uninstall
 ```
 
 ## Running
@@ -93,7 +97,8 @@ python manage.py reset-password admin                    # clears the change-pas
 | `BASILISK_SECRET_KEY` / `_SESSION_SECRET` | generated into files | credential key / cookie key |
 | `PORT` | `8768` | |
 | `BASILISK_HOST` | `127.0.0.1` | loopback address the app is reached on |
-| `BASILISK_BIND` | `0.0.0.0` | listen address (`.env.example` sets 127.0.0.1) |
+| `BASILISK_BIND` | `BASILISK_HOST` (the image: `0.0.0.0`) | listen address |
+| `BASILISK_PORT` | `8768` | compose only: the published (host) port |
 | `BASILISK_CANONICAL_ORIGIN`, `_ALLOWED_HOSTS` | loopback | behind a TLS proxy |
 | `BASILISK_UPDATE_CHECK` | on | GitHub latest-release check in About |
 | `BASILISK_IMPORT_MAX_BYTES` | 1 GiB | largest CSV file an import accepts |
@@ -642,6 +647,44 @@ pins each parser on captured output.
   `est_rows × loops`. An estimate off by 10x (with 100+ rows) gets a warning
   icon. Double-click a node for every field the engine gave.
 - **Raw** shows the engine's own JSON, text or XML.
+
+## Installing (users): compose, Windows
+
+**INSTALL.md** is the users' guide; keep it true when the image, the compose
+files, the launcher or the ports change, and its section 10 says what was
+tested. Traps, all measured (2026-10-26), most shared with Monguana (read its
+CLAUDE.md, *How the image is built* and *Native Windows install*):
+
+- **`BASILISK_BIND` is not in `.env.example` any more**, and the server
+  defaults to `BASILISK_HOST`. `docker run --env-file .env` used to override
+  the image's `0.0.0.0` with `127.0.0.1` and the published port answered
+  nothing. The compose files still set it (0.0.0.0 bridged, the host address
+  with host networking).
+- **From a bridge network, `host.*.internal` does not reach the host's
+  127.0.0.1** (timed out here): the test databases are published on
+  127.0.0.1, so they need `compose.host-network.yaml` (or a bundled server,
+  `--profile postgres`). `manage.py probe` tells the cases apart.
+- Container, image and volume names are fixed (`basilisk`, `basilisk-data`), so
+  a ZIP update in a new folder takes over the same data. The dev container
+  (`scripts/podman-run.sh`) uses the volume **`basilisk_data`** (underscore):
+  separate data.
+- **The Windows bundle** (`tools/windows/build.py`, Monguana's builder) is the
+  official embeddable CPython plus Windows wheels from `uv.lock` (`uv pip
+  --python-platform`, `--only-binary`): every driver has one (psycopg-binary,
+  pymssql, DuckDB ~60 MB of the ~150 MB). It builds on Linux; only Inno Setup
+  needs Windows. `uv run python build/windows/bundle/app/basilisk_launcher.py
+  --check` (with `BASILISK_DATA_DIR` set) tests the launcher here.
+- The launcher runs on **127.0.0.1**, ports 8768–8799 (Monguana keeps
+  127.0.0.2: Basilisk's cookies are namespaced, so it needs no own address);
+  `BASILISK_SQLITE_ROOT` is `%LOCALAPPDATA%\Basilisk\databases` (tray:
+  *Database files folder*). The uninstaller's "delete your data" says it
+  deletes those files too; the default keeps everything.
+- **The installer's AppId** (`basilisk.iss`) must never change: Windows
+  matches upgrades and the uninstaller by it.
+- A `v*` tag runs the workflow and attaches `Basilisk-<version>-setup.exe` to
+  the release (created if missing). The image installs `requirements.txt` with
+  pip, which resolves older packages than `uv.lock` (SQLAlchemy 2.0 vs 2.1):
+  the Windows bundle follows `uv.lock`, the image does not.
 
 ## Things that will bite
 

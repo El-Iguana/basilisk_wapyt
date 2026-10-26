@@ -73,15 +73,17 @@ from services.transfer import router as transfer_router  # noqa: E402
 
 APPLICATION = "basilisk"
 PORT = int(os.getenv("PORT", "8768"))
-# The address uvicorn listens on. The dev container runs with host networking
-# (a database GUI has to reach servers on the host's loopback and LAN), where
-# 0.0.0.0 would publish plain HTTP to the whole network: podman-run.sh sets
-# 127.0.0.1.
-BIND = os.getenv("BASILISK_BIND", "0.0.0.0")
 # The loopback address Basilisk is reached on. pytincture serves authenticated
 # plain HTTP only on a literal loopback IP, so this is an address, not
 # "localhost".
 HOST = os.getenv("BASILISK_HOST", "").strip() or "127.0.0.1"
+# The address uvicorn listens on: that loopback address unless told otherwise.
+# The image sets 0.0.0.0 (a published port needs it inside the container), and
+# nothing in .env.example overrides that any more: `docker run --env-file .env`
+# once set 127.0.0.1 inside the container and left the published port dead.
+# The dev container runs with host networking, where 0.0.0.0 would publish
+# plain HTTP to the whole network: podman-run.sh sets 127.0.0.1.
+BIND = os.getenv("BASILISK_BIND", "").strip() or HOST
 # pytincture cookie_namespace (1.0.0rc13): session, CSRF and SAML cookies are
 # named basilisk-* instead of pytincture-*, so a sign-in here does not replace
 # another pytincture app's on the same host. Changing it signs everyone out once.
