@@ -25,6 +25,16 @@ _SENTINEL_UNCHANGED = "\x00unchanged\x00"
 ENVIRONMENTS = ("", "dev", "test", "prod")
 
 
+
+def _file_engine(name: str) -> bool:
+    """A file database (SQLite, DuckDB): no server, so no SSH tunnel."""
+    from services import engines
+
+    try:
+        return not engines.get(name).uses_server
+    except engines.EngineError:
+        return False
+
 @backend_for_frontend
 @bff_policy(application="basilisk")
 class ConnectionService:
@@ -76,7 +86,8 @@ class ConnectionService:
             "uses_server": spec.uses_server, "levels": list(spec.levels),
             "fields": [field.to_dict() for field in spec.extra_fields],
             "read_only_by_rollback": spec.read_only_by_rollback,
-            "root": str(sqlite_root()) if spec.name == "sqlite" else "",
+            "root": "" if spec.uses_server else str(sqlite_root()),
+            "suffixes": list(getattr(spec, "suffixes", ())),
         } for spec in engines.listing()]
 
     def folders(self) -> list:
@@ -130,7 +141,7 @@ class ConnectionService:
         if conn_id:
             stored_ssh = (fetch_connection(int(conn_id), self._user_id) or {}).get("ssh") or {}
         ssh_settings = tunnels.merge_settings(stored_ssh, ssh if isinstance(ssh, dict) else None)
-        if engine == "sqlite":
+        if _file_engine(engine):
             ssh_settings = {}
         errors.update(tunnels.validate(ssh_settings))
         if errors:
@@ -261,7 +272,7 @@ class ConnectionService:
 
         profile["ssh"] = tunnels.merge_settings(stored.get("ssh") or {},
                                                 ssh if isinstance(ssh, dict) else None)
-        if engine == "sqlite":
+        if _file_engine(engine):
             profile["ssh"] = {}
         errors = self._validate("x", profile, 60, "")
         errors.update(tunnels.validate(profile["ssh"]))
@@ -327,6 +338,10 @@ class ConnectionService:
             data["icon"] = spec.icon
             data["levels"] = list(spec.levels)
             data["dialect"] = spec.editor_dialect
+            data["family"] = spec.family
+            data["uses_server"] = spec.uses_server
+            data["can_analyze"] = spec.can_analyze
+            data["has_identity"] = bool(spec.identity_clause)
             data["read_only_by_rollback"] = spec.read_only_by_rollback
             data["default_database"] = spec.default_database
             data["has_roles"] = spec.has_roles
@@ -334,7 +349,8 @@ class ConnectionService:
             data["roles_label"] = spec.roles_label
             data["types"] = list(spec.common_types)
         except engines.EngineError:
-            data.update(engine_label=data.get("engine") or "?", icon="mdi-database-alert",
+            data.update(family=data.get("engine") or "", uses_server=True, can_analyze=False,
+                        engine_label=data.get("engine") or "?", icon="mdi-database-alert",
                         levels=[], dialect="StandardSQL", read_only_by_rollback=False,
                         default_database="", has_roles=False, roles_label="", types=[],
                         has_sessions=False)

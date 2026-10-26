@@ -289,6 +289,126 @@ def parse_sqlite(rows: list) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# DuckDB: EXPLAIN (FORMAT JSON) and EXPLAIN (ANALYZE, FORMAT JSON)
+# ---------------------------------------------------------------------------
+
+def _rows_from(text: Any) -> Optional[float]:
+    """DuckDB's "~12" / "12 rows" estimates as a number."""
+    found = re.search(r"[\d.]+", str(text or ""))
+    return _num(found.group(0)) if found else None
+
+
+def _duck_node(item: dict, analyzed: bool) -> dict:
+    op = str(item.get("operator_name") or item.get("operator_type") or item.get("name") or "?")
+    info = item.get("extra_info") or {}
+    target = info.get("Table") or info.get("Function") or ""
+    estimate = info.get("Estimated Cardinality")
+    details = []
+    for key in ("Join Type", "Conditions", "Filters", "Groups", "Aggregates", "Projections"):
+        value = info.get(key)
+        if value:
+            details.append(f"{key}: {', '.join(value) if isinstance(value, list) else value}")
+    used = {"Table", "Function", "Estimated Cardinality", "Join Type", "Conditions", "Filters",
+            "Groups", "Aggregates", "Projections"}
+    extra = [[key, ", ".join(map(str, value)) if isinstance(value, list) else str(value)]
+             for key, value in info.items() if key not in used and value not in ("", None, [])]
+    timing = _num(item.get("operator_timing")) if analyzed else None
+    return node(op.replace("_", " ").title(), object=str(target), detail="; ".join(details),
+                est_rows=_rows_from(estimate),
+                act_rows=_num(item.get("operator_cardinality")) if analyzed else None,
+                time_ms=None if timing is None else timing * 1000, loops=1 if analyzed else None,
+                extra=extra, children=[_duck_node(child, analyzed)
+                                       for child in item.get("children") or []])
+
+
+def parse_duckdb(document: Any) -> dict:
+    """``document``: the JSON of EXPLAIN (a list of operators) or of EXPLAIN ANALYZE (a profile)."""
+    import json
+
+    if isinstance(document, str):
+        document = json.loads(document)
+    if isinstance(document, list):
+        roots = [_duck_node(item, False) for item in document]
+        return {"plan": roots[0] if len(roots) == 1 else node("Query plan", children=roots),
+                "summary": {"cost": None}}
+    children = document.get("children") or []
+    # The profile's first operator is EXPLAIN_ANALYZE itself; the plan is under it.
+    while len(children) == 1 and str(children[0].get("operator_type")) == "EXPLAIN_ANALYZE":
+        children = children[0].get("children") or []
+    roots = [_duck_node(item, True) for item in children]
+    latency = _num(document.get("latency"))
+    return {"plan": roots[0] if len(roots) == 1 else node("Query plan", children=roots),
+            "summary": {"cost": None,
+                        "execution_ms": None if latency is None else latency * 1000}}
+
+
+# ---------------------------------------------------------------------------
+# CockroachDB: EXPLAIN [ANALYZE] as a text tree
+# ---------------------------------------------------------------------------
+
+_CRDB_DETAIL = ("equality", "filter", "spans", "order", "group by", "limit", "into",
+                "estimated max memory allocated")
+_CRDB_TREE = "│├└─ "
+
+
+def _duration_ms(text: str) -> Optional[float]:
+    found = re.match(r"\s*([\d.]+)\s*(µs|us|ms|s|m)?", text or "")
+    if not found:
+        return None
+    value = float(found.group(1))
+    return value * {"µs": 0.001, "us": 0.001, "ms": 1, "s": 1000, "m": 60_000}.get(
+        found.group(2) or "ms", 1)
+
+
+def parse_cockroach(lines: list) -> dict:
+    """EXPLAIN / EXPLAIN ANALYZE rows: ``• node`` lines, indented ``key: value`` lines."""
+    root = node("Query plan")
+    stack: list = []            # (column of its •, node)
+    summary: dict = {"cost": None}
+    current = None
+    for raw in lines:
+        line = str(raw).rstrip()
+        mark = line.find("•")
+        if mark >= 0:
+            current = node(line[mark + 1:].strip().title())
+            while stack and stack[-1][0] >= mark:
+                stack.pop()
+            (stack[-1][1] if stack else root)["children"].append(current)
+            stack.append((mark, current))
+            continue
+        text = line.lstrip(_CRDB_TREE)
+        if not text:
+            continue
+        if current is not None and line[:1] not in _CRDB_TREE:
+            current = None      # past the tree: "index recommendations" and the like
+        key, _, value = text.partition(":")
+        key, value = key.strip(), value.strip()
+        if current is None:
+            if key == "execution time":
+                summary["execution_ms"] = _duration_ms(value)
+            elif key == "planning time":
+                summary["planning_ms"] = _duration_ms(value)
+            continue
+        if not _:
+            current["extra"].append([text.strip(), ""])
+        elif key == "table":
+            current["object"] = value
+        elif key == "estimated row count":
+            current["est_rows"] = _num(value.split(" ")[0].replace(",", ""))
+        elif key == "actual row count":
+            current["act_rows"] = _num(value.replace(",", ""))
+        elif key == "execution time":
+            current["time_ms"] = _duration_ms(value)
+            current["loops"] = 1
+        else:
+            if key in _CRDB_DETAIL:
+                current["detail"] = "; ".join(filter(None, [current["detail"], f"{key}: {value}"]))
+            current["extra"].append([key, value])
+    plan = root["children"][0] if len(root["children"]) == 1 else root
+    return {"plan": plan, "summary": summary}
+
+
+# ---------------------------------------------------------------------------
 # Shared
 # ---------------------------------------------------------------------------
 

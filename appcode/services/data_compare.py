@@ -232,6 +232,8 @@ def _side(user_id: int, side: dict, label: str) -> dict:
             raise DataCompareError(f"The {label} has no table named {side['table']!r}") from None
         except Exception as exc:
             raise DataCompareError(f"Reading the {label}: {error_text(exc)}") from None
+        if not columns:     # CockroachDB answers [] for a table that is not there
+            raise DataCompareError(f"The {label} has no table named {side['table']!r}")
         try:
             pk = list((insp.get_pk_constraint(side["table"], schema=schema) or {})
                       .get("constrained_columns") or [])

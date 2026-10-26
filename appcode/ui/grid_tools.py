@@ -87,6 +87,10 @@ def literal(engine: str, value: Any, kind: str = "text") -> str:
             return "0x" + digits
         if engine == "postgresql":
             return "'\\x" + digits + "'"
+        if engine == "duckdb":
+            # DuckDB reads a BLOB from text with one \xHH escape per byte.
+            return "'" + "".join("\\x" + digits[i:i + 2] for i in range(0, len(digits), 2)) \
+                + "'::BLOB"
         return "X'" + digits + "'"
     return text_literal(engine, text)
 
@@ -210,7 +214,7 @@ def filter_sql(engine: str, flt: dict, kind: str = "text") -> str:
         return f"{column} IS NOT NULL"
     if op in ("contains", "not_contains", "starts"):
         pattern = text_literal(engine, _like_pattern(engine, value, op == "starts"))
-        if engine == "postgresql":
+        if engine in ("postgresql", "duckdb"):
             target, like = f"CAST({column} AS TEXT)", "ILIKE"
         elif engine == "mssql":
             target, like = f"CAST({column} AS NVARCHAR(MAX))", "LIKE"

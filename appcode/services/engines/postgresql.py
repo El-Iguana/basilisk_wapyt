@@ -21,6 +21,8 @@ class PostgreSQL(Engine):
     levels = ("database", "schema")
     default_database = "postgres"
     editor_dialect = "PostgreSQL"
+    family = "postgresql"
+    has_matviews = True
     system_schemas = frozenset({"information_schema", "pg_catalog", "pg_toast"})
     system_schema_prefixes = ("pg_temp_", "pg_toast_temp_")
     system_databases = frozenset({"postgres"})

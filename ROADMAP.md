@@ -102,8 +102,20 @@ test.
   hosts (a tunnel through a tunnel); TLS hostname verification through the
   tunnel (send the real host name as SNI); keyboard-interactive / 2FA
   sign-in.
-- **More engines** through the adapter: MariaDB-specific bits, CockroachDB
-  (PostgreSQL dialect), DuckDB, Oracle (oracledb thin mode), BriskDB.
+- **More engines** — DuckDB and CockroachDB done (2026-10-26): every feature
+  where the engine has it (DuckDB: no server sessions, routines or triggers;
+  CockroachDB: no sessions listing yet), Basilisk's own SQLAlchemy dialects
+  where the bundled ones do not fit SQLAlchemy 2.1, plan parsers for both,
+  six-engine tests. Follow-ups: CockroachDB sessions (`SHOW CLUSTER
+  SESSIONS`, string ids); DuckDB schemas other than `main`, macros as
+  functions, attached databases; DuckDB 2.0 (duckdb-engine's reflection does
+  not work with it yet: pinned below 2). Still to come: MariaDB-specific
+  bits, Oracle (oracledb thin mode).
+- **BriskDB** — deferred (2026-10-26): 0.1.0b3's PostgreSQL listener has no
+  general catalog (`pg_catalog` / `information_schema`) and every statement
+  needs a routing key, so SQLAlchemy cannot list or read its tables. Revisit
+  when BriskDB offers catalog queries (or Basilisk grows a non-SQLAlchemy
+  adapter for its embedded API).
 - **Install story** like Monguana's: compose files, INSTALL.md, Windows
   installer.
 

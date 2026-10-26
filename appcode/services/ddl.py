@@ -79,6 +79,9 @@ def column_sql(spec: Any, prep: Any, column: dict, *, inline_pk: bool = False) -
     parts = [prep.quote(col), type_text]
     identity = _flag(column.get("identity"))
     if identity:
+        if not spec.identity_clause:
+            raise DdlError(f"{spec.label} has no self-numbering columns: give {col} a "
+                           "sequence default instead (DEFAULT nextval('a_sequence'))")
         if spec.identity_inline_pk and not inline_pk:
             raise DdlError(f"{spec.label} numbers a column only when it alone is the "
                            "primary key")
@@ -119,6 +122,11 @@ def build(spec: Any, prep: Any, action: str, schema: Optional[str], table: str,
     if action == "add_column":
         if _flag(params.get("identity")):
             raise DdlError("An added column cannot number itself here; create it in the table")
+        if not spec.add_column_constraints and _flag(params.get("not_null")):
+            col = prep.quote(name(params.get("name"), "Column name"))
+            return [f"ALTER TABLE {target} {spec.add_column_keyword} "
+                    f"{column_sql(spec, prep, {**params, 'not_null': False})}",
+                    f"ALTER TABLE {target} ALTER COLUMN {col} SET NOT NULL"]
         return [f"ALTER TABLE {target} {spec.add_column_keyword} "
                 f"{column_sql(spec, prep, params)}"]
     if action == "rename_column":

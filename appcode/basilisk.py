@@ -640,8 +640,8 @@ class Basilisk(MainWindow):
         conn_id = conn["id"]
         node = _node_id("c", conn_id)
         levels = conn.get("levels") or []
-        if conn.get("engine") == "sqlite":
-            where = f"SQLite · {conn.get('database')}"
+        if not conn.get("uses_server", True):
+            where = f"{conn.get('engine_label')} · {conn.get('database')}"
         else:
             where = f"{conn.get('engine_label')} · {conn.get('host')}:{conn.get('port')}"
             if conn.get("username"):
@@ -1118,7 +1118,7 @@ class Basilisk(MainWindow):
 
     async def _copy_name(self, loc: tuple, name: str) -> None:
         conn = self._conn(loc[0]) or {}
-        engine = conn.get("engine") or ""
+        engine = conn.get("family") or conn.get("engine") or ""
         parts = [part for part in (loc[2] or (loc[1] if engine == "mysql" else ""), name) if part]
         text = ".".join(_quote_ident(engine, part) for part in parts)
         if await _copy(text):
@@ -1276,11 +1276,13 @@ class Basilisk(MainWindow):
             for other, ids in extra_ids.items():
                 for fid, _key in ids:
                     (form.show_field if other == spec["name"] else form.hide_field)(fid)
-            if spec["name"] == "sqlite":
+            if not spec["uses_server"]:
+                suffixes = ", ".join(spec.get("suffixes") or [])
                 form.set_properties(
                     "database", label="File", required=True,
-                    placeholder="shop.db",
-                    help=f"A path inside the SQLite folder on the server: {spec['root']}")
+                    placeholder="shop" + ((spec.get("suffixes") or [".db"])[0]),
+                    help=f"A path inside the database files folder on the server: {spec['root']}"
+                         + (f" ({suffixes})" if suffixes else ""))
             else:
                 form.set_properties(
                     "database", label="Database", required=False,
@@ -1573,7 +1575,8 @@ class Basilisk(MainWindow):
         container.innerHTML = self._table_html(tid, conn, loc, name, icon)
         tab = {
             "tid": tid, "kind": "table", "conn": loc[0], "db": loc[1], "loc": loc, "name": name,
-            "object_kind": kind, "engine": conn.get("engine") or "", "info": None,
+            "object_kind": kind, "engine": conn.get("family") or conn.get("engine") or "",
+            "info": None,
             "page": 1, "page_size": 100, "total": None, "exact": False,
             "where": where or "", "order_by": "", "columns": [], "rows": [], "keys": [],
             "truncated": set(), "pending": {}, "new_counter": 0, "tdir": "asc",
@@ -1593,7 +1596,7 @@ class Basilisk(MainWindow):
         return tid
 
     def _table_html(self, tid: str, conn: dict, loc: tuple, name: str, icon: str) -> str:
-        engine = conn.get("engine") or ""
+        engine = conn.get("family") or conn.get("engine") or ""
         quote_hint = _esc(_quote_ident(engine, "column"))
         return f"""
 <div class="bk-view" data-tab="{tid}">
@@ -2077,7 +2080,8 @@ class Basilisk(MainWindow):
         return entry["kinds"] if entry else []
 
     def _engine_of(self, tid: str) -> str:
-        return (self._conn(self._tabs[tid]["conn"]) or {}).get("engine") or ""
+        conn = self._conn(self._tabs[tid]["conn"]) or {}
+        return conn.get("family") or conn.get("engine") or ""
 
     def _on_columns(self, tid: str, payload: dict) -> None:
         """A column was resized, moved, hidden or shown: remember it (saved after a pause)."""
@@ -5092,11 +5096,17 @@ class Basilisk(MainWindow):
             return
         types = f'bk-types-{conn_id}'
         int_type = (conn.get("types") or ["integer"])[0]
+        # DuckDB has no self-numbering columns (a sequence default does it).
+        has_identity = conn.get("has_identity", True)
 
         def row(col: dict) -> str:
             def check(key):
+                off = key == "identity" and not has_identity
                 return (f'<td class="bk-ddl-c"><input type="checkbox" data-c="{key}"'
-                        f'{" checked" if col.get(key) else ""}></td>')
+                        f'{" checked" if col.get(key) and not off else ""}'
+                        + (' disabled title="This engine has no self-numbering columns: use a '
+                           "sequence default (DEFAULT nextval('a_sequence'))\"" if off else "")
+                        + '></td>')
             return (f'<tr data-col="1"><td><input class="bk-input" data-c="name" '
                     f'value="{_esc(col.get("name", ""))}" spellcheck="false" autocomplete="off"></td>'
                     f'<td><input class="bk-input bk-code" data-c="type" list="{types}" '
@@ -5312,7 +5322,8 @@ class Basilisk(MainWindow):
         self._tabs[tid] = {
             "tid": tid, "kind": "object", "conn": loc[0], "db": loc[1], "loc": loc,
             "name": data["name"], "label": label, "object_kind": kind, "ident": ident,
-            "table": table, "engine": conn.get("engine") or "", "info": None, "def_editor": None,
+            "table": table, "engine": conn.get("family") or conn.get("engine") or "", "info": None,
+            "def_editor": None,
         }
         container.innerHTML = self._object_html(tid, conn, loc, kind, label, icon)
         self.tabs.set_active(tid)
@@ -5481,7 +5492,7 @@ class Basilisk(MainWindow):
         default_db = db or conn.get("database") or conn.get("default_database") or ""
         tab = {
             "tid": tid, "kind": "sql", "conn": conn_id, "db": default_db,
-            "name": title, "engine": conn.get("engine") or "", "editor": None,
+            "name": title, "engine": conn.get("family") or conn.get("engine") or "", "editor": None,
             "results": [], "shown": None, "run_id": None, "max_rows": 500,
             "grid": None, "fallback": None, "draft_timer": None, "restore_draft": not text,
             "menu_col": None, "vp": None, "focus_cell": None,
@@ -5518,7 +5529,7 @@ class Basilisk(MainWindow):
             f'<option value="{_esc(self._tabs[tid]["db"])}">{_esc(self._tabs[tid]["db"] or "(default)")}</option>'
             "</select>") if "database" in levels else ""
         # SQLite can only estimate (EXPLAIN QUERY PLAN).
-        analyze = "" if conn.get("engine") == "sqlite" else (
+        analyze = "" if not conn.get("can_analyze", True) else (
             f'<button type="button" class="bk-btn" data-bk="analyze" id="{tid}-analyze" '
             'title="Run the statement for its actual plan: real rows and times '
             '(a write is rolled back)"><span class="mdi mdi-timer-outline"></span>'

@@ -10,3 +10,6 @@ cryptography>=42.0.0
 uvicorn[standard]>=0.30.0
 argon2-cffi>=23.1.0
 paramiko>=3.4.0
+duckdb>=1.1,<2
+duckdb-engine>=0.13
+sqlalchemy-cockroachdb>=2.0.2

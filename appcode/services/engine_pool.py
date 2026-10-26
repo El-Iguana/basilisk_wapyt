@@ -76,7 +76,7 @@ def build_engine(spec: Any, profile: dict, database: Optional[str],
                         on_learn_host_key)
         profile = {**profile, "host": "127.0.0.1", "port": tunnel.port}
     kwargs = {"pool_pre_ping": True, "pool_recycle": 1800}
-    if spec.name != "sqlite":
+    if spec.uses_server:
         kwargs.update(pool_size=3, max_overflow=5, pool_timeout=15)
     kwargs.update(spec.engine_kwargs(profile))
     try:

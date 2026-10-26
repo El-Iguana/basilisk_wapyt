@@ -5,7 +5,7 @@
 <h1 align="center">Basilisk</h1>
 
 A browser-based SQL database manager — think DBeaver, in a browser tab.
-PostgreSQL, MySQL / MariaDB, SQL Server and SQLite, built on
+PostgreSQL, MySQL / MariaDB, SQL Server, SQLite, DuckDB and CockroachDB, built on
 [pytincture](https://github.com/pytincture/pytincture) (the page is Python
 running in Pyodide) and the wapyt widget set.
 
@@ -77,8 +77,10 @@ uv run python service.py      # http://127.0.0.1:8768/basilisk/
 Or in a container: `scripts/podman-run.sh` (Linux + Podman, host networking so
 connections can reach databases on the same machine).
 
-SQLite connections open files inside one folder on the server
-(`BASILISK_SQLITE_ROOT`, by default `data/sqlite`).
+SQLite and DuckDB connections open files inside one folder on the server
+(`BASILISK_SQLITE_ROOT`, by default `data/sqlite`). DuckDB opens a file one way
+per process: a read-only and a read-write connection to the same file cannot
+be open together.
 
 ## Develop
 

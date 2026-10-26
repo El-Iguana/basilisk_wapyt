@@ -20,6 +20,7 @@ _GO = re.compile(r"^[ \t]*GO(?:[ \t]+(\d+))?[ \t]*(?:--[^\n]*)?$", re.I | re.M)
 class SQLServer(Engine):
     name = "mssql"
     label = "SQL Server"
+    family = "mssql"
     icon = "mdi-microsoft"
     default_port = 1433
     levels = ("database", "schema")

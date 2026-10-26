@@ -341,7 +341,8 @@ def retarget(text: str, old: Optional[str], new: Optional[str], quote_new: Calla
     if not old or not new or old == new:
         return text
     target = quote_new(new) + "."
-    pattern = (r'(?<![\w."`\]])(?:"' + re.escape(old) + r'"|`' + re.escape(old) + r'`|\['
+    # Preceded by a "." too: in db.schema.table the middle part is the schema.
+    pattern = (r'(?<![\w"`\]])(?:"' + re.escape(old) + r'"|`' + re.escape(old) + r'`|\['
                + re.escape(old) + r'\]' + (r"|" + re.escape(old) if re.fullmatch(r"\w+", old)
                                             else "") + r')\s*\.')
     return re.sub(pattern, lambda _m: target, text)
@@ -428,6 +429,9 @@ class _Writer:
         engines = {self.src["engine"], self.engine}
         if "mssql" in engines and kinds == {("json",), ("text",)}:
             return True
+        # DuckDB keeps no VARCHAR length: VARCHAR(20) elsewhere is its VARCHAR.
+        if "duckdb" in engines and {kind[0] for kind in kinds} == {"string", "text"}:
+            return True
         # MySQL and SQLite have no UUID type: a UUID is CHAR(32) there, as SQLAlchemy writes it.
         if engines & {"mysql", "sqlite"} and kinds == {("char", 32), ("uuid",)}:
             return True
@@ -458,7 +462,7 @@ class _Writer:
         if inline_pk:
             return f"{self.q(col['name'])} INTEGER PRIMARY KEY"
         parts = [self.q(col["name"]), self.type_of(col) or f"/* {col['type_text']}? */"]
-        if col["auto"] and not self.spec.identity_inline_pk:
+        if col["auto"] and not self.spec.identity_inline_pk and self.spec.identity_clause:
             parts.append(self.spec.identity_clause)
         if default is not None and not col["auto"]:
             parts.append(f"DEFAULT {default}")
@@ -470,9 +474,9 @@ class _Writer:
         ref = self.spec.qualified(self.prep, fk["ref_schema"] or self.schema, fk["ref_table"])
         text = (("CONSTRAINT " + self.q(fk["name"]) + " ") if fk["name"] else "") + \
             f"FOREIGN KEY ({self.cols(columns)}) REFERENCES {ref} ({self.cols(fk['ref_columns'])})"
-        if fk["on_delete"]:
+        if fk["on_delete"] and self.spec.fk_actions:
             text += f" ON DELETE {fk['on_delete']}"
-        if fk["on_update"]:
+        if fk["on_update"] and self.spec.fk_actions:
             text += f" ON UPDATE {fk['on_update']}"
         return text
 
@@ -497,6 +501,10 @@ class _Writer:
             lines.append(f"PRIMARY KEY ({self.cols(pk)})")
         if fks_inline:
             lines += [self.fk_clause(fk, fk["columns"]) for fk in tbl["fks"]]
+        if not self.spec.fk_actions and any(fk["on_delete"] or fk["on_update"]
+                                            for fk in tbl["fks"]):
+            notes.append(f"ON DELETE / ON UPDATE left out: {self.tgt['label']} has no "
+                         "foreign key actions")
         body = ",\n  ".join(lines)
         return f"CREATE TABLE {self.table(name)} (\n  {body}\n)", notes
 
@@ -530,8 +538,8 @@ class _Writer:
         src, tgt = self.src["tables"], self.tgt["tables"]
         pairs, only_src, only_tgt = match(list(src), list(tgt))
         same_tables = 0
-        for name in only_src:
-            self.new_table(src[name])
+        for rank, name in enumerate(_dependency_order([src[name] for name in only_src])):
+            self.new_table(src[name], rank)
         for name_s, name_t in pairs:
             before = len(self.diffs)
             self.table_pair(src[name_s], tgt[name_t])
@@ -563,11 +571,12 @@ class _Writer:
                 "tables": [len(src), len(tgt)], "views": [len(self.src["views"]),
                                                           len(self.tgt["views"])]}
 
-    def new_table(self, tbl: dict) -> None:
+    def new_table(self, tbl: dict, rank: int = 0) -> None:
         name = tbl["name"]
-        inline = self.spec.rebuilds_tables
+        inline = self.spec.rebuilds_tables or not self.spec.can_alter_keys
         create, notes = self.create_table(tbl, name, self.default_of, fks_inline=inline)
-        sql = [(P_CREATE_TABLE, create)]
+        # Referenced tables first: a foreign key written inline needs its table.
+        sql = [(P_CREATE_TABLE + min(rank, 999) / 1000, create)]
         for ix in tbl["indexes"]:
             if ix["expression"]:
                 notes.append(f"expression index {ix['name']} left out: add it by hand")
@@ -602,6 +611,12 @@ class _Writer:
         def to_target(columns: list) -> list:
             return [rename.get(col.casefold(), col) for col in columns]
 
+        # DuckDB: a table an index or a foreign key depends on keeps its columns as they are.
+        pinned = self.spec.alter_blocked_by_dependents and (bool(t["indexes"]) or any(
+            fk["ref_table"].casefold() == name.casefold() and not fk["ref_schema"]
+            for other in self.tgt["tables"].values() for fk in other["fks"]))
+        pinned_note = (f"{self.tgt['label']} cannot change this column while an index or a "
+                       "foreign key depends on the table: rebuild it by hand")
         used_t = {c.casefold() for c in t["pk"]["columns"]}
         for ix in t["indexes"]:
             used_t |= set(_fold(ix["columns"]))
@@ -631,8 +646,9 @@ class _Writer:
             sql = [(P_DROP_COLUMN, statement) for statement in
                    self.spec.sql_script_before_drop_column(self.prep, self.schema, name, col_name)]
             sql.append((P_DROP_COLUMN, f"ALTER TABLE {target} DROP COLUMN {self.q(col_name)}"))
+            notes = [pinned_note] if pinned else []
             self.add(name, "column", col_name, "drop", "Only in the target", target=describe(col),
-                     sql=sql)
+                     sql=[] if pinned else sql, notes=notes)
         for name_s, name_t in pairs:
             a, b = sc[name_s], tc[name_t]
             changed, parts, notes = set(), [], []
@@ -659,6 +675,9 @@ class _Writer:
             if not parts:
                 continue
             sql = []
+            if pinned and changed & {"type", "nullable"}:
+                notes.append(pinned_note)
+                changed = changed - {"type", "nullable"}
             if changed and new_type is not None:
                 if self.spec.rebuilds_tables:
                     rebuild.append(f"change column {name_t}")
@@ -676,18 +695,21 @@ class _Writer:
         sp, tp = s["pk"]["columns"], t["pk"]["columns"]
         if _fold(sp) != _fold(tp):
             sql, notes = [], []
-            if tp:
-                if t["pk"]["name"] or self.engine == "mysql":
-                    sql.append((P_DROP_PK, self.spec.sql_drop_constraint(
-                        self.prep, self.schema, name, t["pk"]["name"] or "", "pk")))
-                elif not self.spec.rebuilds_tables:
-                    notes.append("the primary key has no name: drop it by hand")
-            if sp:
-                sql.append((P_ADD_PK, f"ALTER TABLE {target} ADD PRIMARY KEY "
-                                      f"({self.cols(to_target(sp))})"))
             if self.spec.rebuilds_tables:
                 rebuild.append("primary key")
-                sql = []
+            elif not self.spec.can_alter_keys:
+                notes.append(f"{self.tgt['label']} cannot change an existing table's primary "
+                             "key: rebuild the table by hand")
+            elif tp and not (t["pk"]["name"] or self.engine == "mysql"):
+                notes.append("the primary key has no name: change it by hand")
+            else:
+                pieces = self.spec.sql_change_primary_key(
+                    self.prep, self.schema, name, t["pk"]["name"] or "", to_target(sp), tp)
+                sql = [(P_DROP_PK if when == "drop" else P_ADD_PK, statement)
+                       for when, statement in pieces]
+                if not pieces:
+                    notes.append(f"{self.tgt['label']} cannot leave a table without a primary "
+                                 "key: change it by hand")
             change = "add" if not tp else "drop" if not sp else "alter"
             self.add(name, "pk", t["pk"]["name"] or s["pk"]["name"] or "PRIMARY KEY", change,
                      "Primary key " + {"add": "only in the source", "drop": "only in the target",
@@ -730,8 +752,8 @@ class _Writer:
         t_fk = {fk_key(fk, fk["columns"]): fk for fk in t["fks"]}
         for key, fk in s_fk.items():
             other = t_fk.get(key)
-            if other and (other["on_delete"], other["on_update"]) == (fk["on_delete"],
-                                                                      fk["on_update"]):
+            if other and (not self.spec.fk_actions or (other["on_delete"], other["on_update"])
+                          == (fk["on_delete"], fk["on_update"])):
                 continue
             sql = []
             if other and other["name"]:
@@ -739,24 +761,33 @@ class _Writer:
                     self.prep, self.schema, name, other["name"], "fk")))
             sql.append((P_ADD_FK, f"ALTER TABLE {target} ADD "
                                   + self.fk_clause(fk, to_target(fk["columns"]))))
+            notes = []
             if self.spec.rebuilds_tables:
                 rebuild.append("foreign key on " + ", ".join(fk["columns"]))
+                sql = []
+            elif not self.spec.can_alter_keys:
+                notes.append(f"{self.tgt['label']} cannot add a foreign key to an existing "
+                             "table: rebuild the table by hand")
                 sql = []
             self.add(name, "fk", fk["name"] or other and other["name"] or ", ".join(fk["columns"]),
                      "alter" if other else "add",
                      "ON DELETE / ON UPDATE differ" if other else "Only in the source",
-                     source=_fk_text(fk), target=_fk_text(other) if other else "", sql=sql)
+                     source=_fk_text(fk), target=_fk_text(other) if other else "", sql=sql,
+                     notes=notes)
         for key, fk in t_fk.items():
             if key in s_fk:
                 continue
-            sql = []
+            sql, notes = [], []
             if self.spec.rebuilds_tables or not fk["name"]:
                 rebuild.append("drop foreign key on " + ", ".join(fk["columns"]))
+            elif not self.spec.can_alter_keys:
+                notes.append(f"{self.tgt['label']} cannot drop a foreign key from an existing "
+                             "table: rebuild the table by hand")
             else:
                 sql = [(P_DROP_FK, self.spec.sql_drop_constraint(self.prep, self.schema, name,
                                                                  fk["name"], "fk"))]
             self.add(name, "fk", fk["name"] or ", ".join(fk["columns"]), "drop",
-                     "Only in the target", target=_fk_text(fk), sql=sql)
+                     "Only in the target", target=_fk_text(fk), sql=sql, notes=notes)
 
         if rebuild and self.spec.rebuilds_tables:
             self.rebuild(s, t, start, pairs, rebuild)
@@ -845,6 +876,29 @@ class _Writer:
             return {"sql": [(P_VIEW, f"{self.spec.replace_view} {target} {rest}")], "notes": notes}
         sql = [(P_VIEW, f"DROP VIEW IF EXISTS {target}")] if replace else []
         return {"sql": sql + [(P_VIEW, f"CREATE VIEW {target} {rest}")], "notes": notes}
+
+
+def _dependency_order(tables: list) -> list:
+    """Table names, each after the tables its foreign keys reference (cycles: as they come)."""
+    names = {tbl["name"] for tbl in tables}
+    refs = {tbl["name"]: [fk["ref_table"] for fk in tbl["fks"]
+                          if fk["ref_table"] in names and not fk["ref_schema"]
+                          and fk["ref_table"] != tbl["name"]] for tbl in tables}
+    done: list = []
+    state: dict = {}
+
+    def visit(name: str) -> None:
+        if state.get(name):
+            return              # done, or on the path (a cycle)
+        state[name] = 1
+        for ref in refs[name]:
+            visit(ref)
+        done.append(name)
+        state[name] = 2
+
+    for tbl in tables:
+        visit(tbl["name"])
+    return done
 
 
 def _summary(tbl: dict) -> str:

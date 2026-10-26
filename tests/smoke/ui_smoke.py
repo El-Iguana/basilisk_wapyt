@@ -42,7 +42,16 @@ ENGINES = {
     "sqlite": {"database": "shop.db", "path": ["Tables"],
                "slow": "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) "
                        "SELECT COUNT(*) FROM c"},
+    "duckdb": {"database": "shop.duckdb", "path": ["Tables"],
+               "slow": "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) "
+                       "SELECT COUNT(*) FROM c"},
+    "cockroachdb": {"port": "56257", "database": "shop", "username": "root",
+                    "path": ["shop", "public", "Tables"], "slow": "SELECT pg_sleep(30)"},
 }
+FILE_ENGINES = ("sqlite", "duckdb")
+PG_LIKE = ("postgresql", "cockroachdb")
+# Where the sample lives in the navigator ("" : the connection itself).
+SAMPLE = {"postgresql": "public", "mysql": "shop", "mssql": "dbo", "cockroachdb": "public"}
 
 failures: list[str] = []
 console: list[str] = []
@@ -92,14 +101,14 @@ def create_connection(page: Page, engine: str, name: str) -> None:
     page.click(f'.wapyt-modal [data-field-id="engine"] [data-value="{engine}"]')
     time.sleep(0.2)
     page.fill('.wapyt-modal input[name="name"]', name)
-    if engine != "sqlite":
+    if engine not in FILE_ENGINES:
         page.fill('.wapyt-modal input[name="host"]', "127.0.0.1")
         page.fill('.wapyt-modal input[name="port"]', spec["port"])
         page.fill('.wapyt-modal input[name="username"]', spec["username"])
         page.fill('.wapyt-modal input[name="password"]', DB_PASSWORD)
         check(page.is_visible('.wapyt-modal input[name="host"]'), f"{engine}: host field shown")
     else:
-        check(not page.is_visible('.wapyt-modal input[name="host"]'), "sqlite: no host field")
+        check(not page.is_visible('.wapyt-modal input[name="host"]'), f"{engine}: no host field")
     page.fill('.wapyt-modal input[name="database"]', spec["database"])
     page.click('.wapyt-modal [data-button-id="test"]')
     tested = wait_text(page, '.wapyt-modal [data-field-id="test_result"]', "Connected")
@@ -274,8 +283,8 @@ def value_panel_checks(page: Page, engine: str) -> None:
 
 
 def export_checks(page: Page, engine: str, conn_id: int) -> None:
-    db = {"postgresql": "shop", "mysql": "shop", "mssql": "shop", "sqlite": ""}[engine]
-    schema = {"postgresql": "public", "mssql": "dbo"}.get(engine, "")
+    db = {"postgresql": "shop", "mysql": "shop", "mssql": "shop", "cockroachdb": "shop"}.get(engine, "")
+    schema = {"postgresql": "public", "mssql": "dbo", "cockroachdb": "public"}.get(engine, "")
     result = page.evaluate(
         """async ([id, db, schema]) => {
             const q = new URLSearchParams({table: 'orders', database: db, schema: schema,
@@ -319,8 +328,8 @@ def sql_checks(page: Page, engine: str) -> None:
     check(not page.is_visible(".bk-vp:visible"), f"{engine}: F7 closes it")
     page.click(f"{tab} .cm-content")
     page.keyboard.press("Control+Shift+Enter")
-    if engine in ("sqlite", "mysql"):
-        # SQLite and MySQL divide by zero to NULL, so the script succeeds.
+    if engine in ("sqlite", "mysql", "duckdb"):
+        # SQLite and MySQL divide by zero to NULL (DuckDB to infinity): the script succeeds.
         ok = wait_text(page, f"{tab} .bk-res-tabs", "Result 2")
     else:
         ok = wait_text(page, f"{tab} .bk-msgs", "✘")
@@ -445,6 +454,11 @@ def expand(page: Page, label: str) -> None:
 def navigator_checks(page: Page, engine: str) -> None:
     """Routines, triggers, roles and (PostgreSQL) a materialized view refresh."""
     view = ".bk-view:visible"
+    if engine == "duckdb":  # sequences only
+        expand(page, "Sequences")
+        exact_tree_row(page, "invoice_no").first.dblclick()
+        check(wait_text(page, f"{view} .bk-obj-props", "1000"), f"{engine}: a sequence opens")
+        return
     expand(page, "Triggers")
     exact_tree_row(page, "orders_status_check").first.dblclick()
     ok = wait_text(page, f"{view} .bk-obj-props", "orders")
@@ -452,7 +466,7 @@ def navigator_checks(page: Page, engine: str) -> None:
     check(ok, f"{engine}: a trigger opens with its definition")
     page.click(f'{view} [data-bk="obj_table"]')
     check(wait_text(page, f"{view} .bk-head", "orders"), f"{engine}: trigger opens its table")
-    if engine != "sqlite":
+    if engine not in FILE_ENGINES:
         expand(page, "Procedures")
         exact_tree_row(page, "archive_order").first.dblclick()
         ok = wait_text(page, f"{view} .bk-obj-props", "rocedure")  # "SQL stored procedure"
@@ -464,7 +478,8 @@ def navigator_checks(page: Page, engine: str) -> None:
         roles = page.locator('.wapyt-tree-row:has(.wapyt-tree-label:text-matches("roles$"))')
         roles.first.click()
         page.keyboard.press("ArrowRight")
-        me = {"postgresql": "postgres", "mysql": "root@%", "mssql": "sa"}[engine]
+        me = {"postgresql": "postgres", "mysql": "root@%", "mssql": "sa",
+              "cockroachdb": "root"}[engine]
         page.wait_for_selector(f'.wapyt-tree-row:has(.wapyt-tree-label:text-is("{me}"))',
                                timeout=20000)
         exact_tree_row(page, me).first.dblclick()
@@ -472,7 +487,7 @@ def navigator_checks(page: Page, engine: str) -> None:
               f"{engine}: {me} opens under "
               f"{roles.first.locator('.wapyt-tree-label').inner_text().strip()}")
         shot(page, f"smoke-{engine}-9-role")
-    if engine == "postgresql":
+    if engine in PG_LIKE:
         expand(page, "Views")
         exact_tree_row(page, "product_sales").first.click(button="right")
         page.click('.wapyt-tree-menu [data-action-id]:has-text("Refresh materialized")')
@@ -490,8 +505,9 @@ def ddl_ready(page: Page) -> bool:
 
 def object_action_checks(page: Page, engine: str, name: str) -> None:
     """Create a table from the navigator, add a column from its tab, drop it."""
-    where = {"postgresql": "public", "mysql": "shop", "mssql": "dbo", "sqlite": name}[engine]
-    int_type = {"postgresql": "integer", "mysql": "int", "mssql": "int", "sqlite": "INTEGER"}[engine]
+    where = SAMPLE.get(engine, name)
+    int_type = {"postgresql": "integer", "mysql": "int", "mssql": "int", "sqlite": "INTEGER",
+                "duckdb": "INTEGER", "cockroachdb": "integer"}[engine]
     exact_tree_row(page, where).first.click(button="right")
     page.click('.wapyt-tree-menu [data-action-id]:has-text("Create table")')
     page.wait_for_selector(f'{modal(page)} [data-p="name"]', timeout=10000)
@@ -679,8 +695,8 @@ def session_checks(page: Page, engine: str, name: str) -> None:
     """The server's sessions in their own tab."""
     exact_tree_row(page, name).first.click(button="right")
     page.click('.wapyt-tree-menu [data-action-id]:has-text("Sessions")')
-    if engine == "sqlite":
-        check(wait_text(page, "body", "no server sessions"), "sqlite: no sessions to list")
+    if engine in ("sqlite", "duckdb", "cockroachdb"):
+        check(wait_text(page, "body", "no server sessions"), f"{engine}: no sessions to list")
         return
     view = ".bk-view:visible"
     ok = wait_text(page, f"{view} .bk-head-stats", "session", 20000)
@@ -703,7 +719,7 @@ def er_box(page: Page, table: str):
 
 def er_checks(page: Page, engine: str, name: str) -> None:
     """The ER diagram: draw, drag (remembered), column modes, find, SVG, focus on a table."""
-    where = {"postgresql": "public", "mysql": "shop", "mssql": "dbo", "sqlite": name}[engine]
+    where = SAMPLE.get(engine, name)
     view = ".bk-view:visible"
     exact_tree_row(page, where).first.click(button="right")
     page.click('.wapyt-tree-menu [data-action-id="er"]')
@@ -759,6 +775,7 @@ def er_checks(page: Page, engine: str, name: str) -> None:
 
 CMP_RESET = {
     "postgresql": "DROP SCHEMA IF EXISTS bk_cmp CASCADE;\nCREATE SCHEMA bk_cmp;",
+    "cockroachdb": "DROP SCHEMA IF EXISTS bk_cmp CASCADE;\nCREATE SCHEMA bk_cmp;",
     "mysql": "DROP DATABASE IF EXISTS bk_cmp;\nCREATE DATABASE bk_cmp;",
     "mssql": ("IF SCHEMA_ID('bk_cmp') IS NOT NULL BEGIN\n"
               "DECLARE @s nvarchar(max) = N'';\n"
@@ -784,6 +801,22 @@ def run_script(page: Page, tab: str, sql: str) -> str:
     return page.inner_text(f"{tab} .bk-msgs") if page.locator(f"{tab} .bk-msgs").count() else ""
 
 
+def script_done(page: Page, tab: str, timeout: float = 90) -> str:
+    """Run the editor's whole script; its messages once it has finished (or failed)."""
+    page.click(f"{tab} .cm-content")
+    page.keyboard.press("Control+Shift+Enter")
+    deadline = time.monotonic() + timeout
+    msgs = ""
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        if not page.is_visible(f'{tab} [data-bk="run"]'):
+            continue                    # still running
+        msgs = page.inner_text(f"{tab} .bk-msgs") if page.locator(f"{tab} .bk-msgs").count() else ""
+        if "✔" in msgs or "✘" in msgs:
+            break
+    return msgs
+
+
 def compare_rows(page: Page, view: str) -> list:
     return page.eval_on_selector_all(
         f'{view} tbody tr[data-row-id] td[data-column-id="object"]', "els => els.map(e => e.textContent)")
@@ -791,9 +824,9 @@ def compare_rows(page: Page, view: str) -> list:
 
 def compare_checks(page: Page, engine: str, name: str) -> None:
     """Schema compare: the sample against an empty schema, apply the script, compare again."""
-    where = {"postgresql": "public", "mysql": "shop", "mssql": "dbo", "sqlite": name}[engine]
+    where = SAMPLE.get(engine, name)
     view = ".bk-view:visible"
-    if engine == "sqlite":
+    if engine in FILE_ENGINES:
         exact_tree_row(page, where).first.click(button="right")
         page.click('.wapyt-tree-menu [data-action-id="compare"]')
         page.wait_for_selector(f'{view} [data-role="cmp_conn"][data-side="tgt"] option', state="attached")
@@ -844,11 +877,7 @@ def compare_checks(page: Page, engine: str, name: str) -> None:
     page.click(f'{view} [data-bk="cmp_sql"]')
     page.wait_for_selector(".bk-sqltab:visible .cm-content", timeout=30000)
     tab = ".bk-sqltab:visible"
-    page.click(f"{tab} .cm-content")
-    page.keyboard.press("Control+Shift+Enter")
-    page.wait_for_selector(f'{tab} [data-bk="run"]:visible', timeout=60000)
-    time.sleep(0.5)
-    msgs = page.inner_text(f"{tab} .bk-msgs")
+    msgs = script_done(page, tab)
     check("✘" not in msgs and "✔" in msgs, f"{engine}: the script runs on the target"
           + ("" if "✘" not in msgs else f" ({[l for l in msgs.splitlines() if '✘' in l][:1]})"))
     page.click('.wapyt-tab:has-text("Compare")')
@@ -861,6 +890,7 @@ def compare_checks(page: Page, engine: str, name: str) -> None:
     page.wait_for_selector(".bk-sqltab:visible .cm-content", timeout=30000)
     run_script(page, ".bk-sqltab:visible", {
         "postgresql": "DROP SCHEMA bk_cmp CASCADE;", "mysql": "DROP DATABASE bk_cmp;",
+        "cockroachdb": "DROP SCHEMA bk_cmp CASCADE;",
         "mssql": CMP_RESET["mssql"].split("GO\nCREATE")[0]}[engine])
 
 
@@ -887,9 +917,8 @@ def data_compare_checks(page: Page, engine: str, name: str) -> None:
                                   "value")
     page.select_option(f'{side} [data-role="cmp_conn"]', src_conn)
     time.sleep(1)
-    if engine in ("postgresql", "mssql"):
-        page.select_option(f'{side} [data-role="cmp_schema"]',
-                           "public" if engine == "postgresql" else "dbo")
+    if engine in ("postgresql", "mssql", "cockroachdb"):
+        page.select_option(f'{side} [data-role="cmp_schema"]', SAMPLE[engine])
     elif engine == "mysql":
         page.select_option(f'{side} [data-role="cmp_db"]', "shop")
     page.wait_for_selector(f'{side} [data-role="cmp_table"] option[value="bk_dcmp"]',
@@ -915,11 +944,7 @@ def data_compare_checks(page: Page, engine: str, name: str) -> None:
     page.click(f'{view} [data-bk="cmp_sql"]')
     page.wait_for_selector(".bk-sqltab:visible .cm-content", timeout=30000)
     tab = ".bk-sqltab:visible"
-    page.click(f"{tab} .cm-content")
-    page.keyboard.press("Control+Shift+Enter")
-    page.wait_for_selector(f'{tab} [data-bk="run"]:visible', timeout=60000)
-    time.sleep(0.5)
-    msgs = page.inner_text(f"{tab} .bk-msgs")
+    msgs = script_done(page, tab)
     check("✘" not in msgs and "✔" in msgs, f"{engine}: the row script runs on the target"
           + ("" if "✘" not in msgs else f" ({[l for l in msgs.splitlines() if '✘' in l][:1]})"))
     page.click('.wapyt-tab:has-text("Compare data")')
@@ -945,7 +970,7 @@ def ssh_up() -> bool:
 
 def ssh_checks(page: Page, engine: str) -> None:
     """A connection through the test SSH server (tests/smoke/ssh_server.sh)."""
-    if engine == "sqlite":
+    if engine in FILE_ENGINES:
         return
     if not ssh_up():
         print(f"  skip {engine}: no SSH server on 127.0.0.1:52222", flush=True)

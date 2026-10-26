@@ -28,31 +28,38 @@ def sqlite_root() -> Path:
     return (Path(DATA_DIR) / "sqlite").resolve()
 
 
-def resolve_file(relative: str, *, must_exist: bool = True) -> Path:
-    """The file a profile's path names, inside the root, or EngineError."""
+def resolve_file(relative: str, *, must_exist: bool = True, suffixes: tuple = SUFFIXES) -> Path:
+    """
+    The file a profile's path names, inside the root, or EngineError. The
+    root holds every file database (SQLite and DuckDB), each engine its own
+    ``suffixes``.
+    """
     text = (relative or "").strip().replace("\\", "/")
     if not text:
         raise EngineError("File is required")
     if text.startswith("/") or (len(text) > 1 and text[1] == ":"):
-        raise EngineError("Give the file's path inside the SQLite folder, not an absolute path")
+        raise EngineError("Give the file's path inside the database files folder, not an "
+                          "absolute path")
     root = sqlite_root()
     target = (root / text).resolve()
     if target != root and root not in target.parents:
-        raise EngineError("The file must be inside the SQLite folder")
-    if target.suffix.lower() not in SUFFIXES:
-        raise EngineError(f"The file must end in {', '.join(SUFFIXES)}")
+        raise EngineError("The file must be inside the database files folder")
+    if target.suffix.lower() not in suffixes:
+        raise EngineError(f"The file must end in {', '.join(suffixes)}")
     if must_exist and not target.is_file():
-        raise EngineError(f"No such file in the SQLite folder: {text}")
+        raise EngineError(f"No such file in the database files folder: {text}")
     return target
 
 
 class SQLite(Engine):
     name = "sqlite"
     label = "SQLite"
+    family = "sqlite"
     icon = "mdi-feather"
     levels = ()
     editor_dialect = "SQLite"
     uses_server = False
+    suffixes = SUFFIXES
     extra_fields = (
         Field("create", "Create the file if it does not exist", kind="checkbox", default=False),
     )

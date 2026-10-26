@@ -1,7 +1,7 @@
 # Basilisk — SQL database browser on pytincture + wapyt
 
 A browser-based SQL database manager in the spirit of DBeaver, for
-**PostgreSQL, MySQL / MariaDB, SQL Server and SQLite**. The page is Python in
+**PostgreSQL, MySQL / MariaDB, SQL Server, SQLite, DuckDB and CockroachDB**. The page is Python in
 Pyodide built from **wapyt** widgets (`../wa_pytincture_widgetset`); the server
 is **pytincture** (FastAPI) talking to the databases through **SQLAlchemy 2**
 and their drivers. Started 2026-10-24, modelled on **Monguana**
@@ -37,6 +37,8 @@ appcode/                   # pytincture modules_path
       base.py              #     the hooks: URL, levels, read-only, timeout, cancel, split, DDL,
                            #     routines / sequences / triggers / roles (lists and object info)
       postgresql.py mysql.py mssql.py sqlite.py
+      duckdb.py duckdb_dialect.py   # DuckDB + its SQLAlchemy dialect (reflection from duckdb_*())
+      cockroachdb.py       #     CockroachDB: PostgreSQL's adapter + a dialect subclass
     engine_pool.py         #   SQLAlchemy engines per (user, connection, database) — plain module
     tunnels.py             #   SSH tunnels: the local forwarder, profile SSH settings — plain module
     ssh.py                 #   paramiko helpers from IguanaXterm: key loading, host-key pinning
@@ -107,24 +109,27 @@ podman run -d --name basilisk-pg -p 127.0.0.1:55432:5432 -e POSTGRES_PASSWORD="$
 podman run -d --name basilisk-mysql -p 127.0.0.1:53306:3306 -e MYSQL_ROOT_PASSWORD="$PW" docker.io/library/mysql:8.4
 podman run -d --name basilisk-mssql -p 127.0.0.1:51433:1433 -e ACCEPT_EULA=Y \
   -e MSSQL_SA_PASSWORD="$PW" -e MSSQL_PID=Developer mcr.microsoft.com/mssql/server:2022-latest
-uv run python tests/smoke/seed_sample.py          # the shop sample in all four (SQLite: data/sqlite/shop.db)
+tests/smoke/cockroach.sh                          # CockroachDB basilisk-crdb on 127.0.0.1:56257 (root, no password)
+uv run python tests/smoke/seed_sample.py          # the shop sample in all six (files: data/sqlite/shop.db, shop.duckdb)
 tests/smoke/ssh_server.sh                         # SSH server basilisk-ssh on 127.0.0.1:52222 (tunnel tests)
-uv run --group dev pytest -q tests/test_live.py   # 144 live tests
-BASILISK_PASS=… python3 tests/smoke/ui_smoke.py   # ~95 UI checks per engine
+uv run --group dev pytest -q tests/test_live.py   # 216 live tests
+BASILISK_PASS=… python3 tests/smoke/ui_smoke.py   # ~95 UI checks per engine (six engines: ~1 hour)
 ```
 
-Users: `postgres` / `root` / `sa`. The sample (`seed_sample.py`): customers,
+Users: `postgres` / `root` / `sa` / `root` (CockroachDB, insecure, any password). The sample (`seed_sample.py`): customers,
 products (JSON, binary, a bigint past 2^53), orders (137 rows, uuid, time),
 order_items (composite key), `audit_log` (no primary key), a real PNG in
 `products.photo` and a 32,000-character note on customer 11 (both for the
 value panel), view
-`order_totals`; PostgreSQL and SQL Server also have a `sales` schema. For the
+`order_totals`; PostgreSQL, SQL Server and CockroachDB also have a `sales` schema. For the
 navigator (`EXTRAS`): `order_total` (overloaded on PostgreSQL), a table
 function `customer_orders` (PostgreSQL, SQL Server), procedure
 `archive_order` with an output argument, sequence `invoice_no` (PostgreSQL,
 SQL Server), trigger `orders_status_check` on `orders` in all four (it only
 refuses an empty status), and on PostgreSQL the materialized view
-`product_sales` with a unique index.
+`product_sales` with a unique index. CockroachDB gets PostgreSQL's extras
+(its trigger without `UPDATE OF status`: no column lists); DuckDB only the
+sequence, and sequence defaults number its ids (no SERIAL, no ON DELETE).
 **Reseed before the smoke test**: `test_live.py` edits rows. The smoke test
 needs an admin whose password is not flagged (`manage.py reset-password`) and,
 against the container, `shop.db` copied into `/data/sqlite` (`podman cp`).
@@ -143,6 +148,17 @@ in `engines/__init__.py` + a profile in `test_live.py`.
 | MySQL | database (= schema) | profile; `select_db` | session `READ ONLY` + rollback | `max_execution_time` (SELECT only; MariaDB `max_statement_time`) | `KILL QUERY` on a 2nd connection |
 | SQL Server | database › schema | database | **rollback only** (no read-only session) | `_conn.query_timeout` | `KILL <spid>`, then the connection is invalidated |
 | SQLite | none | profile | `mode=ro` URI + rollback | progress handler | `interrupt()` |
+| DuckDB | none (`main`) | profile | `read_only=True` open | a timer that interrupts | `interrupt()` |
+| CockroachDB | database › schema | database | as PostgreSQL | `statement_timeout` | `cancel_safe()` |
+
+`Engine.family` says whose SQL an engine speaks, for the page's quoting and
+literals (`ui/grid_tools.py`, the tab's `engine`) and dialect choices in
+sqlops (CockroachDB is `postgresql`, DuckDB `duckdb`). Feature flags rather
+than names elsewhere: `uses_server` (a file engine), `has_matviews`,
+`savepoints`, `can_analyze`, `identity_clause` (None: no self-numbering
+column), `can_alter_keys`, `fk_actions`, `alter_blocked_by_dependents`,
+`add_column_constraints`. `connection_service._public` sends `family`,
+`uses_server`, `can_analyze` and `has_identity` to the page.
 
 ### The pool (`engine_pool.py`)
 
@@ -473,6 +489,47 @@ Basilisk's own pooled connections costs nothing but that statement.
 - `tests/test_data_compare.py` (pure parts); `test_live.py` round-trips a
   table with awkward values (quotes, backslashes, Unicode, bytes, booleans,
   decimals, microseconds) on each engine and across engines both ways.
+
+### DuckDB and CockroachDB (milestone 3)
+
+- **DuckDB** runs in-process (`duckdb` < 2 + duckdb-engine 0.17). Its
+  dialect inherits SQLAlchemy's PostgreSQL reflection, whose 2.1 queries
+  (`pg_collation`, `REGCLASS`, `pg_inherits`) DuckDB cannot answer, so
+  `duckdb_dialect.BasiliskDuckDBDialect` (`duckdb+basilisk`) reads
+  `duckdb_tables()`, `duckdb_columns()`, `duckdb_constraints()`,
+  `duckdb_indexes()` instead, names types as DuckDB does (BLOB, DOUBLE,
+  TIMESTAMP), and quotes every keyword DuckDB's grammar keeps (`at`,
+  `columns`…: not only the "reserved" category). duckdb-engine's own
+  `get_indexes` answers [] and is overridden too.
+- DuckDB quirks the adapter covers: a write answers a **`Count` row**, not a
+  rowcount (`Engine.affected_rows`, `dml_count`); statements commit unless
+  `BEGIN` ran (explain's Analyze begins one and rolls back); no statement
+  timeout (a `threading.Timer` interrupts); no setval (`import_wrappers`
+  draws the sequence past imported ids with `nextval` over a `range`);
+  binary literals are `'\xHH…'::BLOB` per byte; `ADD COLUMN` takes no NOT NULL
+  (set after); no ON DELETE / UPDATE actions; keys cannot change on an
+  existing table; a column of a table an index or a foreign key depends on
+  cannot change type, gain NOT NULL or be dropped (compare marks those "by
+  hand"); VARCHAR keeps no length (compare treats VARCHAR(n) as its VARCHAR).
+- **DuckDB opens a file one way per process**: a read-only and a read-write
+  profile on the same file cannot both be open (the dialect's `connect`
+  says so plainly); ATTACH cannot work around it ("unique file handle").
+- **CockroachDB** is PostgreSQL's adapter on sqlalchemy-cockroachdb, with
+  `BasiliskCockroachDialect` (`cockroachdb+basilisk`) fixing: the table list
+  (views and materialized views were in it), foreign keys read table by
+  table (the multi query does not fit 2.1), identity columns (not reported),
+  the **hidden `rowid` key** of a table made without one (reported as its
+  key; Basilisk never reads hidden columns, so it is no key here), and view
+  definitions (`pg_get_viewdef` answers another schema's view of the same
+  name; `SHOW CREATE VIEW` is right).
+- CockroachDB 25+ tables are **schema-locked**: a lone `DROP CONSTRAINT` on
+  the key is refused and `ALTER PRIMARY KEY` keeps the old key as a unique
+  index, so `sql_change_primary_key` drops and adds in one statement.
+  `ALTER COLUMN … TYPE` beyond a safe widening needs
+  `enable_experimental_alter_column_type_general`, set first in the script.
+  EXPLAIN is a text tree (`plans.parse_cockroach`).
+- View definitions name the database (`shop.public.orders`): `retarget`
+  treats the middle of a three-part name as the schema.
 
 ### SSH tunnels (`tunnels.py`, milestone 3)
 

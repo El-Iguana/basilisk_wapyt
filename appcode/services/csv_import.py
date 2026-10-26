@@ -103,7 +103,7 @@ def _reflect(conn: Any, spec: Any, database: str, schema: str, table: str) -> li
     insp = inspect(conn)
     target = spec.schema_for(database, schema)
     views = set(insp.get_view_names(schema=target))
-    if spec.name == "postgresql":
+    if spec.has_matviews:
         views |= set(insp.get_materialized_view_names(schema=target))
     if table in views:
         raise CsvError(f"{table} is a view; import into a table")
@@ -217,7 +217,7 @@ def run(user_id: int, plan: dict, path: Any, progress: Any) -> dict:
 
         with conn.begin():
             if plan["mode"] == "replace":
-                deleted = conn.execute(delete(table)).rowcount or 0
+                deleted = spec.affected_rows(conn.execute(delete(table))) or 0
                 progress.log(f"Deleted the {deleted:,} rows that were there.")
             for sql in before:
                 progress.log(sql)
