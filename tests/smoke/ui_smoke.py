@@ -864,6 +864,75 @@ def compare_checks(page: Page, engine: str, name: str) -> None:
         "mssql": CMP_RESET["mssql"].split("GO\nCREATE")[0]}[engine])
 
 
+def data_compare_checks(page: Page, engine: str, name: str) -> None:
+    """Data compare: customers against a changed copy, apply the script, compare again."""
+    view = ".bk-view:visible"
+    copy = ("SELECT * INTO bk_dcmp FROM customers" if engine == "mssql"
+            else "CREATE TABLE bk_dcmp AS SELECT * FROM customers")
+    exact_tree_row(page, name).first.click(button="right")
+    page.click('.wapyt-tree-menu [data-action-id="sql"]')
+    page.wait_for_selector(".bk-sqltab:visible .cm-content", timeout=30000)
+    msgs = run_script(page, ".bk-sqltab:visible",
+                      f"DROP TABLE IF EXISTS bk_dcmp;\n{copy};\n"
+                      "DELETE FROM bk_dcmp WHERE id = 3;\n"
+                      "UPDATE bk_dcmp SET name = 'Changed' WHERE id = 2;\n")
+    check("✘" not in msgs, f"{engine}: a changed copy of customers")
+    close_tabs(page)
+    exact_tree_row(page, "customers").first.click(button="right")
+    page.click('.wapyt-tree-menu [data-action-id="data_compare"]')
+    page.wait_for_selector(f'{view} [data-role="cmp_table"][data-side="src"] option', state="attached",
+                           timeout=30000)
+    side = f'{view} .bk-cmp-side[data-side="tgt"]'
+    src_conn = page.get_attribute(f'{view} [data-role="cmp_conn"][data-side="src"] option[selected]',
+                                  "value")
+    page.select_option(f'{side} [data-role="cmp_conn"]', src_conn)
+    time.sleep(1)
+    if engine in ("postgresql", "mssql"):
+        page.select_option(f'{side} [data-role="cmp_schema"]',
+                           "public" if engine == "postgresql" else "dbo")
+    elif engine == "mysql":
+        page.select_option(f'{side} [data-role="cmp_db"]', "shop")
+    page.wait_for_selector(f'{side} [data-role="cmp_table"] option[value="bk_dcmp"]',
+                           state="attached", timeout=30000)
+    page.select_option(f'{side} [data-role="cmp_table"]', "bk_dcmp")
+    page.click(f'{view} [data-bk="cmp_run"]')
+    page.wait_for_selector(f"{view} tbody tr[data-row-id]", timeout=60000)
+    changes = sorted(page.eval_on_selector_all(
+        f'{view} tbody tr[data-row-id] td[data-column-id="change"]', "els => els.map(e => e.textContent)"))
+    columns = page.eval_on_selector_all(
+        f'{view} tbody tr[data-row-id] td[data-column-id="columns"]', "els => els.map(e => e.textContent)")
+    check(changes == ["Insert", "Update"] and "name" in columns,
+          f"{engine}: the data compare finds the missing and the changed row ({changes}, {columns})")
+    text = page.inner_text(f"{view} .bk-code-host .cm-content")
+    check("UPDATE" in text and "INSERT INTO" in text, f"{engine}: the row script shows")
+    shot(page, f"smoke-{engine}-19-data-compare")
+    page.locator(f"{view} tbody tr[data-row-id]").first.dblclick()
+    page.wait_for_selector(f"{modal(page)} .bk-cmp-kv", timeout=5000)
+    check(page.locator(f"{modal(page)} .bk-cmp-kv tr").count() > 3,
+          f"{engine}: double-click shows the row's values")
+    page.keyboard.press("Escape")
+    page.wait_for_selector(".wapyt-modal", state="detached", timeout=5000)
+    page.click(f'{view} [data-bk="cmp_sql"]')
+    page.wait_for_selector(".bk-sqltab:visible .cm-content", timeout=30000)
+    tab = ".bk-sqltab:visible"
+    page.click(f"{tab} .cm-content")
+    page.keyboard.press("Control+Shift+Enter")
+    page.wait_for_selector(f'{tab} [data-bk="run"]:visible', timeout=60000)
+    time.sleep(0.5)
+    msgs = page.inner_text(f"{tab} .bk-msgs")
+    check("✘" not in msgs and "✔" in msgs, f"{engine}: the row script runs on the target"
+          + ("" if "✘" not in msgs else f" ({[l for l in msgs.splitlines() if '✘' in l][:1]})"))
+    page.click('.wapyt-tab:has-text("Compare data")')
+    page.click(f'{view} [data-bk="cmp_run"]')
+    check(wait_text(page, f"{view} .bk-results", "The two tables hold the same rows", timeout=60000),
+          f"{engine}: after the script the tables hold the same rows")
+    close_tabs(page)
+    exact_tree_row(page, name).first.click(button="right")
+    page.click('.wapyt-tree-menu [data-action-id="sql"]')
+    page.wait_for_selector(".bk-sqltab:visible .cm-content", timeout=30000)
+    run_script(page, ".bk-sqltab:visible", "DROP TABLE bk_dcmp;")
+
+
 def ssh_up() -> bool:
     import socket
 
@@ -997,6 +1066,8 @@ def main() -> int:
                 er_checks(page, engine, name)
                 close_tabs(page)
                 compare_checks(page, engine, name)
+                close_tabs(page)
+                data_compare_checks(page, engine, name)
                 close_tabs(page)
                 ssh_checks(page, engine)
             except Exception as exc:  # noqa: BLE001 - report and carry on

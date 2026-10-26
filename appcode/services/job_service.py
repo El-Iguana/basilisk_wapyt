@@ -44,6 +44,37 @@ class JobService:
         return {"ok": True, "plan": jobs.put_plan(self._user_id, plan),
                 "note": plan.get("note", "")}
 
+    def compare_data(self, src_conn: int, src_db: str, src_schema: str, src_table: str,
+                     tgt_conn: int, tgt_db: str, tgt_schema: str, tgt_table: str,
+                     where: str = "") -> dict:
+        """
+        Check a data compare (tables, columns, key) and start it as a job;
+        ``status`` follows it and holds the differences when it is done.
+        """
+        if not self._user_id:
+            return {"ok": False, "error": "Not authenticated"}
+        from services import data_compare, jobs, sqlops
+        from services.engine_pool import ProfileNotFound, error_text
+        from services.engines import EngineError
+
+        user_id = self._user_id
+        source = {"conn": int(src_conn), "db": src_db or "", "schema": src_schema or "",
+                  "table": src_table or ""}
+        target = {"conn": int(tgt_conn), "db": tgt_db or "", "schema": tgt_schema or "",
+                  "table": tgt_table or ""}
+        try:
+            plan = data_compare.check(user_id, source, target, where or "")
+            job = jobs.start(user_id, "data_compare",
+                             f"Compare {source['table']} with {target['table']}",
+                             lambda progress: data_compare.run(user_id, plan, progress))
+        except ProfileNotFound:
+            return {"ok": False, "error": "Connection not found"}
+        except (data_compare.DataCompareError, sqlops.OpError, EngineError, jobs.JobLimit) as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception as exc:  # noqa: BLE001 - the driver's message, for the person
+            return {"ok": False, "error": error_text(exc)}
+        return {"ok": True, "job": job.id, "plan": data_compare.public_plan(plan)}
+
     def status(self, job_id: str, log_from: int = 0) -> dict:
         from services import jobs
 

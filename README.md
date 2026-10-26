@@ -40,6 +40,11 @@ running in Pyodide) and the wapyt widget set.
   and views that differ, and a script that makes the target like the source.
   Tick what to apply (drops start unticked), then open the script in a SQL
   editor on the target, copy it or save it.
+- **Data compare**: the rows of two tables (any connections and engines),
+  matched by primary key, optionally only those matching a WHERE: rows to
+  insert, to update (which columns) and only in the target, with the
+  INSERT / UPDATE / DELETE script for the target. Runs in the background with
+  progress and Cancel.
 - **Sessions**: what is running on a PostgreSQL, MySQL / MariaDB or SQL
   Server server, refreshed every few seconds, with Cancel query and End
   session.

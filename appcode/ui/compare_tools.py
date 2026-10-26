@@ -119,3 +119,99 @@ def statement_count(result: dict, chosen) -> int:
     chosen = set(chosen)
     return sum(1 for diff in result.get("diffs") or [] if diff["id"] in chosen
                for _phase, statement in diff.get("sql") or [] if not _is_comment(statement))
+
+
+# ---------------------------------------------------------------------------
+# Data compare (services/data_compare.py): rows to insert, update, delete
+# ---------------------------------------------------------------------------
+
+ROW_LABELS = {"insert": "Insert", "update": "Update", "delete": "Delete"}
+ROW_ICONS = {"insert": "mdi-plus-circle-outline", "update": "mdi-pencil-circle-outline",
+             "delete": "mdi-minus-circle-outline"}
+_ROW_CLASS = {"insert": "add", "update": "alter", "delete": "drop"}
+ROW_PHASES = (("delete", "Delete rows only in the target"), ("update", "Update rows that differ"),
+              ("insert", "Insert rows only in the source"))
+
+
+def data_default_chosen(rows: list) -> list:
+    """Ticked at first: inserts and updates; deletes lose data."""
+    return [row["id"] for row in rows if row.get("change") != "delete" and row.get("sql")]
+
+
+def _value(value) -> str:
+    return "NULL" if value is None else str(value)
+
+
+def data_detail(result: dict, row: dict, limit: int = 4) -> str:
+    """``name: a → b · price: 1 → 2`` for an update; the first values otherwise."""
+    columns = result.get("columns") or []
+    if row["change"] == "update":
+        index = {col["target"]: i for i, col in enumerate(columns)}
+        parts = []
+        for name in row.get("changed") or []:
+            i = index.get(name)
+            if i is None:
+                continue
+            parts.append(f"{name}: {_value(row['target'][i])} → {_value(row['source'][i])}")
+        more = len(parts) - limit
+        return " · ".join(parts[:limit]) + (f" · and {more} more" if more > 0 else "")
+    values = row["source"] if row["change"] == "insert" else row["target"]
+    keys = int(result.get("keys") or 0)
+    shown = [f"{col['target']}={_value(value)}"
+             for col, value in list(zip(columns, values))[keys:keys + limit]]
+    return " · ".join(shown)
+
+
+def data_rows(result: dict, chosen) -> list:
+    """The data compare grid's rows."""
+    chosen = set(chosen)
+    rows = []
+    for row in result.get("rows") or []:
+        change = row["change"]
+        rows.append({
+            "rid": row["id"], "use": row["id"] in chosen,
+            "change": ROW_LABELS.get(change, change), "change_icon": ROW_ICONS.get(change),
+            "key": row["key"], "columns": ", ".join(row.get("changed") or []),
+            "detail": data_detail(result, row) if row.get("sql") or change != "update" else
+            "⚠ only columns that cannot be written differ",
+            "cls": "bk-cmp-" + _ROW_CLASS.get(change, change),
+        })
+    return rows
+
+
+def data_summary(result: dict) -> str:
+    counts = result.get("counts") or {}
+    parts = []
+    for change, label in (("insert", "to insert"), ("update", "to update"),
+                          ("delete", "only in the target")):
+        if counts.get(change):
+            parts.append(f"{counts[change]:,} {label}")
+    parts.append(f"{counts.get('same', 0):,} the same")
+    return " · ".join(parts)
+
+
+def data_script(result: dict, chosen, header: list = ()) -> str:
+    """The ticked rows' statements: deletes, updates, then inserts (with their wrappers)."""
+    chosen = set(chosen)
+    out = [f"-- {line}" for line in header]
+    picked = {change: [row["sql"] for row in result.get("rows") or []
+                       if row["change"] == change and row["id"] in chosen and row.get("sql")]
+              for change, _label in ROW_PHASES}
+    if not any(picked.values()):
+        out += ["", "-- Nothing to run: tick the rows to apply."]
+    for change, label in ROW_PHASES:
+        statements = picked[change]
+        if not statements:
+            continue
+        if change == "insert":
+            statements = list(result.get("insert_before") or []) + statements + \
+                list(result.get("insert_after") or [])
+        out += ["", f"-- ── {label} " + "─" * max(4, 60 - len(label))]
+        out += [statement if statement.rstrip().endswith(";") else statement + ";"
+                for statement in statements]
+    return "\n".join(out).strip() + "\n"
+
+
+def data_statement_count(result: dict, chosen) -> int:
+    chosen = set(chosen)
+    return sum(1 for row in result.get("rows") or [] if row["id"] in chosen and row.get("sql"))
