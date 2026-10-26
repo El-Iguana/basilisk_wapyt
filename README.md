@@ -4,107 +4,141 @@
 
 <h1 align="center">Basilisk</h1>
 
-A browser-based SQL database manager — think DBeaver, in a browser tab.
-PostgreSQL, MySQL / MariaDB, SQL Server, SQLite, DuckDB and CockroachDB, built on
-[pytincture](https://github.com/pytincture/pytincture) (the page is Python
-running in Pyodide) and the wapyt widget set.
+<p align="center">
+  <b>A SQL database manager in your browser — think DBeaver, in a tab.</b><br>
+  PostgreSQL · MySQL / MariaDB · SQL Server · SQLite · DuckDB · CockroachDB
+</p>
 
-- **Database navigator**: connections in folders, then databases, schemas,
-  tables, views, functions, procedures, sequences and triggers, and each
-  server's users and roles, loaded as you open them. Open a routine, sequence,
-  trigger or role to see its properties and definition; a routine's **Call…**
-  writes a ready-to-fill call in a SQL editor. PostgreSQL materialized views
-  can be refreshed (concurrently when they allow it). Development / test /
-  production connection types; read-only connections.
-- **Object actions**: create a table (columns, types, primary key, an
-  auto-numbered column), rename, truncate or drop it, add / rename / drop
-  columns, create / drop indexes, drop views. Each shows its SQL as you
-  fill it in and runs it in one transaction where the engine allows.
-- **Table editor**: paged data with a WHERE / ORDER BY bar, sorting by header,
-  inline editing that stays pending until **Save** (shown as SQL first, run in
-  one transaction), add / duplicate / delete rows, Set NULL, filter by a
-  cell's value; columns, keys, indexes, foreign keys (double-click to follow)
-  and DDL.
-- **Grids**: column filters (shown as chips; on a table they filter every row
-  on the server), hide, move and resize columns (remembered per table),
-  freeze the first columns, copy rows as INSERT statements or a Markdown
-  table, and open the row a foreign-key cell points at.
-- **Import CSV** into a table: the delimiter and encoding are guessed,
-  columns are matched by name, a preview shows what will be stored. The whole
-  file goes in one transaction, with a progress bar and Cancel.
-- **ER diagram** of a schema, or of one table and its neighbours: tables
-  laid out by their foreign keys (crow's-foot lines), drag tables around
-  (remembered), all columns / keys only / names, find, export as SVG.
-- **Schema compare**: two schemas side by side (on one server, two servers,
-  or two different engines): tables, columns, keys, indexes, foreign keys
-  and views that differ, and a script that makes the target like the source.
-  Tick what to apply (drops start unticked), then open the script in a SQL
-  editor on the target, copy it or save it.
-- **Data compare**: the rows of two tables (any connections and engines),
-  matched by primary key, optionally only those matching a WHERE: rows to
-  insert, to update (which columns) and only in the target, with the
-  INSERT / UPDATE / DELETE script for the target. Runs in the background with
-  progress and Cancel.
-- **Sessions**: what is running on a PostgreSQL, MySQL / MariaDB or SQL
-  Server server, refreshed every few seconds, with Cancel query and End
-  session.
-- **Value panel** (F7, or Shift+Enter on a cell): the whole value of the
-  focused cell beside the grid, as text, pretty JSON, a hex dump or a
-  picture. Edit long text, JSON and binary there, load a value from a file or
-  save it to one.
-- **SQL editor**: syntax highlighting and table/column completion for each
-  dialect, run the statement at the cursor or the whole script, cancel a
-  running statement, per-statement timeouts, results in a grid, messages,
-  query history, formatting, drafts kept per connection. Auto-commit or
-  manual commit with Commit / Rollback; explain plans (estimated or with
-  actual rows and times) for all four engines.
-- **Export** a table (with its filter) or a query result to CSV or JSON,
-  streamed from the server.
-- **SSH tunnels**: reach a database through an SSH server, with a password
-  or a private key (any type `ssh-keygen` makes, with a passphrase or not);
-  the server's host key is pinned on first use.
-- Multi-user, passwords encrypted at rest, sign-in required.
+<p align="center">
+  <a href="https://github.com/El-Iguana/basilisk_wapyt/releases/latest">Download 0.1.0</a> ·
+  <a href="INSTALL.md">Install guide</a> ·
+  <a href="https://github.com/El-Iguana/basilisk_wapyt/wiki">Wiki</a> ·
+  <a href="ROADMAP.md">Roadmap</a>
+</p>
+
+Basilisk is a self-hosted database GUI: browse and edit tables, write SQL with
+completion, read explain plans, draw ER diagrams and compare schemas and data
+— for several people, each with their own encrypted connections. It is built
+on [pytincture](https://github.com/pytincture/pytincture) (the whole interface
+is Python running in your browser, through Pyodide) and the
+[wapyt](https://github.com/WAwesome-AI/wa_pytincture_widgetset) widget set.
+
+![The navigator with three connections, and a PostgreSQL table open in a tab](docs/images/basilisk-table.png)
+
+| | |
+|---|---|
+| ![The SQL editor with a query and its result grid](docs/images/basilisk-sql.png) | ![The ER diagram of a schema, one table picked out](docs/images/basilisk-er.png) |
+| **SQL editor** — completion, results, explain plans | **ER diagram** — laid out by foreign keys |
+| ![Schema compare between two schemas, with the script below](docs/images/basilisk-compare.png) | |
+| **Schema compare** — the differences and the script that fixes them | |
+
+## What it does
+
+**Browse and edit**
+- **Navigator**: connections in folders, then databases, schemas, tables,
+  views, functions, procedures, sequences, triggers, and each server's users
+  and roles, loaded as you open them. Routines, sequences, triggers and roles
+  open with their properties and definition; **Call…** writes a ready-to-fill
+  call. PostgreSQL materialized views refresh (concurrently when they can).
+- **Table editor**: paged data with WHERE / ORDER BY, sorting by header,
+  inline edits that stay pending until **Save** (shown as SQL first, run in one
+  transaction), add / duplicate / delete rows, Set NULL; columns, keys,
+  indexes, foreign keys (double-click to follow) and DDL.
+- **Grids**: column filters as chips (on a table they filter every row on the
+  server), hide, move, resize and freeze columns (remembered per table), copy
+  rows as INSERT statements or a Markdown table, open the row a foreign key
+  points at.
+- **Value panel** (F7): a cell's whole value as text, pretty JSON, a hex dump
+  or a picture; edit long values there, load from or save to a file.
+- **Object actions**: create, rename, truncate and drop tables; add, rename and
+  drop columns; create and drop indexes — each previews its SQL as you type.
+- **Import CSV** with the delimiter and encoding guessed and columns matched by
+  name, in one transaction with progress and Cancel. **Export** tables and
+  results to CSV or JSON.
+
+**Query**
+- **SQL editor** (CodeMirror): syntax highlighting and completion per dialect,
+  run the statement at the cursor or the whole script, cancel, timeouts,
+  history, formatting, drafts. Auto-commit or **manual commit** with
+  Commit / Rollback.
+- **Explain plans**, estimated or with actual rows and times, as one plan grid
+  for every engine, with the costly steps shaded.
+- **Sessions**: what runs on a PostgreSQL, MySQL / MariaDB or SQL Server
+  server, with Cancel query and End session.
+
+**Design and compare**
+- **ER diagram** of a schema or of one table and its neighbours: drag tables
+  (remembered), keys only or names only, find, export as SVG.
+- **Schema compare** between any two schemas — the same server, two servers or
+  two engines — with a ticked list of differences and the script, in a safe
+  order, that makes the target like the source.
+- **Data compare** of two tables by primary key: rows to insert, update and
+  delete, and the script for the target, run in the background.
+
+**Run it safely**
+- Several accounts, each with their own connections; database passwords and
+  SSH keys encrypted at rest.
+- **SSH tunnels** to databases only an SSH server can reach, with the host
+  key pinned on first use.
+- **Read-only** and **production** connections: one cannot change anything,
+  the other asks before anything that is not a read.
+
+## Engines
+
+| Engine | Connects to | Notes |
+|---|---|---|
+| PostgreSQL | a server | materialized views, sessions, savepoints in manual commit |
+| MySQL / MariaDB | a server | sessions; MySQL commits DDL as it runs |
+| SQL Server | a server | `GO` batches, sessions |
+| CockroachDB | a server | PostgreSQL's features, without the sessions list |
+| SQLite | a file | in the server's database files folder |
+| DuckDB | a file | in the same folder; explain and analyze |
 
 ## Install
 
-**[INSTALL.md](INSTALL.md)** has it all, step by step:
+**[INSTALL.md](INSTALL.md)** goes step by step; in short:
 
 - **With Docker or Podman** on Windows, macOS or Linux:
   ```bash
+  git clone https://github.com/El-Iguana/basilisk_wapyt.git && cd basilisk_wapyt
   cp .env.example .env          # set BASILISK_ADMIN_PASS
-  docker compose up -d --build  # http://127.0.0.1:8768/basilisk
+  docker compose up -d --build  # then open http://127.0.0.1:8768/basilisk
   ```
-  (`--profile postgres` adds a PostgreSQL to try it with;
-  `compose.host-network.yaml` on Linux reaches databases on the host's
-  127.0.0.1.)
-- **Windows without Docker**: `Basilisk-<version>-setup.exe` from the
-  [releases](https://github.com/El-Iguana/basilisk_wapyt/releases), a
-  per-user install with a tray icon.
+  `--profile postgres` adds a PostgreSQL to try it with;
+  `compose.host-network.yaml` (Linux) reaches databases on the host's
+  127.0.0.1.
+- **Windows without Docker**: `Basilisk-0.1.0-setup.exe` from the
+  [latest release](https://github.com/El-Iguana/basilisk_wapyt/releases/latest)
+  — a per-user install with its own Python and a tray icon, no administrator
+  rights needed.
 
-From source, for development:
+Sign in as `admin` (the password from `.env`, or `change_me` with the
+Windows installer); Basilisk asks you to choose your own. Use `127.0.0.1`, not
+`localhost`.
+
+## Documentation
+
+- **[The wiki](https://github.com/El-Iguana/basilisk_wapyt/wiki)** — using
+  Basilisk: connections, the table editor, the SQL editor, explain plans, the
+  ER diagram, compares, administration, security and troubleshooting.
+- **[INSTALL.md](INSTALL.md)** — installing, updating, backups, reaching it
+  from other machines.
+- **[ROADMAP.md](ROADMAP.md)** — what is done and what comes next.
+- **`CLAUDE.md`** — the design, the test databases and the traps, for working
+  on Basilisk.
+
+## Develop
 
 ```bash
 cp .env.example .env          # set BASILISK_ADMIN_PASS
 uv sync
 ../wa_pytincture_widgetset/scripts/dev_wheel.sh appcode   # the widget set for the browser
 uv run python service.py      # http://127.0.0.1:8768/basilisk/
+uv run --group dev pytest -q  # the live tests skip databases that are not running
 ```
 
 `scripts/podman-run.sh` builds the development container (Linux + Podman,
-host networking, the sibling wapyt checkout).
-
-SQLite and DuckDB connections open files inside one folder on the server
-(`BASILISK_SQLITE_ROOT`, by default `data/sqlite`). DuckDB opens a file one way
-per process: a read-only and a read-write connection to the same file cannot
-be open together.
-
-## Develop
-
-See `CLAUDE.md` for the design, the test databases and the traps, and
-`ROADMAP.md` for what comes next.
-
-```bash
-uv run --group dev pytest -q
-```
+host networking, the sibling wapyt checkout). The test databases and the
+browser smoke test are described in `CLAUDE.md`.
 
 MIT licensed.
