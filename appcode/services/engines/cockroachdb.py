@@ -73,37 +73,92 @@ class BasiliskCockroachDialect(CockroachDBDialect_psycopg):
             {"schema": schema or self.default_schema_name}).all()
         return {(table, column) for table, column in rows}
 
+    def _no_hidden_key(self, conn: Any, schema: Optional[str], table: str, pk: dict,
+                       hidden: Optional[set] = None) -> dict:
+        """A table made without a key gets a hidden ``rowid`` key: that is no key here."""
+        columns = (pk or {}).get("constrained_columns") or []
+        hidden = self._hidden(conn, schema) if hidden is None else hidden
+        if columns and all((table, column) in hidden for column in columns):
+            return {"constrained_columns": [], "name": None}
+        return pk
+
+    # Neither calls the other: sqlalchemy-cockroachdb 2.0.4 (under SQLAlchemy
+    # 2.0) answers the multi form through the single one, SQLAlchemy 2.1's
+    # PostgreSQL dialect the other way round.
+    def get_pk_constraint(self, connection: Any, table_name: str, schema: Optional[str] = None,
+                          **kw: Any) -> dict:
+        pk = super().get_pk_constraint(connection, table_name, schema, **kw)
+        return self._no_hidden_key(connection, schema, table_name, pk)
+
     def get_multi_pk_constraint(self, connection: Any, schema: Optional[str] = None,
                                 filter_names: Any = None, scope: Any = None, kind: Any = None,
                                 **kw: Any) -> list:
-        """A table made without a key gets a hidden ``rowid`` key: that is no key here."""
         from sqlalchemy.engine.reflection import ObjectKind, ObjectScope
 
         found = list(super().get_multi_pk_constraint(
             connection, schema=schema, filter_names=filter_names,
             scope=scope or ObjectScope.DEFAULT, kind=kind or ObjectKind.TABLE, **kw))
         hidden = self._hidden(connection, schema)
-        out = []
-        for key, pk in found:
-            columns = pk.get("constrained_columns") or []
-            if columns and all((key[1], column) in hidden for column in columns):
-                pk = {"constrained_columns": [], "name": None}
-            out.append((key, pk))
+        return [(key, self._no_hidden_key(connection, schema, key[1], pk, hidden))
+                for key, pk in found]
+
+    _FK_ACTIONS = {"c": "CASCADE", "n": "SET NULL", "d": "SET DEFAULT", "r": "RESTRICT"}
+
+    def _foreign_keys(self, conn: Any, schema: Optional[str], names: Any) -> dict:
+        """
+        ``{table: [fk, …]}`` from pg_constraint, read here: the bundled readers
+        call each other in a loop under one SQLAlchemy or the other.
+        """
+        from sqlalchemy import bindparam, text
+
+        target = schema or self.default_schema_name
+        rows = conn.execute(text(
+            "SELECT cl.relname, con.conname, con.conkey, con.confkey, rn.nspname, rcl.relname, "
+            "con.confdeltype, con.confupdtype, con.conrelid, con.confrelid "
+            "FROM pg_catalog.pg_constraint con "
+            "JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid "
+            "JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace "
+            "JOIN pg_catalog.pg_class rcl ON rcl.oid = con.confrelid "
+            "JOIN pg_catalog.pg_namespace rn ON rn.oid = rcl.relnamespace "
+            "WHERE con.contype = 'f' AND n.nspname = :schema ORDER BY 1, 2"),
+            {"schema": target}).all()
+        if names is not None:
+            wanted = set(names)
+            rows = [row for row in rows if row[0] in wanted]
+        relids = sorted({row[8] for row in rows} | {row[9] for row in rows})
+        attnames: dict = {}
+        if relids:
+            for relid, num, attname in conn.execute(text(
+                    "SELECT attrelid, attnum, attname FROM pg_catalog.pg_attribute "
+                    "WHERE attrelid IN :ids").bindparams(bindparam("ids", expanding=True)),
+                    {"ids": relids}).all():
+                attnames[(relid, num)] = attname
+        out: dict = {}
+        for table, name, conkey, confkey, ref_schema, ref_table, on_delete, on_update, \
+                relid, ref_relid in rows:
+            out.setdefault(table, []).append({
+                "name": name,
+                "constrained_columns": [attnames.get((relid, n), str(n)) for n in conkey or []],
+                "referred_schema": None if ref_schema == target and schema is None else ref_schema,
+                "referred_table": ref_table,
+                "referred_columns": [attnames.get((ref_relid, n), str(n)) for n in confkey or []],
+                "options": {key: self._FK_ACTIONS[code] for key, code in
+                            (("ondelete", on_delete), ("onupdate", on_update))
+                            if code in self._FK_ACTIONS},
+            })
         return out
 
-    def get_pk_constraint(self, connection: Any, table_name: str, schema: Optional[str] = None,
-                          **kw: Any) -> dict:
-        found = dict(self.get_multi_pk_constraint(connection, schema, [table_name]))
-        return found.get((schema, table_name)) or {"constrained_columns": [], "name": None}
+    def get_foreign_keys(self, connection: Any, table_name: str, schema: Optional[str] = None,
+                         **kw: Any) -> list:
+        return self._foreign_keys(connection, schema, [table_name]).get(table_name, [])
 
     def get_multi_foreign_keys(self, connection: Any, schema: Optional[str] = None,
                                filter_names: Any = None, scope: Any = None, kind: Any = None,
                                **kw: Any) -> list:
         names = filter_names if filter_names is not None else \
             self.get_table_names(connection, schema)
-        return [((schema, name), self.get_foreign_keys(connection, name, schema))
-                for name in names]
-
+        found = self._foreign_keys(connection, schema, names)
+        return [((schema, name), found.get(name, [])) for name in names]
 
 def register() -> None:
     from sqlalchemy.dialects import registry
