@@ -43,6 +43,7 @@ appcode/                   # pytincture modules_path
     sessions.py            #   manual commit mode: pinned connection per SQL tab, idle reaper — plain module
     sqlops.py              #   everything done to a database; the running-statement registry
     ddl.py                 #   object actions' statements (create/rename/drop/truncate, columns, indexes) — pure
+    schema_compare.py      #   schema compare: read two schemas, the differences and their DDL — plain module
     csv_import.py          #   CSV import: option checks, the import job — plain module
     jobs.py                #   background jobs with progress (from Monguana) + import plans — plain module
     job_service.py         #   BFF: plan an import, follow / cancel a job
@@ -57,12 +58,14 @@ appcode/                   # pytincture modules_path
   ui/grid_tools.py         #   grids: column layouts, column filters, copy as INSERT / Markdown, FK rows — pure
   ui/import_tools.py       #   the Import CSV dialog: sniffing, preview, column matching — pure
   ui/er_layout.py          #   the ER diagram: model, layout, SVG — pure
+  ui/compare_tools.py      #   the schema compare tab: rows, the ticked differences' script — pure
   static/                  #   basilisk_avatar.webp: logo, login page, favicon, About
   vendor/codemirror/       #   the SQL editor bundle (built, committed), served at /vendor
 docs/basilisk.webp         # the README's picture (both cut from the original artwork, 1254 px)
 tools/codemirror/          # its recipe: pinned package.json, entry.js, build.sh
 tests/                     # test_units.py, test_plans.py, test_value_panel.py, test_grid_tools.py,
-                           # test_import_tools.py, test_er_layout.py, test_tunnels.py, test_bff_state.py, test_live.py (needs the databases)
+                           # test_import_tools.py, test_er_layout.py, test_tunnels.py, test_schema_compare.py,
+                           # test_bff_state.py, test_live.py (needs the databases)
 tests/smoke/               # seed_sample.py + ui_smoke.py (Playwright, all four engines)
 Containerfile, scripts/podman-run.sh   # image + dev container "basilisk"
 ```
@@ -105,8 +108,8 @@ podman run -d --name basilisk-mssql -p 127.0.0.1:51433:1433 -e ACCEPT_EULA=Y \
   -e MSSQL_SA_PASSWORD="$PW" -e MSSQL_PID=Developer mcr.microsoft.com/mssql/server:2022-latest
 uv run python tests/smoke/seed_sample.py          # the shop sample in all four (SQLite: data/sqlite/shop.db)
 tests/smoke/ssh_server.sh                         # SSH server basilisk-ssh on 127.0.0.1:52222 (tunnel tests)
-uv run --group dev pytest -q tests/test_live.py   # 115 live tests
-BASILISK_PASS=… python3 tests/smoke/ui_smoke.py   # ~85 UI checks per engine
+uv run --group dev pytest -q tests/test_live.py   # 127 live tests
+BASILISK_PASS=… python3 tests/smoke/ui_smoke.py   # ~90 UI checks per engine
 ```
 
 Users: `postgres` / `root` / `sa`. The sample (`seed_sample.py`): customers,
@@ -381,6 +384,55 @@ Basilisk's own pooled connections costs nothing but that statement.
   table's own diagram (**ER diagram around this table**) is not saved.
   **Pointer capture sends `dblclick` to the host, not the table**: two clicks
   on one table within 400 ms open it instead.
+
+### Schema compare (`schema_compare.py`, milestone 3)
+
+- **Compare schema with…** on a server, database or schema opens a tab with a
+  source and a target (connection, database, schema each; any two
+  locations, different engines too). `sqlops.compare_schemas` reads both with
+  bulk reflection (`snapshot`), and `compare` answers one difference per
+  object, each with its statements **for the target**, tagged with a phase
+  (`PHASES`: drop views, drop FKs, drop indexes, drop PKs, create tables,
+  add / change / drop columns, add PKs, create indexes, add FKs, drop
+  tables, views). The page (`ui/compare_tools.script`) puts the ticked
+  differences' statements in phase order, so any subset runs top to bottom;
+  drops start unticked. The script opens in a SQL editor on the target:
+  nothing runs from the compare tab itself.
+- Tables, views and columns pair by name (exactly, then ignoring case); keys,
+  indexes (unique constraints and unique indexes are one thing) and foreign
+  keys pair **by their columns**: engines invent their names. A changed FK
+  is a drop and an add.
+- Dialect differences are `Engine` hooks: `sql_alter_column` (PostgreSQL
+  `TYPE … USING`, MySQL `MODIFY` restating the column, SQL Server drops the
+  default constraint (looked up in the script itself, `_drop_default_sql`)
+  before changing the type, standard SQL otherwise), `sql_drop_constraint`
+  (MySQL `DROP FOREIGN KEY` / `PRIMARY KEY` / `INDEX`),
+  `sql_script_before_drop_column`, `replace_view` (`CREATE OR ALTER` on SQL
+  Server; SQLite drops and creates), `script_batches` (SQL Server scripts
+  end each statement with `GO`), `before_compare`.
+- **SQLite cannot alter a column, key or FK**: a table with such changes is
+  one "Rebuilt" difference (`_Writer.rebuild`): `foreign_keys` off, new table
+  `_bk_new_<t>`, rows copied, old table dropped, renamed (with
+  `legacy_alter_table` on: a view on the table fails the rename otherwise),
+  indexes made again, `foreign_key_check`. Triggers on it are lost (noted).
+- **Between engines** types compare by family (`family`: INT, TEXT,
+  VARCHAR(n), NUMERIC(p,s)…) and are written through `as_generic()` without
+  collation; MySQL TINYINT(1) is a boolean, SQL Server keeps JSON as
+  NVARCHAR(max), MySQL and SQLite keep UUIDs as CHAR(32), MySQL's own
+  index per foreign key is no difference, and SQLite's rowid key numbers
+  itself whether asked or not. Defaults compare only when both are plain
+  values (`portable_default`); view definitions are not compared and are
+  written into the script commented out.
+- **A key column is never NULL** whatever the engine reports (SQLite says a
+  rowid key is nullable).
+- **PostgreSQL view definitions leave out the schema** of tables on the
+  search path, so `before_compare` sets `search_path` to `pg_catalog` for the
+  read (never committed); `retarget` then points the source schema's names at
+  the target's. SQL Server definitions are the text as written: unqualified
+  names keep meaning the default schema (noted when the schemas differ).
+- `tests/test_schema_compare.py` round-trips two SQLite files;
+  `test_live.py` round-trips each engine (compare, run the script, compare
+  again: nothing left) and copies each server's schema into SQLite and back.
 
 ### SSH tunnels (`tunnels.py`, milestone 3)
 

@@ -259,6 +259,51 @@ class Engine:
         return []
 
     # ------------------------------------------------------------------
+    # Schema compare (services/schema_compare.py writes the script)
+    # ------------------------------------------------------------------
+    # A script runs as GO-separated batches (SQL Server).
+    script_batches = False
+    # SQLite cannot change a column, a key or a foreign key in place: the
+    # compare script rebuilds the table instead.
+    rebuilds_tables = False
+    # How a view is replaced; None: dropped and created again.
+    replace_view: Optional[str] = "CREATE OR REPLACE VIEW"
+
+    def before_compare(self, conn: Any, schema: Optional[str]) -> None:
+        """Set the connection up for reading a schema to compare (it is never committed)."""
+
+    def sql_alter_column(self, prep: Any, schema: Optional[str], table: str, column: str,
+                         new: dict, old: dict, changed: set) -> list:
+        """
+        Statements that give ``column`` the ``new`` definition (``type``,
+        ``nullable``, ``default``, ``auto``); ``changed`` names what differs
+        from ``old``. Standard SQL here.
+        """
+        target = self.qualified(prep, schema, table)
+        col = prep.quote(column)
+        out = []
+        if "type" in changed:
+            out.append(f"ALTER TABLE {target} ALTER COLUMN {col} SET DATA TYPE {new['type']}")
+        if "nullable" in changed:
+            out.append(f"ALTER TABLE {target} ALTER COLUMN {col} "
+                       + ("DROP NOT NULL" if new["nullable"] else "SET NOT NULL"))
+        if "default" in changed:
+            out.append(f"ALTER TABLE {target} ALTER COLUMN {col} "
+                       + (f"SET DEFAULT {new['default']}" if new.get("default") else "DROP DEFAULT"))
+        return out
+
+    def sql_drop_constraint(self, prep: Any, schema: Optional[str], table: str,
+                            name: str, kind: str) -> str:
+        """Drop a ``fk``, ``pk`` or ``unique`` constraint by name."""
+        return (f"ALTER TABLE {self.qualified(prep, schema, table)} "
+                f"DROP CONSTRAINT {prep.quote(name)}")
+
+    def sql_script_before_drop_column(self, prep: Any, schema: Optional[str], table: str,
+                                      column: str) -> list:
+        """``before_drop_column`` for a script, without asking the server first."""
+        return []
+
+    # ------------------------------------------------------------------
     # CSV import (services/csv_import.py)
     # ------------------------------------------------------------------
 

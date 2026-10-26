@@ -111,6 +111,12 @@ class SqlService:
         """Tables, columns, keys and foreign keys of a location, for the ER diagram."""
         return self._call("er_model", int(conn_id), database or "", schema or "")
 
+    def compare_schemas(self, src_conn: int, src_db: str, src_schema: str, tgt_conn: int,
+                        tgt_db: str, tgt_schema: str) -> dict:
+        """Differences between two schemas and the statements that make the target like the source."""
+        return self._call("compare_schemas", int(src_conn), src_db or "", src_schema or "",
+                          int(tgt_conn), tgt_db or "", tgt_schema or "")
+
     # Session manager ----------------------------------------------------------
 
     def sessions(self, conn_id: int, include_idle: bool = False) -> dict:

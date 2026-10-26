@@ -757,6 +757,113 @@ def er_checks(page: Page, engine: str, name: str) -> None:
           f"{engine}: a table's diagram shows its neighbours ({shown})")
 
 
+CMP_RESET = {
+    "postgresql": "DROP SCHEMA IF EXISTS bk_cmp CASCADE;\nCREATE SCHEMA bk_cmp;",
+    "mysql": "DROP DATABASE IF EXISTS bk_cmp;\nCREATE DATABASE bk_cmp;",
+    "mssql": ("IF SCHEMA_ID('bk_cmp') IS NOT NULL BEGIN\n"
+              "DECLARE @s nvarchar(max) = N'';\n"
+              "SELECT @s += N'ALTER TABLE bk_cmp.' + QUOTENAME(OBJECT_NAME(parent_object_id)) "
+              "+ N' DROP CONSTRAINT ' + QUOTENAME(name) + N';' FROM sys.foreign_keys "
+              "WHERE schema_id = SCHEMA_ID('bk_cmp');\n"
+              "SELECT @s += N'DROP VIEW bk_cmp.' + QUOTENAME(name) + N';' FROM sys.views "
+              "WHERE schema_id = SCHEMA_ID('bk_cmp');\n"
+              "SELECT @s += N'DROP TABLE bk_cmp.' + QUOTENAME(name) + N';' FROM sys.tables "
+              "WHERE schema_id = SCHEMA_ID('bk_cmp');\n"
+              "EXEC (@s); DROP SCHEMA bk_cmp; END\nGO\nCREATE SCHEMA bk_cmp\nGO\n"),
+}
+
+
+def run_script(page: Page, tab: str, sql: str) -> str:
+    """Run a whole script in the SQL tab; its messages."""
+    page.click(f"{tab} .cm-content")
+    page.keyboard.press("Control+a")
+    page.keyboard.insert_text(sql)
+    page.keyboard.press("Control+Shift+Enter")
+    page.wait_for_selector(f'{tab} [data-bk="run"]:visible', timeout=60000)
+    time.sleep(0.5)
+    return page.inner_text(f"{tab} .bk-msgs") if page.locator(f"{tab} .bk-msgs").count() else ""
+
+
+def compare_rows(page: Page, view: str) -> list:
+    return page.eval_on_selector_all(
+        f'{view} tbody tr[data-row-id] td[data-column-id="object"]', "els => els.map(e => e.textContent)")
+
+
+def compare_checks(page: Page, engine: str, name: str) -> None:
+    """Schema compare: the sample against an empty schema, apply the script, compare again."""
+    where = {"postgresql": "public", "mysql": "shop", "mssql": "dbo", "sqlite": name}[engine]
+    view = ".bk-view:visible"
+    if engine == "sqlite":
+        exact_tree_row(page, where).first.click(button="right")
+        page.click('.wapyt-tree-menu [data-action-id="compare"]')
+        page.wait_for_selector(f'{view} [data-role="cmp_conn"][data-side="tgt"] option', state="attached")
+        page.select_option(f'{view} [data-role="cmp_conn"][data-side="tgt"]',
+                           page.get_attribute(f'{view} [data-role="cmp_conn"][data-side="src"]'
+                                              " option[selected]", "value"))
+        time.sleep(0.5)
+        page.click(f'{view} [data-bk="cmp_run"]')
+        check(wait_text(page, ".wapyt-toast, .wapyt-message", "the same"),
+              f"{engine}: comparing a schema with itself is refused")
+        return
+    exact_tree_row(page, name).first.click(button="right")
+    page.click('.wapyt-tree-menu [data-action-id="sql"]')
+    page.wait_for_selector(".bk-sqltab:visible .cm-content", timeout=30000)
+    msgs = run_script(page, ".bk-sqltab:visible", CMP_RESET[engine])
+    check("✘" not in msgs, f"{engine}: an empty bk_cmp to compare with" + (f" ({msgs})" if "✘" in msgs else ""))
+    close_tabs(page)
+    exact_tree_row(page, where).first.click(button="right")
+    page.click('.wapyt-tree-menu [data-action-id="compare"]')
+    role = "cmp_db" if engine == "mysql" else "cmp_schema"
+    picker = f'{view} [data-role="{role}"][data-side="tgt"]'
+    page.wait_for_selector(f'{picker} option[value="bk_cmp"]', state="attached", timeout=30000)
+    page.select_option(picker, "bk_cmp")
+    time.sleep(0.5)
+    page.click(f'{view} [data-bk="cmp_run"]')
+    page.wait_for_selector(f"{view} tbody tr[data-row-id]", timeout=60000)
+    objects = compare_rows(page, view)
+    wanted = {"customers", "products", "orders", "order_items", "audit_log", "order_totals"}
+    check(wanted <= set(objects), f"{engine}: the compare lists the sample's tables and view ({len(objects)})")
+    count = page.inner_text(f'{view} [id$="-count"]')
+    text = page.inner_text(f"{view} .bk-code-host .cm-content")
+    check("CREATE TABLE" in text and "Create tables" in text and "statements" in count,
+          f"{engine}: the script shows ({count})")
+    shot(page, f"smoke-{engine}-18-compare")
+    row = page.locator(f'{view} tbody tr:has(td[data-column-id="object"]:text-is("customers"))')
+    row.locator('td[data-column-id="use"] input').click()
+    time.sleep(0.4)
+    fewer = page.inner_text(f'{view} [id$="-count"]')
+    check(fewer != count, f"{engine}: unticking a difference changes the script ({fewer})")
+    page.click(f'{view} [data-bk="cmp_tick"][data-which="all"]')
+    time.sleep(0.4)
+    row.dblclick()
+    page.wait_for_selector(f"{modal(page)} .bk-pre", timeout=5000)
+    check("CREATE TABLE" in page.inner_text(f"{modal(page)} .bk-pre"),
+          f"{engine}: double-click shows a difference's statements")
+    page.keyboard.press("Escape")
+    page.wait_for_selector(".wapyt-modal", state="detached", timeout=5000)
+    page.click(f'{view} [data-bk="cmp_sql"]')
+    page.wait_for_selector(".bk-sqltab:visible .cm-content", timeout=30000)
+    tab = ".bk-sqltab:visible"
+    page.click(f"{tab} .cm-content")
+    page.keyboard.press("Control+Shift+Enter")
+    page.wait_for_selector(f'{tab} [data-bk="run"]:visible', timeout=60000)
+    time.sleep(0.5)
+    msgs = page.inner_text(f"{tab} .bk-msgs")
+    check("✘" not in msgs and "✔" in msgs, f"{engine}: the script runs on the target"
+          + ("" if "✘" not in msgs else f" ({[l for l in msgs.splitlines() if '✘' in l][:1]})"))
+    page.click('.wapyt-tab:has-text("Compare")')
+    page.click(f'{view} [data-bk="cmp_run"]')
+    check(wait_text(page, f"{view} .bk-results", "The two schemas are the same", timeout=60000),
+          f"{engine}: after the script the schemas compare the same ({compare_rows(page, view)[:5]})")
+    close_tabs(page)
+    exact_tree_row(page, name).first.click(button="right")
+    page.click('.wapyt-tree-menu [data-action-id="sql"]')
+    page.wait_for_selector(".bk-sqltab:visible .cm-content", timeout=30000)
+    run_script(page, ".bk-sqltab:visible", {
+        "postgresql": "DROP SCHEMA bk_cmp CASCADE;", "mysql": "DROP DATABASE bk_cmp;",
+        "mssql": CMP_RESET["mssql"].split("GO\nCREATE")[0]}[engine])
+
+
 def ssh_up() -> bool:
     import socket
 
@@ -888,6 +995,8 @@ def main() -> int:
                 session_checks(page, engine, name)
                 close_tabs(page)
                 er_checks(page, engine, name)
+                close_tabs(page)
+                compare_checks(page, engine, name)
                 close_tabs(page)
                 ssh_checks(page, engine)
             except Exception as exc:  # noqa: BLE001 - report and carry on

@@ -174,6 +174,25 @@ class MySQL(Engine):
 
     def sql_drop_index(self, prep: Any, schema: Optional[str], table: str, index: str) -> str:
         return f"DROP INDEX {prep.quote(index)} ON {self.qualified(prep, schema, table)}"
+
+    def sql_alter_column(self, prep: Any, schema: Optional[str], table: str, column: str,
+                         new: dict, old: dict, changed: set) -> list:
+        # MODIFY restates the whole column, so every part comes from ``new``.
+        parts = [prep.quote(column), new["type"], "NULL" if new["nullable"] else "NOT NULL"]
+        if new.get("default") and not new.get("auto"):
+            parts.append(f"DEFAULT {new['default']}")
+        if new.get("auto"):
+            parts.append("AUTO_INCREMENT")
+        return [f"ALTER TABLE {self.qualified(prep, schema, table)} MODIFY COLUMN {' '.join(parts)}"]
+
+    def sql_drop_constraint(self, prep: Any, schema: Optional[str], table: str,
+                            name: str, kind: str) -> str:
+        target = self.qualified(prep, schema, table)
+        if kind == "fk":
+            return f"ALTER TABLE {target} DROP FOREIGN KEY {prep.quote(name)}"
+        if kind == "pk":
+            return f"ALTER TABLE {target} DROP PRIMARY KEY"
+        return f"ALTER TABLE {target} DROP INDEX {prep.quote(name)}"
     _SYSTEM_ACCOUNTS = frozenset({"mysql.sys", "mysql.session", "mysql.infoschema",
                                   "mariadb.sys"})
 

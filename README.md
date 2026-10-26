@@ -35,6 +35,11 @@ running in Pyodide) and the wapyt widget set.
 - **ER diagram** of a schema, or of one table and its neighbours: tables
   laid out by their foreign keys (crow's-foot lines), drag tables around
   (remembered), all columns / keys only / names, find, export as SVG.
+- **Schema compare**: two schemas side by side (on one server, two servers,
+  or two different engines): tables, columns, keys, indexes, foreign keys
+  and views that differ, and a script that makes the target like the source.
+  Tick what to apply (drops start unticked), then open the script in a SQL
+  editor on the target, copy it or save it.
 - **Sessions**: what is running on a PostgreSQL, MySQL / MariaDB or SQL
   Server server, refreshed every few seconds, with Cancel query and End
   session.

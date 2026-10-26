@@ -80,7 +80,15 @@ test.
   SVG export; tables in other schemas as ghost boxes. Follow-ups: PNG export;
   views in the diagram; edge routing around boxes (orthogonal lines); create
   a foreign key by dragging between columns; print / PDF.
-- **Data compare / schema compare** between two connections.
+- ~~**Schema compare**~~ — done (2026-10-26): two schemas on any connections
+  (different engines too); tables, columns, primary keys, indexes and unique
+  constraints, foreign keys and views; a script for the target in a safe
+  order, per ticked difference, opened in a SQL editor (SQLite tables are
+  rebuilt). Follow-ups: check constraints, routines, sequences, triggers and
+  materialized views; renames (now a drop and an add); column order; SQL
+  Server unique constraints (now unique indexes); comparing whole databases.
+- **Data compare** between two tables (rows by primary key: missing, extra,
+  different), with the INSERT / UPDATE / DELETE script.
 - ~~**SSH tunnels**~~ — done (2026-10-26): password or private-key sign-in,
   host key pinned on first use (forgettable), a tunnel per pooled engine
   dialled before the driver connects, rebuilt when it drops. Follow-ups: jump
