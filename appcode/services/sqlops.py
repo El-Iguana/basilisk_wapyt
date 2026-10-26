@@ -850,6 +850,40 @@ def _short_type(sa_type: Any, dialect: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Schema compare (services/schema_compare.py)
+# ---------------------------------------------------------------------------
+
+def compare_schemas(user_id: int, src_conn: int, src_db: str, src_schema: str,
+                    tgt_conn: int, tgt_db: str, tgt_schema: str) -> dict:
+    """
+    What differs between two schemas, with the statements that make the
+    target like the source (``schema_compare.compare``). Nothing is run.
+    """
+    from services import schema_compare
+
+    if (int(src_conn), src_db or "", src_schema or "") == (int(tgt_conn), tgt_db or "",
+                                                          tgt_schema or ""):
+        raise OpError("The source and the target are the same: choose two different schemas")
+    started = time.monotonic()
+    sides = []
+    for side, conn_id, database, schema in (("source", src_conn, src_db, src_schema),
+                                            ("target", tgt_conn, tgt_db, tgt_schema)):
+        with connect(user_id, conn_id, database) as (conn, spec, _p, _engine):
+            try:
+                sides.append((schema_compare.snapshot(conn, spec, database, schema), spec))
+            except Exception as exc:
+                raise OpError(f"Reading the {side}: {error_text(exc)}") from None
+    (source, _src_spec), (target, tgt_spec) = sides
+    try:
+        result = schema_compare.compare(source, target, tgt_spec)
+    except Exception as exc:
+        raise OpError(f"Comparing: {error_text(exc)}") from None
+    result.update(engine=tgt_spec.name, source_engine=source["engine"],
+                  ms=int((time.monotonic() - started) * 1000))
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Session manager: the server's client sessions, and stopping one
 # ---------------------------------------------------------------------------
 

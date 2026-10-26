@@ -241,6 +241,40 @@ class SQLServer(Engine):
     def sql_drop_index(self, prep: Any, schema: Optional[str], table: str, index: str) -> str:
         return f"DROP INDEX {prep.quote(index)} ON {self.qualified(prep, schema, table)}"
 
+    script_batches = True
+    replace_view = "CREATE OR ALTER VIEW"
+
+    def _drop_default_sql(self, prep: Any, schema: Optional[str], table: str, column: str) -> str:
+        """A batch that drops the column's default constraint, whatever it is called."""
+        target = self.qualified(prep, schema, table)
+        return ("DECLARE @df nvarchar(300) = (SELECT QUOTENAME(d.name) FROM sys.default_constraints d "
+                "JOIN sys.columns c ON c.object_id = d.parent_object_id "
+                "AND c.column_id = d.parent_column_id "
+                f"WHERE d.parent_object_id = OBJECT_ID({_nstring(target)}) "
+                f"AND c.name = {_nstring(column)});\n"
+                f"IF @df IS NOT NULL EXEC (N'ALTER TABLE ' + {_nstring(target)} "
+                "+ N' DROP CONSTRAINT ' + @df)")
+
+    def sql_alter_column(self, prep: Any, schema: Optional[str], table: str, column: str,
+                         new: dict, old: dict, changed: set) -> list:
+        target = self.qualified(prep, schema, table)
+        col = prep.quote(column)
+        out = []
+        # A default constraint blocks ALTER COLUMN, so a type change drops and re-adds it.
+        drop_default = bool(old.get("default")) and bool(changed & {"default", "type"})
+        if drop_default:
+            out.append(self._drop_default_sql(prep, schema, table, column))
+        if changed & {"type", "nullable"}:
+            out.append(f"ALTER TABLE {target} ALTER COLUMN {col} {new['type']} "
+                       + ("NULL" if new["nullable"] else "NOT NULL"))
+        if new.get("default") and ("default" in changed or drop_default):
+            out.append(f"ALTER TABLE {target} ADD DEFAULT {new['default']} FOR {col}")
+        return out
+
+    def sql_script_before_drop_column(self, prep: Any, schema: Optional[str], table: str,
+                                      column: str) -> list:
+        return [self._drop_default_sql(prep, schema, table, column)]
+
     def before_drop_column(self, conn: Any, prep: Any, schema: Optional[str], table: str,
                            column: str) -> list:
         from sqlalchemy import text

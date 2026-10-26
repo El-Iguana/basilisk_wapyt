@@ -147,6 +147,8 @@ class SQLite(Engine):
     object_groups = ("triggers",)
     identity_clause = "PRIMARY KEY AUTOINCREMENT"
     identity_inline_pk = True
+    rebuilds_tables = True
+    replace_view = None
     common_types = ("INTEGER", "REAL", "TEXT", "BLOB", "NUMERIC")
 
     def sql_truncate(self, prep: Any, schema: Optional[str], table: str) -> str:

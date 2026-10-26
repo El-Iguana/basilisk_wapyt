@@ -94,6 +94,23 @@ class PostgreSQL(Engine):
         # Thread-safe: sends a cancel request on a side channel.
         dbapi_conn.cancel_safe(timeout=5)
 
+    def before_compare(self, conn: Any, schema: Optional[str]) -> None:
+        # pg_get_viewdef leaves out the schema of tables on the search path, so
+        # a view copied to another schema would still read this one's tables.
+        # With only pg_catalog searched, every name comes back qualified.
+        if schema:
+            conn.exec_driver_sql("SET LOCAL search_path TO pg_catalog")
+
+    def sql_alter_column(self, prep: Any, schema: Optional[str], table: str, column: str,
+                         new: dict, old: dict, changed: set) -> list:
+        out = super().sql_alter_column(prep, schema, table, column, new, old, changed - {"type"})
+        if "type" in changed:
+            col = prep.quote(column)
+            # USING converts the stored values; without it text -> integer is refused.
+            out.insert(0, f"ALTER TABLE {self.qualified(prep, schema, table)} ALTER COLUMN {col} "
+                          f"TYPE {new['type']} USING {col}::{new['type']}")
+        return out
+
     def import_wrappers(self, conn: Any, prep: Any, schema: Optional[str], table: str,
                         columns: list) -> tuple:
         """After explicit values in a serial or identity column, move its sequence past them."""
