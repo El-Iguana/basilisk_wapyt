@@ -87,8 +87,15 @@ test.
   rebuilt). Follow-ups: check constraints, routines, sequences, triggers and
   materialized views; renames (now a drop and an add); column order; SQL
   Server unique constraints (now unique indexes); comparing whole databases.
-- **Data compare** between two tables (rows by primary key: missing, extra,
-  different), with the INSERT / UPDATE / DELETE script.
+- ~~**Data compare**~~ — done (2026-10-26): two tables on any connections
+  (different engines too), rows matched by the target's primary key (or the
+  source's), an optional WHERE for both; inserts, updates (only the changed
+  columns) and deletes as a ticked list and a script in the target's
+  literals; a background job with progress and Cancel; up to 500,000 source
+  rows, 5,000 listed per kind. Follow-ups: choosing key columns by hand (for
+  tables without a key); comparing every table of two schemas at once;
+  ignoring columns; a faster path when both tables are on one server (a SQL
+  join instead of reading both); case-insensitive keys as the collation says.
 - ~~**SSH tunnels**~~ — done (2026-10-26): password or private-key sign-in,
   host key pinned on first use (forgettable), a tunnel per pooled engine
   dialled before the driver connects, rebuilt when it drops. Follow-ups: jump

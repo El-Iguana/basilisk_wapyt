@@ -73,6 +73,12 @@ from services.ui_state_service import UiStateService
 from services.user_service import UserService
 from services.values import MAX_CELL_CHARS
 from ui.compare_tools import (
+    data_default_chosen as cmp_data_default_chosen,
+    data_detail as cmp_data_detail,
+    data_rows as cmp_data_rows,
+    data_script as cmp_data_script,
+    data_statement_count as cmp_data_statement_count,
+    data_summary as cmp_data_summary,
     default_chosen as cmp_default_chosen,
     grid_rows as cmp_grid_rows,
     object_label as cmp_object_label,
@@ -343,6 +349,8 @@ class Basilisk(MainWindow):
                                kinds=["table"]),
                     TreeAction("compare", "Compare schema with…", "mdi-compare-horizontal",
                                kinds=["server", "database", "schema"]),
+                    TreeAction("data_compare", "Compare data with…", "mdi-table-sync",
+                               kinds=["table"]),
                     TreeAction("disconnect", "Disconnect", "mdi-lan-disconnect", kinds=server),
                     TreeAction(separator=True),
                     TreeAction("edit_conn", "Edit connection…", "mdi-pencil", kinds=server),
@@ -465,7 +473,7 @@ class Basilisk(MainWindow):
             self._sessions_action(tid, action, button)
         elif tab["kind"] == "er":
             self._er_action(tid, action, button)
-        elif tab["kind"] == "compare":
+        elif tab["kind"] in self._CMP_KINDS:
             self._cmp_action(tid, action, button)
         else:
             self._sql_action(tid, action, button)
@@ -479,8 +487,8 @@ class Basilisk(MainWindow):
             return
         role = _attr(target, "data-role")
         tab = self._tabs[tid]
-        if tab["kind"] == "compare":
-            if role in ("cmp_conn", "cmp_db", "cmp_schema"):
+        if tab["kind"] in self._CMP_KINDS:
+            if role in ("cmp_conn", "cmp_db", "cmp_schema", "cmp_table"):
                 _spawn(self._cmp_pick(tid, _attr(target, "data-side"), role, str(target.value)),
                        "compare choice")
             return
@@ -520,6 +528,11 @@ class Basilisk(MainWindow):
             ):
                 event.preventDefault()
                 self._apply_filter(tid)
+                return
+            if tab["kind"] == "datacmp" and key == "Enter" and \
+                    _attr(target, "data-role") == "dcmp_where":
+                event.preventDefault()
+                _spawn(self._dcmp_run(tid), "compare")
                 return
             if tab["kind"] == "sql" and _attr(target, "data-role") == "fallback":
                 if key == "Enter" and (event.ctrlKey or event.metaKey):
@@ -1033,6 +1046,8 @@ class Basilisk(MainWindow):
             self._open_er(data, focus=name)
         elif action == "compare":
             self._open_compare(data)
+        elif action == "data_compare":
+            self._open_compare(data, rows=True)
         elif action == "trigger_table":
             self._open_table(self._loc(data), data.get("table") or "", "table")
         elif action == "export_csv":
@@ -1492,6 +1507,8 @@ class Basilisk(MainWindow):
             return
         if tab["kind"] == "sql" and tab.get("manual"):
             _spawn(self._end_session(tab), "end session")
+        if tab.get("job"):
+            _spawn(JobService().cancel_async(tab["job"]), "cancel compare")
         for key in ("vp", "grid", "cols_table", "idx_table", "fk_table", "con_table", "pager",
                     "plan_grid"):
             widget = tab.get(key)
@@ -3781,22 +3798,31 @@ class Basilisk(MainWindow):
             self._toast("Saved the diagram as SVG.", kind="success")
 
     # ------------------------------------------------------------------
-    # Schema compare (milestone 3): two schemas side by side, the
-    # differences with a tick each, and the script that makes the target
-    # like the source (ui/compare_tools.py, services/schema_compare.py).
+    # Schema and data compare (milestone 3): two schemas (or two tables)
+    # side by side, the differences (or differing rows) with a tick each,
+    # and the script that makes the target like the source
+    # (ui/compare_tools.py, services/schema_compare.py, data_compare.py).
+    # One tab kind per mode: "compare" (schemas) and "datacmp" (rows).
     # The script opens in a SQL editor on the target; nothing runs here.
     # ------------------------------------------------------------------
 
-    def _open_compare(self, data: dict) -> str | None:
+    _CMP_KINDS = ("compare", "datacmp")
+
+    def _open_compare(self, data: dict, rows: bool = False) -> str | None:
         conn_id = data.get("conn")
         if self._conn(conn_id) is None:
             return None
         loc = self._loc(data)
-        source = {"conn": loc[0], "db": loc[1], "schema": loc[2]}
+        table = str(data.get("name") or "") if rows else ""
+        source = {"conn": loc[0], "db": loc[1], "schema": loc[2], "table": table}
         target = dict(source)
         conn = self._conn(loc[0]) or {}
         where = ".".join(part for part in loc[1:] if part) or conn.get("name", "")
-        tid, container = self._new_tab(f"Compare · {where}", "mdi-compare-horizontal")
+        if rows:
+            tid, container = self._new_tab(f"Compare data · {table}", "mdi-table-sync")
+        else:
+            tid, container = self._new_tab(f"Compare · {where}", "mdi-compare-horizontal")
+        what = "table" if rows else "schema"
         sides = "".join(
             f'<div class="bk-cmp-side" data-side="{side}">'
             f'<span class="bk-cmp-label" title="{_esc(hint)}">'
@@ -3806,35 +3832,50 @@ class Basilisk(MainWindow):
             f'<select class="bk-select" data-role="cmp_db" data-side="{side}" '
             f'aria-label="{label} database" hidden></select>'
             f'<select class="bk-select" data-role="cmp_schema" data-side="{side}" '
-            f'aria-label="{label} schema" hidden></select></div>'
+            f'aria-label="{label} schema" hidden></select>'
+            f'<select class="bk-select" data-role="cmp_table" data-side="{side}" '
+            f'aria-label="{label} table" hidden></select></div>'
             + ('<button type="button" class="bk-btn" data-bk="cmp_swap" '
                'title="Swap the source and the target">'
                '<span class="mdi mdi-swap-horizontal"></span></button>' if side == "src" else "")
             for side, label, icon, hint in (
-                ("src", "Source", "mdi-database-export-outline", "The schema to copy from"),
+                ("src", "Source", "mdi-database-export-outline", f"The {what} to copy from"),
                 ("tgt", "Target", "mdi-database-import-outline",
-                 "The schema the script changes to look like the source")))
+                 f"The {what} the script changes to look like the source")))
+        where_row = f"""
+  <div class="bk-filter">
+    <span class="bk-flabel">WHERE</span>
+    <input class="bk-input bk-grow bk-code" data-role="dcmp_where" id="{tid}-where"
+      spellcheck="false" autocomplete="off" aria-label="Rows to compare"
+      placeholder="Optional: compare only the rows matching this condition, on both sides">
+  </div>""" if rows else ""
+        hint = ("Choose two tables and Compare: rows are matched by primary key. Tick what the "
+                "script should change; deletes start unticked. Double-click a row for its values."
+                if rows else
+                "Choose two schemas and Compare. Tick what the script should change; drops "
+                "start unticked. Double-click a difference for its details.")
         container.innerHTML = f"""
 <div class="bk-view" data-tab="{tid}">
-  <div class="bk-head">{self._crumbs(conn, loc[1], loc[2], "Schema compare",
-                                     "mdi-compare-horizontal")}
+  <div class="bk-head">{self._crumbs(conn, loc[1], loc[2], table or "Schema compare",
+                                     "mdi-table-sync" if rows else "mdi-compare-horizontal")}
     <span class="bk-head-stats" id="{tid}-stats"></span></div>
   <div class="bk-bar bk-cmp-pick">{sides}
     <button type="button" class="bk-btn bk-primary" data-bk="cmp_run" id="{tid}-run"
-      title="Read both schemas and list what differs">
+      title="Read both sides and list what differs">
       <span class="mdi mdi-compare-horizontal"></span><span>Compare</span></button>
-  </div>
+    <button type="button" class="bk-btn bk-danger" data-bk="cmp_cancel" id="{tid}-cancel" hidden
+      title="Stop the comparison"><span class="mdi mdi-stop"></span><span>Cancel</span></button>
+  </div>{where_row}
   <div class="bk-status" id="{tid}-status" hidden></div>
   <div class="bk-split" id="{tid}-split"></div>
-  <div class="bk-foot"><code id="{tid}-foot">Choose two schemas and Compare. Tick what the
-    script should change; drops start unticked. Double-click a difference for its details.</code></div>
+  <div class="bk-foot"><code id="{tid}-foot">{_esc(hint)}</code></div>
 </div>"""
         tab = {
-            "tid": tid, "kind": "compare", "conn": loc[0], "db": loc[1], "loc": loc,
-            "name": "Schema compare", "sides": {"src": source, "tgt": target},
-            "lists": {"src": {"dbs": [], "schemas": []}, "tgt": {"dbs": [], "schemas": []}},
+            "tid": tid, "kind": "datacmp" if rows else "compare", "conn": loc[0], "db": loc[1],
+            "loc": loc, "name": table or "Schema compare", "sides": {"src": source, "tgt": target},
+            "lists": {side: {"dbs": [], "schemas": [], "tables": []} for side in ("src", "tgt")},
             "result": None, "chosen": set(), "grid": None, "cmp_editor": None, "busy": False,
-            "labels": ("", ""), "stale": False,
+            "labels": ("", ""), "job": None,
         }
         self._tabs[tid] = tab
         layout = Layout(LayoutConfig(css="bk-split-layout", rows=[
@@ -3843,15 +3884,17 @@ class Basilisk(MainWindow):
         ]))
         _el(f"{tid}-split").appendChild(layout.layout.getRootElement())
         tab["layout"] = layout
+        safe = ("No deletes", "Inserts and updates (the first choice)") if rows else \
+            ("No drops", "Everything but drops (the first choice)")
         layout.get_cell(f"{tid}-top").getContainer().innerHTML = f"""
 <div class="bk-res">
   <div class="bk-res-bar">
-    <span class="bk-cmp-title"><span class="mdi mdi-format-list-checks"></span>Differences</span>
-    <button type="button" class="bk-btn" data-bk="cmp_tick" data-which="all" title="Apply every difference">
+    <span class="bk-cmp-title"><span class="mdi mdi-format-list-checks"></span>
+      {"Rows" if rows else "Differences"}</span>
+    <button type="button" class="bk-btn" data-bk="cmp_tick" data-which="all" title="Apply everything">
       <span class="mdi mdi-checkbox-multiple-marked-outline"></span><span>All</span></button>
-    <button type="button" class="bk-btn" data-bk="cmp_tick" data-which="safe"
-      title="Everything but drops (the first choice)">
-      <span class="mdi mdi-shield-check-outline"></span><span>No drops</span></button>
+    <button type="button" class="bk-btn" data-bk="cmp_tick" data-which="safe" title="{safe[1]}">
+      <span class="mdi mdi-shield-check-outline"></span><span>{safe[0]}</span></button>
     <button type="button" class="bk-btn" data-bk="cmp_tick" data-which="none" title="Apply nothing">
       <span class="mdi mdi-checkbox-multiple-blank-outline"></span><span>None</span></button>
     <span class="bk-spacer"></span>
@@ -3875,28 +3918,46 @@ class Basilisk(MainWindow):
   </div>
   <div class="bk-results"><div class="bk-panel bk-code-host" id="{tid}-script"></div></div>
 </div>"""
-        grid = DataTable(DataTableConfig(
-            columns=[
-                ColumnConfig(id="use", header="Apply", width=66, align="center", editable=True,
-                             editor="checkbox", sortable=False),
-                ColumnConfig(id="change", header="Change", width=100, icon_by="change_icon"),
+        apply = ColumnConfig(id="use", header="Apply", width=66, align="center", editable=True,
+                             editor="checkbox", sortable=False)
+        if rows:
+            columns = [
+                apply, ColumnConfig(id="change", header="Change", width=100, icon_by="change_icon"),
+                ColumnConfig(id="key", header="Key", width=200),
+                ColumnConfig(id="columns", header="Columns that differ", width=220),
+                ColumnConfig(id="detail", header="Values (target → source)", width=560),
+            ]
+            actions = [
+                TableAction("details", "Values and statement", "mdi-text-box-search-outline"),
+                TableAction(separator=True),
+                TableAction("tick_group", "Apply every row of this kind",
+                            "mdi-checkbox-multiple-marked-outline"),
+                TableAction("untick_group", "Apply no row of this kind",
+                            "mdi-checkbox-multiple-blank-outline"),
+            ]
+            empty = "Choose the two tables, then Compare."
+        else:
+            columns = [
+                apply, ColumnConfig(id="change", header="Change", width=100, icon_by="change_icon"),
                 ColumnConfig(id="kind", header="Kind", width=110),
                 ColumnConfig(id="object", header="Object", width=230),
                 ColumnConfig(id="detail", header="Difference", width=330),
                 ColumnConfig(id="source", header="In the source", width=260),
                 ColumnConfig(id="target", header="In the target", width=260),
-            ],
-            id_field="rid", selection="single", resizable_columns=True, row_class_by="cls",
-            filterable=True, filter_placeholder="Filter the differences",
-            empty_text="Choose the two schemas, then Compare.", loading_text="Comparing…",
-            context_actions=[
+            ]
+            actions = [
                 TableAction("details", "Details and statements", "mdi-text-box-search-outline"),
                 TableAction(separator=True),
-                TableAction("tick_table", "Apply everything on this table",
+                TableAction("tick_group", "Apply everything on this table",
                             "mdi-checkbox-multiple-marked-outline"),
-                TableAction("untick_table", "Apply nothing on this table",
+                TableAction("untick_group", "Apply nothing on this table",
                             "mdi-checkbox-multiple-blank-outline"),
-            ],
+            ]
+            empty = "Choose the two schemas, then Compare."
+        grid = DataTable(DataTableConfig(
+            columns=columns, id_field="rid", selection="single", resizable_columns=True,
+            row_class_by="cls", filterable=True, filter_placeholder="Filter",
+            empty_text=empty, loading_text="Comparing…", context_actions=actions,
         ), container=_el(f"{tid}-grid"))
         grid.on_edit(lambda payload: self._cmp_on_edit(tid, payload))
         grid.on_select(lambda payload: self._cmp_on_select(tid, payload))
@@ -3904,7 +3965,7 @@ class Basilisk(MainWindow):
         grid.on_action(lambda payload: self._cmp_menu(tid, payload))
         tab["grid"] = grid
         self.tabs.set_active(tid)
-        _spawn(self._cmp_start(tid), "schema compare")
+        _spawn(self._cmp_start(tid), "compare")
         return tid
 
     async def _cmp_start(self, tid: str) -> None:
@@ -3919,7 +3980,7 @@ class Basilisk(MainWindow):
         if tab is None:
             return
         source, target = tab["sides"]["src"], tab["sides"]["tgt"]
-        target.update(conn=source["conn"], db=source["db"], schema=source["schema"])
+        target.update(source)
         levels = (self._conn(source["conn"]) or {}).get("levels") or []
         lists = tab["lists"]["src"]
         if "schema" in levels:
@@ -3939,17 +4000,17 @@ class Basilisk(MainWindow):
 
     def _cmp_where(self, pick: dict) -> str:
         conn = self._conn(pick["conn"]) or {}
-        return " › ".join(part for part in (conn.get("name", "?"), pick["db"], pick["schema"])
-                          if part)
+        return " › ".join(part for part in (conn.get("name", "?"), pick["db"], pick["schema"],
+                                            pick.get("table", "")) if part)
 
     async def _cmp_lists(self, tid: str, side: str) -> None:
-        """The databases and schemas a side can choose from; keeps a valid choice."""
+        """The databases, schemas (and tables) a side can choose from; keeps a valid choice."""
         tab = self._tabs.get(tid)
         if tab is None:
             return
         pick = tab["sides"][side]
         levels = (self._conn(pick["conn"]) or {}).get("levels") or []
-        lists = {"dbs": [], "schemas": []}
+        lists = {"dbs": [], "schemas": [], "tables": []}
         if "database" in levels:
             result = await SqlService().databases_async(pick["conn"], False)
             if result.get("ok"):
@@ -3970,6 +4031,16 @@ class Basilisk(MainWindow):
                         lists["schemas"][0] if lists["schemas"] else "")
             else:
                 self._status(tid, result.get("error", "Could not list the schemas"))
+        if tab["kind"] == "datacmp":
+            result = await SqlService().objects_async(pick["conn"], pick["db"], pick["schema"])
+            if result.get("ok"):
+                lists["tables"] = [row["name"] for row in result.get("tables") or []]
+                if pick["table"] not in lists["tables"]:
+                    folded = {name.casefold(): name for name in lists["tables"]}
+                    pick["table"] = folded.get(pick["table"].casefold()) or (
+                        lists["tables"][0] if lists["tables"] else "")
+            else:
+                self._status(tid, result.get("error", "Could not list the tables"))
         if tid in self._tabs:
             tab["lists"][side] = lists
             self._cmp_fill(tid, side)
@@ -3991,13 +4062,12 @@ class Basilisk(MainWindow):
         box.querySelector('[data-role="cmp_conn"]').innerHTML = options(
             [c["id"] for c in conns], pick["conn"],
             [f'{c.get("name", "?")} ({c.get("engine_label", "")})' for c in conns])
-        db = box.querySelector('[data-role="cmp_db"]')
-        db.hidden = "database" not in levels
-        db.innerHTML = options(lists["dbs"] or ([pick["db"]] if pick["db"] else []), pick["db"])
-        schema = box.querySelector('[data-role="cmp_schema"]')
-        schema.hidden = "schema" not in levels
-        schema.innerHTML = options(lists["schemas"] or ([pick["schema"]] if pick["schema"] else []),
-                                   pick["schema"])
+        for role, key, level in (("cmp_db", "db", "database"), ("cmp_schema", "schema", "schema"),
+                                 ("cmp_table", "table", None)):
+            select = box.querySelector(f'[data-role="{role}"]')
+            select.hidden = (level not in levels) if level else tab["kind"] != "datacmp"
+            values = lists["dbs" if key == "db" else key + "s"] or ([pick[key]] if pick[key] else [])
+            select.innerHTML = options(values, pick[key])
 
     async def _cmp_pick(self, tid: str, side: str, role: str, value: str) -> None:
         tab = self._tabs.get(tid)
@@ -4012,30 +4082,49 @@ class Basilisk(MainWindow):
             await self._cmp_lists(tid, side)
         elif role == "cmp_schema":
             pick["schema"] = value
+            if tab["kind"] == "datacmp":
+                await self._cmp_lists(tid, side)
+        elif role == "cmp_table":
+            pick["table"] = value
         if tid in self._tabs and tab["result"] is not None:
-            tab["stale"] = True
-            self._status(tid, "The schemas changed since the last comparison: Compare again.",
+            self._status(tid, "The choice changed since the last comparison: Compare again.",
                          "info")
+
+    def _cmp_items(self, tab: dict) -> list:
+        """The schema differences or the differing rows of the last comparison."""
+        result = tab.get("result") or {}
+        return result.get("rows" if tab["kind"] == "datacmp" else "diffs") or []
 
     def _cmp_action(self, tid: str, action: str, button) -> None:
         tab = self._tabs[tid]
+        rows = tab["kind"] == "datacmp"
         if action == "cmp_run":
-            _spawn(self._cmp_run(tid), "schema compare")
+            _spawn(self._dcmp_run(tid) if rows else self._cmp_run(tid), "compare")
+        elif action == "cmp_cancel":
+            if tab.get("job"):
+                button.disabled = True
+                _spawn(JobService().cancel_async(tab["job"]), "cancel compare")
         elif action == "cmp_swap":
+            if tab["busy"]:
+                return
             sides, lists = tab["sides"], tab["lists"]
             sides["src"], sides["tgt"] = sides["tgt"], sides["src"]
             lists["src"], lists["tgt"] = lists["tgt"], lists["src"]
             self._cmp_fill(tid, "src")
             self._cmp_fill(tid, "tgt")
             if tab["result"] is not None:
-                _spawn(self._cmp_run(tid), "schema compare")
+                _spawn(self._dcmp_run(tid) if rows else self._cmp_run(tid), "compare")
         elif tab["result"] is None:
             return
         elif action == "cmp_tick":
-            diffs = tab["result"]["diffs"]
+            items = self._cmp_items(tab)
             which = _attr(button, "data-which")
-            chosen = ([d["id"] for d in diffs] if which == "all" else
-                      cmp_default_chosen(diffs) if which == "safe" else [])
+            if which == "all":
+                chosen = [item["id"] for item in items if not rows or item.get("sql")]
+            elif which == "safe":
+                chosen = cmp_data_default_chosen(items) if rows else cmp_default_chosen(items)
+            else:
+                chosen = []
             self._cmp_set_chosen(tid, set(chosen))
         elif action == "cmp_sql":
             target = tab["sides"]["tgt"]
@@ -4051,10 +4140,12 @@ class Basilisk(MainWindow):
             url = js.URL.createObjectURL(blob)
             anchor = js.document.createElement("a")
             anchor.href = url
-            names = [tab["sides"][side]["schema"] or tab["sides"][side]["db"] or
+            names = [(tab["sides"][side].get("table") if rows else "") or
+                     tab["sides"][side]["schema"] or tab["sides"][side]["db"] or
                      (self._conn(tab["sides"][side]["conn"]) or {}).get("name", side)
                      for side in ("src", "tgt")]
-            anchor.download = f"compare-{names[0]}-to-{names[1]}.sql".replace(" ", "_")
+            word = "data" if rows else "compare"
+            anchor.download = f"{word}-{names[0]}-to-{names[1]}.sql".replace(" ", "_")
             js.document.body.appendChild(anchor)
             anchor.click()
             anchor.remove()
@@ -4062,62 +4153,127 @@ class Basilisk(MainWindow):
             self._proxies.append(revoke)
             js.setTimeout(revoke, 10_000)
 
-    async def _cmp_run(self, tid: str) -> None:
-        tab = self._tabs.get(tid)
-        if tab is None or tab["busy"]:
-            return
+    def _cmp_ready(self, tid: str) -> bool:
+        """Both sides chosen and different; says what is missing otherwise."""
+        tab = self._tabs[tid]
         source, target = tab["sides"]["src"], tab["sides"]["tgt"]
         for side, pick in (("source", source), ("target", target)):
             levels = (self._conn(pick["conn"]) or {}).get("levels") or []
             if ("schema" in levels and not pick["schema"]) or ("database" in levels and not pick["db"]):
                 self._toast(f"Choose the {side}'s " + ("schema" if "schema" in levels else "database")
                             + ".", kind="warning")
-                return
-        if (source["conn"], source["db"], source["schema"]) == (target["conn"], target["db"],
-                                                                target["schema"]):
-            self._toast("The source and the target are the same: choose two different schemas.",
-                        kind="warning")
+                return False
+            if tab["kind"] == "datacmp" and not pick["table"]:
+                self._toast(f"Choose the {side}'s table.", kind="warning")
+                return False
+        if all(source.get(key) == target.get(key) for key in ("conn", "db", "schema", "table")):
+            self._toast("The source and the target are the same: choose two different "
+                        + ("tables." if tab["kind"] == "datacmp" else "schemas."), kind="warning")
+            return False
+        return True
+
+    def _cmp_busy(self, tid: str, busy: bool) -> None:
+        tab = self._tabs.get(tid)
+        if tab is None:
             return
-        tab["busy"] = True
-        run = _el(f"{tid}-run")
-        run.disabled = True
-        tab["grid"].set_busy(True)
+        tab["busy"] = busy
+        _el(f"{tid}-run").disabled = busy
+        cancel = _el(f"{tid}-cancel")
+        cancel.hidden = not (busy and tab["kind"] == "datacmp")
+        cancel.disabled = False
+        tab["grid"].set_busy(busy)
+
+    def _cmp_show(self, tid: str, result: dict) -> None:
+        """A finished comparison: notes, stats, the grid and the script."""
+        tab = self._tabs[tid]
+        rows = tab["kind"] == "datacmp"
+        source, target = tab["sides"]["src"], tab["sides"]["tgt"]
+        tab["result"] = result
+        tab["labels"] = (self._cmp_where(source), self._cmp_where(target))
+        self._status(tid, "\n".join(result.get("notes") or []), "info")
+        _el(f"{tid}-stats").textContent = (
+            f"{tab['labels'][0]} → {tab['labels'][1]} · {result.get('ms', 0)} ms")
+        _el(f"{tid}-note").textContent = cmp_data_summary(result) if rows else cmp_summary(result)
+        tab["grid"].set_empty_text("The two tables hold the same rows." if rows
+                                   else "The two schemas are the same.")
+        items = self._cmp_items(tab)
+        chosen = cmp_data_default_chosen(items) if rows else cmp_default_chosen(items)
+        self._cmp_set_chosen(tid, set(chosen), rows=True)
+
+    async def _cmp_run(self, tid: str) -> None:
+        tab = self._tabs.get(tid)
+        if tab is None or tab["busy"] or not self._cmp_ready(tid):
+            return
+        source, target = tab["sides"]["src"], tab["sides"]["tgt"]
+        self._cmp_busy(tid, True)
         self._status(tid, "Reading both schemas…", "info")
         try:
             result = await SqlService().compare_schemas_async(
                 source["conn"], source["db"], source["schema"],
                 target["conn"], target["db"], target["schema"])
         finally:
-            tab["busy"] = False
-            if tid in self._tabs:
-                run.disabled = False
-                tab["grid"].set_busy(False)
+            self._cmp_busy(tid, False)
         if tid not in self._tabs:
             return
         if not result.get("ok"):
             self._status(tid, result.get("error", "Could not compare"))
             return
-        tab["result"] = result
-        tab["stale"] = False
-        tab["labels"] = (self._cmp_where(source), self._cmp_where(target))
-        self._status(tid, "\n".join(result.get("notes") or []), "info")
-        _el(f"{tid}-stats").textContent = (
-            f"{tab['labels'][0]} → {tab['labels'][1]} · {result.get('ms', 0)} ms")
-        _el(f"{tid}-note").textContent = cmp_summary(result)
-        tab["grid"].set_empty_text("The two schemas are the same.")
-        self._cmp_set_chosen(tid, set(cmp_default_chosen(result["diffs"])), rows=True)
+        self._cmp_show(tid, result)
+
+    async def _dcmp_run(self, tid: str) -> None:
+        """A data compare runs as a job: start it, follow it, show what it found."""
+        tab = self._tabs.get(tid)
+        if tab is None or tab["busy"] or not self._cmp_ready(tid):
+            return
+        source, target = tab["sides"]["src"], tab["sides"]["tgt"]
+        where = str(_el(f"{tid}-where").value or "").strip()
+        self._cmp_busy(tid, True)
+        self._status(tid, "Checking the tables…", "info")
+        status: dict = {}
+        try:
+            started = await JobService().compare_data_async(
+                source["conn"], source["db"], source["schema"], source["table"],
+                target["conn"], target["db"], target["schema"], target["table"], where)
+            if not started.get("ok"):
+                if tid in self._tabs:
+                    self._status(tid, started.get("error", "Could not compare"))
+                return
+            tab["job"] = started["job"]
+            while tid in self._tabs:
+                status = await JobService().status_async(tab["job"], 10 ** 9)
+                if not status.get("ok") or status.get("state") != "running":
+                    break
+                steps = [f"{item['label']}: {item.get('note') or '…'}"
+                         for item in status.get("items") or []]
+                self._status(tid, ("Cancelling… " if status.get("cancelling") else "")
+                             + (" · ".join(steps) or "Starting…"), "info")
+                await asyncio.sleep(0.4)
+        finally:
+            tab["job"] = None
+            self._cmp_busy(tid, False)
+        if tid not in self._tabs:
+            return
+        if not status.get("ok"):
+            self._status(tid, status.get("error", "The comparison is gone"))
+        elif status["state"] == "done":
+            self._cmp_show(tid, status.get("result") or {})
+        elif status["state"] == "cancelled":
+            self._status(tid, "Cancelled.", "info")
+        else:
+            self._status(tid, status.get("error") or "The comparison failed")
 
     def _cmp_set_chosen(self, tid: str, chosen: set, rows: bool = False) -> None:
         tab = self._tabs[tid]
         before = tab["chosen"]
         tab["chosen"] = chosen
-        diffs = tab["result"]["diffs"]
+        items = self._cmp_items(tab)
         if rows:
-            tab["grid"].set_rows(cmp_grid_rows(diffs, chosen))
+            tab["grid"].set_rows(cmp_data_rows(tab["result"], chosen) if tab["kind"] == "datacmp"
+                                 else cmp_grid_rows(items, chosen))
         else:
-            for diff in diffs:
-                if (diff["id"] in chosen) != (diff["id"] in before):
-                    tab["grid"].set_cell(diff["id"], "use", diff["id"] in chosen)
+            for item in items:
+                if (item["id"] in chosen) != (item["id"] in before):
+                    tab["grid"].set_cell(item["id"], "use", item["id"] in chosen)
         _spawn(self._cmp_show_script(tid), "compare script")
 
     def _cmp_text(self, tid: str) -> str:
@@ -4128,19 +4284,28 @@ class Basilisk(MainWindow):
         source, target = tab["labels"]
         header = [f"Make {target} like {source}",
                   f"Written by Basilisk {VERSION}: read it before running it."]
-        header += result.get("notes") or []
-        return cmp_script(result, tab["chosen"], header)
+        if tab["kind"] == "datacmp":
+            header.append("Auto-commit runs it statement by statement; switch the editor to "
+                          "Manual to apply it as one transaction.")
+            return cmp_data_script(result, tab["chosen"], header + (result.get("notes") or []))
+        return cmp_script(result, tab["chosen"], header + (result.get("notes") or []))
 
     async def _cmp_show_script(self, tid: str) -> None:
         tab = self._tabs.get(tid)
         if tab is None:
             return
         text = self._cmp_text(tid)
-        count = cmp_statement_count(tab["result"], tab["chosen"]) if tab["result"] else 0
-        total = len(tab["result"]["diffs"]) if tab["result"] else 0
+        result = tab["result"]
+        if tab["kind"] == "datacmp":
+            count = cmp_data_statement_count(result, tab["chosen"]) if result else 0
+            noun = "rows"
+        else:
+            count = cmp_statement_count(result, tab["chosen"]) if result else 0
+            noun = "differences"
+        total = len(self._cmp_items(tab))
         _el(f"{tid}-count").textContent = (
             f"{count} statement{'s' if count != 1 else ''} · {len(tab['chosen'])} of {total} "
-            "differences applied")
+            f"{noun} applied")
         target = self._conn(tab["sides"]["tgt"]["conn"]) or {}
         dialect = target.get("dialect") or "StandardSQL"
         if tab.get("cmp_editor") is not None:
@@ -4180,55 +4345,85 @@ class Basilisk(MainWindow):
 
     def _cmp_diff(self, tid: str, rid: str) -> dict | None:
         tab = self._tabs.get(tid)
-        result = (tab or {}).get("result") or {}
-        return next((d for d in result.get("diffs") or [] if d["id"] == rid), None)
+        if tab is None:
+            return None
+        return next((item for item in self._cmp_items(tab) if item["id"] == rid), None)
 
     def _cmp_on_select(self, tid: str, payload: dict) -> None:
-        diff = self._cmp_diff(tid, str(payload.get("id") or ""))
+        tab = self._tabs.get(tid)
+        item = self._cmp_diff(tid, str(payload.get("id") or ""))
         foot = _el(f"{tid}-foot")
-        if diff is None or not foot:
+        if tab is None or item is None or not foot:
             return
-        parts = [cmp_object_label(diff) + ": " + (diff.get("detail") or "")]
-        if diff.get("manual"):
-            parts.append("⚠ " + diff["manual"])
-        parts += diff.get("items") or []
+        if tab["kind"] == "datacmp":
+            parts = [f"{item['key']}: {cmp_data_detail(tab['result'], item, limit=50)}"]
+        else:
+            parts = [cmp_object_label(item) + ": " + (item.get("detail") or "")]
+            if item.get("manual"):
+                parts.append("⚠ " + item["manual"])
+            parts += item.get("items") or []
         foot.textContent = " · ".join(parts)
         foot.title = "\n".join(parts)
 
     def _cmp_menu(self, tid: str, payload: dict) -> None:
         tab = self._tabs.get(tid)
-        diff = self._cmp_diff(tid, str(payload.get("id") or ""))
-        if tab is None or diff is None:
+        item = self._cmp_diff(tid, str(payload.get("id") or ""))
+        if tab is None or item is None:
             return
         action = payload.get("action")
         if action == "details":
-            self._cmp_detail(tid, diff["id"])
-        elif action in ("tick_table", "untick_table"):
-            same = {d["id"] for d in tab["result"]["diffs"] if d["group"] == diff["group"]}
-            chosen = (tab["chosen"] | same) if action == "tick_table" else (tab["chosen"] - same)
+            self._cmp_detail(tid, item["id"])
+        elif action in ("tick_group", "untick_group"):
+            field = "change" if tab["kind"] == "datacmp" else "group"
+            same = {other["id"] for other in self._cmp_items(tab)
+                    if other[field] == item[field] and (field == "group" or other.get("sql"))}
+            chosen = (tab["chosen"] | same) if action == "tick_group" else (tab["chosen"] - same)
             self._cmp_set_chosen(tid, chosen)
 
     def _cmp_detail(self, tid: str, rid: str) -> None:
         tab = self._tabs.get(tid)
-        diff = self._cmp_diff(tid, rid)
-        if tab is None or diff is None:
+        item = self._cmp_diff(tid, rid)
+        if tab is None or item is None:
             return
         source, target = tab["labels"]
-        facts = [("Difference", diff.get("detail")), ("Source · " + source, diff.get("source")),
-                 ("Target · " + target, diff.get("target")), ("By hand", diff.get("manual"))]
-        props = "".join(f"<dt>{_esc(label)}</dt><dd>{_esc(value)}</dd>"
-                        for label, value in facts if value)
-        items = "".join(f"<li>{_esc(item)}</li>" for item in diff.get("items") or [])
-        statements = cmp_script({"diffs": [diff], "phases": tab["result"].get("phases"),
-                                 "batches": tab["result"].get("batches")}, [diff["id"]])
-        modal = ModalWindow(ModalConfig(dispose_on_close=True, width=860, height=600,
-                                        title=f"{cmp_object_label(diff)} · "
-                                              f"{diff.get('kind', '')}"))
+        if tab["kind"] == "datacmp":
+            columns = tab["result"].get("columns") or []
+            changed = set(item.get("changed") or [])
+            cells = []
+            for i, col in enumerate(columns):
+                values = [(item[side][i] if i < len(item[side]) else "")
+                          for side in ("source", "target")]
+                shown = ['<em class="bk-null">NULL</em>' if value is None else _esc(value)
+                         for value in values]
+                if item["change"] == "insert":
+                    shown[1] = ""
+                elif item["change"] == "delete":
+                    shown[0] = ""
+                mark = ' class="bk-cmp-changed"' if col["target"] in changed else ""
+                key = ' <span class="mdi mdi-key"></span>' if col.get("key") else ""
+                cells.append(f"<tr{mark}><th>{_esc(col['target'])}{key}</th>"
+                             f"<td>{shown[0]}</td><td>{shown[1]}</td></tr>")
+            body = (f'<div class="bk-cmp-values"><table class="bk-kv bk-cmp-kv"><thead><tr>'
+                    f"<th>Column</th><th>Source · {_esc(source)}</th>"
+                    f"<th>Target · {_esc(target)}</th></tr></thead>"
+                    f'<tbody>{"".join(cells)}</tbody></table></div>')
+            statements = cmp_data_script(tab["result"], [item["id"]])
+            title = f"{item['key']} · {item['change']}"
+        else:
+            facts = [("Difference", item.get("detail")), ("Source · " + source, item.get("source")),
+                     ("Target · " + target, item.get("target")), ("By hand", item.get("manual"))]
+            props = "".join(f"<dt>{_esc(label)}</dt><dd>{_esc(value)}</dd>"
+                            for label, value in facts if value)
+            items = "".join(f"<li>{_esc(entry)}</li>" for entry in item.get("items") or [])
+            body = (f'<dl class="bk-session-facts">{props}</dl>'
+                    + (f'<ul class="bk-cmp-items">{items}</ul>' if items else ""))
+            statements = cmp_script({"diffs": [item], "phases": tab["result"].get("phases"),
+                                     "batches": tab["result"].get("batches")}, [item["id"]])
+            title = f"{cmp_object_label(item)} · {item.get('kind', '')}"
+        modal = ModalWindow(ModalConfig(dispose_on_close=True, width=860, height=600, title=title))
         modal.body.innerHTML = (
-            '<div class="bk-dialog bk-fill">'
-            f'<dl class="bk-session-facts">{props}</dl>'
-            + (f'<ul class="bk-cmp-items">{items}</ul>' if items else "")
-            + f'<pre class="bk-pre bk-grow-box">{_esc(statements)}</pre>'
+            f'<div class="bk-dialog bk-fill">{body}'
+            f'<pre class="bk-pre bk-grow-box bk-cmp-sql">{_esc(statements)}</pre>'
             '<div class="bk-actions"><span class="bk-spacer"></span>'
             '<button type="button" class="bk-btn bk-primary" data-s="close">Close</button>'
             '</div></div>')
@@ -6959,6 +7154,19 @@ tr.bk-cmp-alter td[data-column-id="change"]{color:#fcd34d;}
 tr.bk-cmp-drop td[data-column-id="change"]{color:#fca5a5;}
 tr.bk-cmp-drop td[data-column-id="object"]{text-decoration:line-through;text-decoration-color:#f87171;}
 tr.bk-cmp-manual td[data-column-id="detail"]{color:#fcd34d;}
+tr.bk-cmp-alter td[data-column-id="columns"]{color:#fcd34d;}
+tr.bk-cmp-drop td[data-column-id="key"]{text-decoration:line-through;text-decoration-color:#f87171;}
+.bk-cmp-values{flex:0 1 auto;min-height:0;overflow:auto;border:1px solid var(--bk-line);
+  border-radius:6px;}
+.bk-cmp-kv{width:100%;border-collapse:collapse;font:12.5px ui-monospace,Menlo,Consolas,monospace;}
+.bk-cmp-kv th,.bk-cmp-kv td{padding:4px 10px;border-bottom:1px solid var(--bk-line);
+  text-align:left;vertical-align:top;word-break:break-word;width:auto;}
+.bk-cmp-kv thead th{position:sticky;top:0;background:var(--bk-panel);color:var(--bk-muted);
+  font:600 11px system-ui,sans-serif;text-transform:uppercase;letter-spacing:.05em;}
+.bk-cmp-kv tr.bk-cmp-changed td,.bk-cmp-kv tr.bk-cmp-changed th{background:#2a2108;color:#fcd34d;}
+.bk-cmp-kv .mdi-key{color:#fbbf24;}
+.bk-cmp-kv .bk-null{color:var(--bk-dim);}
+.bk-cmp-sql{flex:0 1 auto;max-height:180px;}
 .bk-cmp-items{margin:0;padding:6px 12px 6px 30px;max-height:140px;overflow:auto;flex:0 0 auto;
   font:12.5px ui-monospace,Menlo,Consolas,monospace;color:var(--bk-muted);
   border:1px solid var(--bk-line);border-radius:6px;}

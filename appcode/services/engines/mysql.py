@@ -175,6 +175,10 @@ class MySQL(Engine):
     def sql_drop_index(self, prep: Any, schema: Optional[str], table: str, index: str) -> str:
         return f"DROP INDEX {prep.quote(index)} ON {self.qualified(prep, schema, table)}"
 
+    def sql_text_literal(self, text: str) -> str:
+        # MySQL reads backslash escapes in string literals.
+        return "'" + text.replace("\\", "\\\\").replace("'", "''") + "'"
+
     def sql_alter_column(self, prep: Any, schema: Optional[str], table: str, column: str,
                          new: dict, old: dict, changed: set) -> list:
         # MODIFY restates the whole column, so every part comes from ``new``.

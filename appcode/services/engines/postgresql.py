@@ -94,6 +94,9 @@ class PostgreSQL(Engine):
         # Thread-safe: sends a cancel request on a side channel.
         dbapi_conn.cancel_safe(timeout=5)
 
+    def sql_bytes_literal(self, raw: bytes) -> str:
+        return "'\\x" + raw.hex() + "'::bytea"
+
     def before_compare(self, conn: Any, schema: Optional[str]) -> None:
         # pg_get_viewdef leaves out the schema of tables on the search path, so
         # a view copied to another schema would still read this one's tables.

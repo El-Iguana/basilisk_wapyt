@@ -304,6 +304,20 @@ class Engine:
         return []
 
     # ------------------------------------------------------------------
+    # Data compare (services/data_compare.py writes values as literals)
+    # ------------------------------------------------------------------
+    bool_literals = ("TRUE", "FALSE")
+
+    def sql_text_literal(self, text: str) -> str:
+        return "'" + text.replace("'", "''") + "'"
+
+    def sql_bytes_literal(self, raw: bytes) -> str:
+        return "X'" + raw.hex() + "'"
+
+    def sql_datetime_literal(self, value: Any, type_text: str) -> str:
+        return self.sql_text_literal(value.isoformat(sep=" "))
+
+    # ------------------------------------------------------------------
     # CSV import (services/csv_import.py)
     # ------------------------------------------------------------------
 

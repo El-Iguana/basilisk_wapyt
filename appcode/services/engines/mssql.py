@@ -244,6 +244,20 @@ class SQLServer(Engine):
     script_batches = True
     replace_view = "CREATE OR ALTER VIEW"
 
+    bool_literals = ("1", "0")
+
+    def sql_text_literal(self, text: str) -> str:
+        return _nstring(text)
+
+    def sql_bytes_literal(self, raw: bytes) -> str:
+        return "0x" + raw.hex()
+
+    def sql_datetime_literal(self, value: Any, type_text: str) -> str:
+        # DATETIME keeps milliseconds and refuses more digits; DATETIME2 keeps seven.
+        precise = any(word in (type_text or "").upper() for word in ("DATETIME2", "DATETIMEOFFSET"))
+        text = value.isoformat(sep="T") if precise else value.isoformat(sep="T", timespec="milliseconds")
+        return "'" + text + "'"
+
     def _drop_default_sql(self, prep: Any, schema: Optional[str], table: str, column: str) -> str:
         """A batch that drops the column's default constraint, whatever it is called."""
         target = self.qualified(prep, schema, table)

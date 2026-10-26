@@ -1075,7 +1075,7 @@ def _cmp_location(user_id, engine, conn_id, name, statements):
     else:
         drops = [f"IF OBJECT_ID('{name}.big_orders') IS NOT NULL DROP VIEW {name}.big_orders"]
         drops += [f"IF OBJECT_ID('{name}.{t}') IS NOT NULL DROP TABLE {name}.{t}"
-                  for t in ("order_tags", "orders", "customers", "only_a", "only_b")]
+                  for t in ("order_tags", "orders", "customers", "only_a", "only_b", "items")]
         _run_ddl(user_id, conn_id, database, drops + [
             f"IF SCHEMA_ID('{name}') IS NULL EXEC('CREATE SCHEMA {name}')"])
     _run_ddl(user_id, conn_id, database, [st.format(s=f"{name}.", auto=CMP_AUTO[engine])
@@ -1148,6 +1148,140 @@ def test_schema_compare_from_sqlite(user_id, profile):
         [("add", "view", "big_orders")], [(d["group"], d["name"], d["detail"])
                                           for d in again["diffs"]]
     assert again["same_tables"] == 4
+
+
+# ---------------------------------------------------------------------------
+# Data compare (services/data_compare.py): two copies of a table that differ,
+# the script run on the target, compared again: the same.
+# ---------------------------------------------------------------------------
+
+DCMP_TYPES = {
+    "postgresql": {"bool": "BOOLEAN", "when": "TIMESTAMP", "bin": "BYTEA", "id": "INTEGER"},
+    "mysql": {"bool": "BOOLEAN", "when": "DATETIME(6)", "bin": "VARBINARY(32)", "id": "INTEGER"},
+    "mssql": {"bool": "BIT", "when": "DATETIME2", "bin": "VARBINARY(32)", "id": "INTEGER"},
+    "sqlite": {"bool": "BOOLEAN", "when": "DATETIME", "bin": "BLOB", "id": "INTEGER"},
+}
+DCMP_DDL = ("CREATE TABLE {s}items (id {id} NOT NULL PRIMARY KEY, name VARCHAR(60) NOT NULL, "
+            "price NUMERIC(10,2), flag {bool}, seen {when}, raw {bin}, note VARCHAR(200))")
+
+
+def _dcmp_rows(variant):
+    import datetime
+    import decimal
+
+    when = datetime.datetime(2026, 10, 26, 9, 30, 15, 250000)
+    rows = {
+        1: dict(name="same", price=decimal.Decimal("1.50"), flag=True, seen=when,
+                raw=b"\x00\xff", note=None),
+        2: dict(name="it's a \\path", price=decimal.Decimal("20.00"), flag=False, seen=when,
+                raw=b"ab", note="N'one"),
+        3: dict(name="only source", price=None, flag=None, seen=None, raw=None, note="x"),
+        5: dict(name="flag and note", price=decimal.Decimal("5"), flag=True, seen=None,
+                raw=None, note="ünïcode ✓"),
+    }
+    if variant == "target":
+        rows.pop(3)
+        rows[2] = dict(rows[2], name="old name", price=decimal.Decimal("19.99"))
+        rows[5] = dict(rows[5], flag=False, note=None)
+        rows[9] = dict(name="only target", price=None, flag=None, seen=None, raw=None, note=None)
+    return [dict(id=key, **value) for key, value in sorted(rows.items())]
+
+
+def _dcmp_location(user_id, engine, conn_id, name, variant):
+    """A schema ``name`` (as _cmp_location) holding ``items`` with the ``variant`` rows."""
+    from sqlalchemy import MetaData, Table, insert
+
+    from services.engine_pool import pool
+
+    statements = [DCMP_DDL.format(s="{s}", **DCMP_TYPES[engine])]
+    conn_id, database, schema = _cmp_location(user_id, engine, conn_id, name, statements)
+    engine_, spec, profile = pool.open(user_id, conn_id, database)
+    with engine_.connect() as conn:
+        if database and "database" in spec.levels and spec.database_for(profile, database) is None:
+            spec.use_database(conn.connection.dbapi_connection, database)
+        table = Table("items", MetaData(), schema=spec.schema_for(database, schema),
+                      autoload_with=conn)
+        conn.execute(insert(table), _dcmp_rows(variant))
+        conn.commit()
+    return conn_id, database, schema
+
+
+def _dcmp(user_id, src, tgt):
+    from services import data_compare
+    from services.jobs import Progress
+
+    plan = data_compare.check(user_id, dict(zip(("conn", "db", "schema"), src), table="items"),
+                              dict(zip(("conn", "db", "schema"), tgt), table="items"))
+    return data_compare.run(user_id, plan, Progress())
+
+
+def _dcmp_apply(user_id, src, tgt):
+    from services import sqlops
+    from ui import compare_tools
+
+    first = _dcmp(user_id, src, tgt)
+    script = compare_tools.data_script(first, [row["id"] for row in first["rows"]], ["test"])
+    ran = sqlops.execute(user_id, tgt[0], tgt[1], script, "script")
+    assert ran["ok"], [r.get("error") for r in ran["results"] if r.get("error")] or ran
+    return first, _dcmp(user_id, src, tgt)
+
+
+def test_data_compare_round_trip(user_id, profile):
+    engine, conn_id = profile
+    src = _dcmp_location(user_id, engine, conn_id, "dcmp_a", "source")
+    tgt = _dcmp_location(user_id, engine, conn_id, "dcmp_b", "target")
+    first, again = _dcmp_apply(user_id, src, tgt)
+    assert first["counts"] == {"insert": 1, "update": 2, "delete": 1, "same": 1}, first["counts"]
+    changed = {row["key"]: row["changed"] for row in first["rows"] if row["change"] == "update"}
+    assert changed == {"id = 2": ["name", "price"], "id = 5": ["flag", "note"]}, changed
+    assert again["counts"] == {"insert": 0, "update": 0, "delete": 0, "same": 4}, again["rows"]
+
+
+def test_data_compare_across_engines(user_id, profile):
+    """A server's table into SQLite and SQLite's into the server: values survive the trip."""
+    engine, conn_id = profile
+    if engine == "sqlite":
+        pytest.skip("the same engine: test_data_compare_round_trip")
+    server = _dcmp_location(user_id, engine, conn_id, "dcmp_a", "source")
+    lite = _dcmp_location(user_id, "sqlite", 0, f"dcmp_{engine}", "target")
+    first, again = _dcmp_apply(user_id, server, lite)
+    assert first["counts"]["same"] == 1 and again["counts"]["same"] == 4, again["rows"]
+    back = _dcmp_location(user_id, engine, conn_id, "dcmp_b", "target")
+    _first, again = _dcmp_apply(user_id, lite, back)
+    assert again["counts"] == {"insert": 0, "update": 0, "delete": 0, "same": 4}, again["rows"]
+
+
+def test_data_compare_where(user_id, profile):
+    from services import data_compare
+    from services.jobs import Progress
+
+    engine, conn_id = profile
+    src = _dcmp_location(user_id, engine, conn_id, "dcmp_a", "source")
+    tgt = _dcmp_location(user_id, engine, conn_id, "dcmp_b", "target")
+    plan = data_compare.check(user_id, dict(zip(("conn", "db", "schema"), src), table="items"),
+                              dict(zip(("conn", "db", "schema"), tgt), table="items"),
+                              "id <= 2")
+    result = data_compare.run(user_id, plan, Progress())
+    assert result["counts"] == {"insert": 0, "update": 1, "delete": 0, "same": 1}
+    with pytest.raises(data_compare.DataCompareError, match="Reading the source"):
+        bad = data_compare.check(user_id, dict(zip(("conn", "db", "schema"), src), table="items"),
+                                 dict(zip(("conn", "db", "schema"), tgt), table="items"),
+                                 "no_such_column = 1")
+        data_compare.run(user_id, bad, Progress())
+
+
+def test_data_compare_refusals(user_id, profile):
+    from services import data_compare
+
+    engine, conn_id = profile
+    database, schema = LOCATION[engine]
+    here = {"conn": conn_id, "db": database, "schema": schema}
+    with pytest.raises(data_compare.DataCompareError, match="primary key"):
+        data_compare.check(user_id, dict(here, table="audit_log"), dict(here, table="orders"))
+    with pytest.raises(data_compare.DataCompareError, match="same table"):
+        data_compare.check(user_id, dict(here, table="orders"), dict(here, table="orders"))
+    with pytest.raises(data_compare.DataCompareError, match="no table"):
+        data_compare.check(user_id, dict(here, table="orders"), dict(here, table="nope"))
 
 
 # ---------------------------------------------------------------------------

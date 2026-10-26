@@ -44,9 +44,10 @@ appcode/                   # pytincture modules_path
     sqlops.py              #   everything done to a database; the running-statement registry
     ddl.py                 #   object actions' statements (create/rename/drop/truncate, columns, indexes) — pure
     schema_compare.py      #   schema compare: read two schemas, the differences and their DDL — plain module
+    data_compare.py        #   data compare: rows of two tables by key, the INSERT/UPDATE/DELETE script (a job) — plain module
     csv_import.py          #   CSV import: option checks, the import job — plain module
     jobs.py                #   background jobs with progress (from Monguana) + import plans — plain module
-    job_service.py         #   BFF: plan an import, follow / cancel a job
+    job_service.py         #   BFF: plan an import, start a data compare, follow / cancel a job
     values.py              #   driver values <-> grid text; lossless row keys; typed coercion
     plans.py               #   explain plans from every engine in one tree shape (pure parsers)
     connection_service.py  #   BFF: profiles, test, disconnect
@@ -58,13 +59,13 @@ appcode/                   # pytincture modules_path
   ui/grid_tools.py         #   grids: column layouts, column filters, copy as INSERT / Markdown, FK rows — pure
   ui/import_tools.py       #   the Import CSV dialog: sniffing, preview, column matching — pure
   ui/er_layout.py          #   the ER diagram: model, layout, SVG — pure
-  ui/compare_tools.py      #   the schema compare tab: rows, the ticked differences' script — pure
+  ui/compare_tools.py      #   the compare tabs (schema, data): rows, the ticked differences' script — pure
   static/                  #   basilisk_avatar.webp: logo, login page, favicon, About
   vendor/codemirror/       #   the SQL editor bundle (built, committed), served at /vendor
 docs/basilisk.webp         # the README's picture (both cut from the original artwork, 1254 px)
 tools/codemirror/          # its recipe: pinned package.json, entry.js, build.sh
 tests/                     # test_units.py, test_plans.py, test_value_panel.py, test_grid_tools.py,
-                           # test_import_tools.py, test_er_layout.py, test_tunnels.py, test_schema_compare.py,
+                           # test_import_tools.py, test_er_layout.py, test_tunnels.py, test_schema_compare.py, test_data_compare.py,
                            # test_bff_state.py, test_live.py (needs the databases)
 tests/smoke/               # seed_sample.py + ui_smoke.py (Playwright, all four engines)
 Containerfile, scripts/podman-run.sh   # image + dev container "basilisk"
@@ -108,8 +109,8 @@ podman run -d --name basilisk-mssql -p 127.0.0.1:51433:1433 -e ACCEPT_EULA=Y \
   -e MSSQL_SA_PASSWORD="$PW" -e MSSQL_PID=Developer mcr.microsoft.com/mssql/server:2022-latest
 uv run python tests/smoke/seed_sample.py          # the shop sample in all four (SQLite: data/sqlite/shop.db)
 tests/smoke/ssh_server.sh                         # SSH server basilisk-ssh on 127.0.0.1:52222 (tunnel tests)
-uv run --group dev pytest -q tests/test_live.py   # 127 live tests
-BASILISK_PASS=… python3 tests/smoke/ui_smoke.py   # ~90 UI checks per engine
+uv run --group dev pytest -q tests/test_live.py   # 144 live tests
+BASILISK_PASS=… python3 tests/smoke/ui_smoke.py   # ~95 UI checks per engine
 ```
 
 Users: `postgres` / `root` / `sa`. The sample (`seed_sample.py`): customers,
@@ -433,6 +434,45 @@ Basilisk's own pooled connections costs nothing but that statement.
 - `tests/test_schema_compare.py` round-trips two SQLite files;
   `test_live.py` round-trips each engine (compare, run the script, compare
   again: nothing left) and copies each server's schema into SQLite and back.
+
+### Data compare (`data_compare.py`, milestone 3)
+
+- **Compare data with…** on a table opens a "datacmp" tab: the compare tab
+  (same pickers, grid, script panel and `_cmp_*` code, branching on the
+  kind) with a table per side and a WHERE box used on both sides.
+- `JobService.compare_data` checks first (`check`: tables, columns paired by
+  name, the key: the **target's primary key**, whose columns the source must
+  have, else the source's with a note), then runs `run` as a job; the page
+  polls `JobService.status` and shows the steps, with Cancel. The result
+  rides on the finished job.
+- `run` reads the source into `{key: digest}` (blake2b of the normalised
+  values; at most `MAX_ROWS`), streams the target sorting each row into
+  same / update / delete, takes source keys never seen as inserts, and reads
+  the source again for the listed rows (`MAX_LISTED` per kind). A key seen
+  twice on one side is refused (the target's key may not be unique in the
+  source).
+- **Values are read untyped** (the driver's own values, no SQLAlchemy result
+  processing): SQLite keeps any value in any column, so a `CREATE TABLE AS`
+  copy whose DATE became NUM made typed reading fail. The normalisers read
+  text too.
+- **Normalised comparison** (`normaliser`, kind by `pair_kind`, the stronger
+  kind of the two columns): numbers as normalised decimals; JSON parsed and
+  sorted, a JSON `null` equal to NULL; UUIDs as hex (CHAR(32) on MySQL and
+  SQLite); booleans from 0/1, text and MySQL BIT bytes; dates, times and
+  timestamps parsed from objects or ISO text, time zones to UTC, MySQL TIME
+  (a timedelta) as a time of day; CHAR without its padding.
+- **Literals for the target** (`literal`): `Engine.sql_text_literal`
+  (MySQL doubles backslashes, SQL Server `N''`), `sql_bytes_literal`
+  (PostgreSQL `'\x..'::bytea`, SQL Server `0x..`, `X'..'`), `bool_literals`
+  (SQL Server 1/0), `sql_datetime_literal` (SQL Server `DATETIME` takes
+  milliseconds only, `DATETIME2` seven digits). UPDATE sets only the
+  differing, writable columns; WHERE uses the target's key values; inserts
+  are wrapped by `import_wrappers` (SQL Server `IDENTITY_INSERT`,
+  PostgreSQL `setval`). The script is deletes, updates, inserts, and says
+  that Manual commit mode applies it as one transaction.
+- `tests/test_data_compare.py` (pure parts); `test_live.py` round-trips a
+  table with awkward values (quotes, backslashes, Unicode, bytes, booleans,
+  decimals, microseconds) on each engine and across engines both ways.
 
 ### SSH tunnels (`tunnels.py`, milestone 3)
 
