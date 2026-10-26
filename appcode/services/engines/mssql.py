@@ -166,6 +166,37 @@ class SQLServer(Engine):
     object_groups = ("functions", "procedures", "sequences", "triggers")
     has_roles = True
     roles_label = "Logins & roles"
+    identity_clause = "IDENTITY(1,1)"
+    add_column_keyword = "ADD"
+    common_types = ("int", "bigint", "smallint", "decimal(12,2)", "float", "bit",
+                    "nvarchar(255)", "nvarchar(max)", "date", "time", "datetime2",
+                    "uniqueidentifier", "varbinary(max)")
+
+    # sp_rename takes the old name as a (bracketed) string and the new one bare.
+    def sql_rename_table(self, prep: Any, schema: Optional[str], old: str, new: str) -> str:
+        return (f"EXEC sp_rename {_nstring(self.qualified(prep, schema, old))}, "
+                f"{_nstring(new)}")
+
+    def sql_rename_column(self, prep: Any, schema: Optional[str], table: str, old: str,
+                          new: str) -> str:
+        path = f"{self.qualified(prep, schema, table)}.{prep.quote(old)}"
+        return f"EXEC sp_rename {_nstring(path)}, {_nstring(new)}, N'COLUMN'"
+
+    def sql_drop_index(self, prep: Any, schema: Optional[str], table: str, index: str) -> str:
+        return f"DROP INDEX {prep.quote(index)} ON {self.qualified(prep, schema, table)}"
+
+    def before_drop_column(self, conn: Any, prep: Any, schema: Optional[str], table: str,
+                           column: str) -> list:
+        from sqlalchemy import text
+
+        rows = conn.execute(text(
+            "SELECT d.name FROM sys.default_constraints d "
+            "JOIN sys.columns c ON c.object_id = d.parent_object_id "
+            "AND c.column_id = d.parent_column_id "
+            "WHERE d.parent_object_id = OBJECT_ID(:table) AND c.name = :column"),
+            {"table": self.qualified(prep, schema, table), "column": column}).all()
+        return [f"ALTER TABLE {self.qualified(prep, schema, table)} "
+                f"DROP CONSTRAINT {prep.quote(row[0])}" for row in rows]
     _ROUTINE_TYPES = {"P": "procedure", "PC": "procedure", "FN": "function", "IF": "function",
                       "TF": "function", "FS": "function", "FT": "function"}
 
@@ -387,6 +418,10 @@ class SQLServer(Engine):
             ("Created", created), ("Modified", modified),
         ], ddl, native=False, lists=[{"title": "Member of", "items": member_of},
                                      {"title": "Members", "items": members}])
+
+
+def _nstring(text: str) -> str:
+    return "N'" + text.replace("'", "''") + "'"
 
 
 def _type_text(type_name: str, length: int, precision: int, scale: int) -> str:

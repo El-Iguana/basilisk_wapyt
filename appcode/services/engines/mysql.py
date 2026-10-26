@@ -134,6 +134,18 @@ class MySQL(Engine):
     # ------------------------------------------------------------------
     object_groups = ("functions", "procedures", "triggers")
     has_roles = True
+    identity_clause = "AUTO_INCREMENT"
+    ddl_transactional = False
+    common_types = ("int", "bigint", "smallint", "decimal(12,2)", "double", "tinyint(1)",
+                    "varchar(255)", "text", "date", "time", "datetime", "timestamp", "json",
+                    "blob")
+
+    def sql_rename_table(self, prep: Any, schema: Optional[str], old: str, new: str) -> str:
+        return (f"RENAME TABLE {self.qualified(prep, schema, old)} "
+                f"TO {self.qualified(prep, schema, new)}")
+
+    def sql_drop_index(self, prep: Any, schema: Optional[str], table: str, index: str) -> str:
+        return f"DROP INDEX {prep.quote(index)} ON {self.qualified(prep, schema, table)}"
     _SYSTEM_ACCOUNTS = frozenset({"mysql.sys", "mysql.session", "mysql.infoschema",
                                   "mariadb.sys"})
 

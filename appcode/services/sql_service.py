@@ -63,6 +63,12 @@ class SqlService:
         return self._call("object_info", int(conn_id), database or "", schema or "",
                           str(kind or ""), str(ident or ""), str(table or ""))
 
+    def alter(self, conn_id: int, database: str, schema: str, table: str, action: str,
+              params: dict, dry_run: bool = False) -> dict:
+        return self._call("alter", int(conn_id), database or "", schema or "", str(table or ""),
+                          str(action or ""), params if isinstance(params, dict) else {},
+                          bool(dry_run))
+
     def roles(self, conn_id: int, show_system: bool = False) -> dict:
         return self._call("roles", int(conn_id), bool(show_system))
 

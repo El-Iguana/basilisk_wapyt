@@ -483,6 +483,46 @@ def navigator_checks(page: Page, engine: str) -> None:
         check(ok, f"{engine}: materialized view refreshes CONCURRENTLY")
 
 
+def ddl_ready(page: Page) -> bool:
+    """Wait for the action dialog's live SQL preview."""
+    return wait_text(page, f'{modal(page)} [data-ddl="sql"]', ";", 10000)
+
+
+def object_action_checks(page: Page, engine: str, name: str) -> None:
+    """Create a table from the navigator, add a column from its tab, drop it."""
+    where = {"postgresql": "public", "mysql": "shop", "mssql": "dbo", "sqlite": name}[engine]
+    int_type = {"postgresql": "integer", "mysql": "int", "mssql": "int", "sqlite": "INTEGER"}[engine]
+    exact_tree_row(page, where).first.click(button="right")
+    page.click('.wapyt-tree-menu [data-action-id]:has-text("Create table")')
+    page.wait_for_selector(f'{modal(page)} [data-p="name"]', timeout=10000)
+    page.fill(f'{modal(page)} [data-p="name"]', "smoke_gadgets")
+    ok = ddl_ready(page) and "CREATE TABLE" in page.inner_text(f'{modal(page)} [data-ddl="sql"]')
+    check(ok, f"{engine}: Create table previews its SQL")
+    shot(page, f"smoke-{engine}-10-create")
+    page.click(f'{modal(page)} [data-answer="yes"]')
+    page.wait_for_selector(".wapyt-modal", state="detached", timeout=15000)
+    view = ".bk-view:visible"
+    check(wait_text(page, f"{view} .bk-head", "smoke_gadgets"), f"{engine}: the new table opens")
+    page.click(f'{view} [data-bk="col_add"]')
+    page.wait_for_selector(f'{modal(page)} [data-p="name"]', timeout=10000)
+    page.fill(f'{modal(page)} [data-p="name"]', "qty")
+    page.fill(f'{modal(page)} [data-p="type"]', int_type)
+    ddl_ready(page)
+    page.click(f'{modal(page)} [data-answer="yes"]')
+    page.wait_for_selector(".wapyt-modal", state="detached", timeout=15000)
+    ok = wait_text(page, f'{view} [id$="-cols"]', "qty")
+    check(ok, f"{engine}: Add column shows the new column")
+    exact_tree_row(page, "smoke_gadgets").first.click(button="right")
+    page.click('.wapyt-tree-menu [data-action-id]:has-text("Drop")')
+    page.wait_for_selector(f"{modal(page)} .bk-danger", timeout=10000)
+    page.click(f'{modal(page)} [data-answer="yes"]')
+    page.wait_for_selector(".wapyt-modal", state="detached", timeout=15000)
+    time.sleep(1.5)
+    check(exact_tree_row(page, "smoke_gadgets").count() == 0
+          and page.locator('.wapyt-tab:has-text("smoke_gadgets")').count() == 0,
+          f"{engine}: Drop removes the table and its tab")
+
+
 def close_tabs(page: Page) -> None:
     for _ in range(10):
         close = page.locator(".wapyt-tab-close").first
@@ -536,6 +576,8 @@ def main() -> int:
                 sql_checks(page, engine)
                 generate_check(page, engine)
                 navigator_checks(page, engine)
+                close_tabs(page)
+                object_action_checks(page, engine, name)
             except Exception as exc:  # noqa: BLE001 - report and carry on
                 check(False, f"{engine}: {type(exc).__name__}: {str(exc).splitlines()[0]}")
                 shot(page, f"smoke-{engine}-error")

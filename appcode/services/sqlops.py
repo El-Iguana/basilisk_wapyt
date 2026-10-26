@@ -454,6 +454,61 @@ def _ddl(conn: Any, spec: Any, insp: Any, target: Optional[str], name: str,
 
 
 # ---------------------------------------------------------------------------
+# Object actions: create / rename / drop / truncate, columns, indexes
+# ---------------------------------------------------------------------------
+
+def alter(user_id: int, conn_id: int, database: str, schema: str, table: str, action: str,
+          params: dict, dry_run: bool = False) -> dict:
+    """
+    Build (``services.ddl``) and, unless ``dry_run``, run one object action.
+    Its statements run in one transaction; MySQL commits DDL as it goes, so
+    there the note says it cannot be rolled back.
+    """
+    from services import ddl
+
+    engine, spec, profile = pool.open(user_id, conn_id, database)
+    params = params if isinstance(params, dict) else {}
+    with connect(user_id, conn_id, database) as (conn, spec, _p, _engine):
+        prep = conn.dialect.identifier_preparer
+        target = spec.schema_for(database, schema)
+        try:
+            statements = ddl.build(spec, prep, action, target, table, params)
+        except ddl.DdlError as exc:
+            raise OpError(str(exc)) from None
+        if action == "drop_column":
+            statements = spec.before_drop_column(conn, prep, target, table,
+                                                 str(params.get("column") or "")) + statements
+    note = ("Runs in one transaction." if spec.ddl_transactional else
+            f"{spec.label} commits DDL as it runs: it cannot be rolled back.")
+    preview = [statement + ";" for statement in statements]
+    if dry_run:
+        return {"ok": True, "sql": preview, "note": note,
+                "read_only": bool(profile.get("read_only"))}
+    if profile.get("read_only"):
+        raise OpError("This connection is read-only")
+    started = time.monotonic()
+    try:
+        with engine.connect() as conn:
+            dbapi = conn.connection.dbapi_connection
+            spec.set_timeout(dbapi, profile.get("timeout_s") or 300)
+            if "database" in spec.levels and database and \
+                    spec.database_for(profile, database) is None:
+                spec.use_database(dbapi, database)
+            with conn.begin():
+                for statement in statements:
+                    # Not text(): a default such as '10:30' is not a bind parameter.
+                    conn.exec_driver_sql(statement)
+            spec.set_timeout(dbapi, 0)
+    except Exception as exc:
+        raise OpError(error_text(exc)) from None
+    # The table's name afterwards, for the page to open or reopen it.
+    after = {"create_table": params.get("name"), "rename_table": params.get("new_name")}.get(
+        action, table)
+    return {"ok": True, "sql": preview, "table": str(after or "").strip(),
+            "ms": int((time.monotonic() - started) * 1000)}
+
+
+# ---------------------------------------------------------------------------
 # Browsing a table
 # ---------------------------------------------------------------------------
 
