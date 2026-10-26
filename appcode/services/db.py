@@ -154,6 +154,8 @@ CREATE TABLE IF NOT EXISTS users (
 -- relative to BASILISK_SQLITE_ROOT). `options` holds the engine's extra
 -- settings (sslmode, ...) as JSON, encrypted like `password`.
 -- `env` is the connection type: '' / dev / test / prod (prod confirms writes).
+-- `ssh` is the tunnel's settings (host, port, username, password or
+-- private_key + passphrase, the pinned host_key) as JSON, encrypted.
 CREATE TABLE IF NOT EXISTS connections (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -170,7 +172,8 @@ CREATE TABLE IF NOT EXISTS connections (
     timeout_s    INTEGER NOT NULL DEFAULT 60,
     env          TEXT    NOT NULL DEFAULT '',
     notes        TEXT    NOT NULL DEFAULT '',
-    created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+    created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+    ssh          TEXT    NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_connections_user ON connections(user_id);
@@ -210,7 +213,10 @@ _KNOWN_DEFAULTS = (DEFAULT_ADMIN_PASSWORD, "changeme")
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """Columns added after a database was first created. None yet."""
+    """Columns added after a database was first created."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(connections)")}
+    if "ssh" not in columns:        # SSH tunnels (milestone 3)
+        conn.execute("ALTER TABLE connections ADD COLUMN ssh TEXT NOT NULL DEFAULT ''")
 
 
 def init_db() -> None:
@@ -261,8 +267,24 @@ def fetch_connection(conn_id: int, user_id: int) -> Optional[dict]:
     profile = dict(row)
     profile["password"] = decrypt(profile.get("password") or "")
     profile["options"] = decode_options(profile.get("options") or "")
+    profile["ssh"] = decode_options(profile.get("ssh") or "")
     profile["read_only"] = bool(profile.get("read_only"))
     return profile
+
+
+def pin_ssh_host_key(conn_id: int, user_id: int, serialized: str) -> None:
+    """Pin a tunnel's host key on first use; a key already pinned is never replaced here."""
+    with get_db() as conn:
+        row = conn.execute("SELECT ssh FROM connections WHERE id = ? AND user_id = ?",
+                           (int(conn_id), int(user_id))).fetchone()
+        if not row:
+            return
+        settings = decode_options(row["ssh"] or "")
+        if not settings or settings.get("host_key"):
+            return
+        settings["host_key"] = serialized
+        conn.execute("UPDATE connections SET ssh = ? WHERE id = ? AND user_id = ?",
+                     (encode_options(settings), int(conn_id), int(user_id)))
 
 
 def encode_options(options: Optional[dict]) -> str:

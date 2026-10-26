@@ -616,6 +616,9 @@ class Basilisk(MainWindow):
             where = f"{conn.get('engine_label')} · {conn.get('host')}:{conn.get('port')}"
             if conn.get("username"):
                 where = f"{conn.get('username')}@{where}"
+        tunnel = conn.get("ssh") or {}
+        if tunnel.get("enabled"):
+            where += f"\nthrough SSH {tunnel.get('username')}@{tunnel.get('host')}:{tunnel.get('port')}"
         flags = []
         if conn.get("read_only"):
             flags.append("read-only")
@@ -1127,8 +1130,42 @@ class Basilisk(MainWindow):
                     extra_fields.append(FieldConfig(id=fid, label=field["label"], value=value))
 
         title = "Edit connection" if conn_id else "New connection"
-        modal = ModalWindow(ModalConfig(dispose_on_close=True, title=title, width=640, height=720))
+        modal = ModalWindow(ModalConfig(dispose_on_close=True, title=title, width=640, height=760))
         has_password = bool(existing.get("has_password"))
+        ssh = existing.get("ssh") or {}
+        ssh_fields = [
+            FieldConfig(id="ssh_enabled", label="Connect through SSH", type="toggle", span=2,
+                        value=bool(ssh.get("enabled")),
+                        help="A tunnel through an SSH server that can reach the database. "
+                             "Host and Port above are then as that server sees them."),
+            FieldConfig(id="ssh_host", label="SSH host", value=ssh.get("host") or ""),
+            FieldConfig(id="ssh_port", label="SSH port", type="number", min=1, max=65535,
+                        value=ssh.get("port") or 22),
+            FieldConfig(id="ssh_username", label="SSH user", value=ssh.get("username") or "",
+                        autocomplete="off"),
+            FieldConfig(id="ssh_auth", label="Sign in with", type="toggle_group",
+                        value=ssh.get("auth") or "password", options=[
+                            SelectOption(value="password", label="Password"),
+                            SelectOption(value="key", label="Private key")]),
+            FieldConfig(id="ssh_password", label="SSH password", type="password", span=2,
+                        autocomplete="new-password",
+                        placeholder="(stored — leave empty to keep)" if ssh.get("has_password")
+                        else ""),
+            FieldConfig(id="ssh_private_key", label="Private key", type="textarea", rows=4,
+                        span=2, autocomplete="off",
+                        placeholder="(stored — leave empty to keep)" if ssh.get("has_key")
+                        else "-----BEGIN OPENSSH PRIVATE KEY-----"),
+            FieldConfig(id="ssh_passphrase", label="Key passphrase", type="password", span=2,
+                        autocomplete="new-password",
+                        placeholder="(stored — leave empty to keep)" if ssh.get("has_passphrase")
+                        else "(none)"),
+            FieldConfig(id="ssh_host_key", label="SSH host key", type="static",
+                        value=ssh.get("host_key") or "",
+                        placeholder="Not pinned yet: the first connection pins it"),
+            FieldConfig(id="ssh_forget", label="Forget the pinned key", type="toggle",
+                        help="Only if the server was rebuilt: a changed key can also mean "
+                             "someone is in the middle."),
+        ]
         form = Form(
             FormConfig(
                 columns=2, submit_text="Save", cancel_text="Cancel",
@@ -1156,6 +1193,7 @@ class Basilisk(MainWindow):
                                 placeholder="(stored — leave empty to keep)" if has_password
                                 else ""),
                     *extra_fields,
+                    *ssh_fields,
                     FieldConfig(id="env", label="Connection type", type="toggle_group",
                                 value=existing.get("env") or "", span=2, options=[
                                     SelectOption(value="", label="None"),
@@ -1179,7 +1217,21 @@ class Basilisk(MainWindow):
         )
         if has_password:
             form.set_properties("password", help="Type a single space to clear the stored password.")
-        state = {"engine": engine}
+        state = {"engine": engine, "learned": None}
+
+        def _apply_ssh() -> None:
+            values = form.get_values()
+            spec = specs.get(state["engine"]) or {}
+            server = bool(spec.get("uses_server"))
+            on = server and bool(values.get("ssh_enabled"))
+            key = values.get("ssh_auth") == "key"
+            (form.show_field if server else form.hide_field)("ssh_enabled")
+            for field_id, shown in (("ssh_host", on), ("ssh_port", on), ("ssh_username", on),
+                                    ("ssh_auth", on), ("ssh_password", on and not key),
+                                    ("ssh_private_key", on and key),
+                                    ("ssh_passphrase", on and key), ("ssh_host_key", on),
+                                    ("ssh_forget", on and bool(ssh.get("host_key")))):
+                (form.show_field if shown else form.hide_field)(field_id)
 
         def _apply_engine(name: str, initial: bool = False) -> None:
             spec = specs.get(name) or specs["postgresql"]
@@ -1210,6 +1262,7 @@ class Basilisk(MainWindow):
                 values = form.get_values()
                 if not values.get("port") or values.get("port") == previous.get("default_port"):
                     form.set_values({"port": spec["default_port"]})
+            _apply_ssh()
 
         _apply_engine(engine, initial=True)
 
@@ -1231,6 +1284,25 @@ class Basilisk(MainWindow):
                 profile["password"] = ""
             elif password:
                 profile["password"] = password
+            tunnel = {
+                "enabled": bool(spec["uses_server"] and values.get("ssh_enabled")),
+                "host": (values.get("ssh_host") or "").strip(),
+                "port": int(values.get("ssh_port") or 22),
+                "username": (values.get("ssh_username") or "").strip(),
+                "auth": values.get("ssh_auth") or "password",
+            }
+            # Secrets only when typed (a single space clears one), as for the password.
+            for secret in ("password", "private_key", "passphrase"):
+                typed = values.get(f"ssh_{secret}") or ""
+                if typed == " ":
+                    tunnel[secret] = ""
+                elif typed.strip():
+                    tunnel[secret] = typed
+            if values.get("ssh_forget"):
+                tunnel["forget_host_key"] = True
+            if state["learned"]:
+                tunnel["host_key"] = state["learned"]
+            profile["ssh"] = tunnel
             return {**profile, "name": (values.get("name") or "").strip(),
                     "folder": values.get("folder") or "", "env": values.get("env") or "",
                     "timeout_s": int(values.get("timeout_s") or 0),
@@ -1239,6 +1311,10 @@ class Basilisk(MainWindow):
         def _on_change(payload: dict) -> None:
             if payload.get("id") == "engine" and payload.get("value"):
                 _apply_engine(str(payload["value"]))
+            elif payload.get("id") in ("ssh_enabled", "ssh_auth"):
+                _apply_ssh()
+            elif payload.get("id") in ("ssh_host", "ssh_port"):
+                state["learned"] = None      # a key seen on another host is not this one's
 
         async def _test() -> None:
             form.set_button_loading("test", True)
@@ -1247,15 +1323,19 @@ class Basilisk(MainWindow):
                 p = _collect()
                 args = [conn_id or None, p["engine"], p["host"], p["port"], p["database"],
                         p["username"]]
-                if "password" in p:
-                    result = await ConnectionService().test_async(
-                        *args, p["password"], p["options"], p["read_only"])
-                else:
-                    result = await ConnectionService().test_async(
-                        *args, "\x00unchanged\x00", p["options"], p["read_only"])
+                result = await ConnectionService().test_async(
+                    *args, p.get("password", "\x00unchanged\x00"), p["options"], p["read_only"],
+                    p["ssh"])
                 if result.get("ok"):
-                    form.set_values({"test_result": f"✔ Connected — server {result.get('version')}"
-                                     f" in {result.get('ms')} ms"})
+                    text = (f"✔ Connected — server {result.get('version')}"
+                            f" in {result.get('ms')} ms")
+                    if result.get("ssh"):
+                        text += " · through SSH"
+                        if result.get("ssh_new_key"):
+                            state["learned"] = result.get("ssh_host_key") or None
+                            form.set_values({"ssh_host_key": f"{result.get('ssh_fingerprint')} "
+                                                             "(new: pinned when you save)"})
+                    form.set_values({"test_result": text})
                 else:
                     form.set_values({"test_result": f"✘ {result.get('error')}"})
             finally:
@@ -1270,7 +1350,7 @@ class Basilisk(MainWindow):
                 password = p.get("password", "\x00unchanged\x00")
                 result = await ConnectionService().save_async(
                     *kwargs_order, password, p["options"], p["read_only"], p["timeout_s"],
-                    p["env"], p["notes"])
+                    p["env"], p["notes"], p["ssh"])
                 if not result.get("ok"):
                     if result.get("errors"):
                         form.set_errors(result["errors"])

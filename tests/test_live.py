@@ -1000,3 +1000,109 @@ def test_er_model(user_id, profile):
     types = " ".join(c["type"] for t in model["tables"] for c in t["columns"]).upper()
     assert "COLLATE" not in types and "CHARACTER SET" not in types
     assert not model["truncated"]
+
+
+# ---------------------------------------------------------------------------
+# SSH tunnels: tests/smoke/ssh_server.sh runs the SSH server
+# ---------------------------------------------------------------------------
+
+SSH = {"enabled": True, "host": "127.0.0.1", "port": 52222, "username": "tunnel",
+       "auth": "password", "password": "Tunn3l-pass"}
+SSH_KEYS = ROOT / "data" / "ssh-test"
+
+
+def _ssh_up() -> bool:
+    import socket
+
+    try:
+        socket.create_connection(("127.0.0.1", 52222), timeout=2).close()
+        return True
+    except OSError:
+        return False
+
+
+def test_ssh_tunnel(user_id, profile):
+    from services import sqlops
+    from services.connection_service import ConnectionService
+    from services.db import fetch_connection, get_db
+    from services.engine_pool import pool, tunnel_of
+
+    engine, _plain = profile
+    if engine == "sqlite":
+        pytest.skip("SQLite files are local")
+    if not _ssh_up():
+        pytest.skip("run tests/smoke/ssh_server.sh first")
+    database, schema = LOCATION[engine]
+    service = ConnectionService({"user_id": user_id})
+    values = dict(PROFILES[engine])
+
+    tested = service.test(None, engine, password=PASSWORD, ssh=SSH, **values)
+    assert tested["ok"] and tested["ssh"] and tested["ssh_new_key"], tested
+    assert tested["ssh_fingerprint"].startswith("SHA256:")
+    saved = service.save(name=f"{engine} via ssh", engine=engine, password=PASSWORD,
+                         ssh={**SSH, "host_key": tested["ssh_host_key"]}, **values)
+    assert saved["ok"], saved
+    conn_id = saved["id"]
+    stored = fetch_connection(conn_id, user_id)["ssh"]
+    assert stored["host_key"] == tested["ssh_host_key"] and stored["password"] == "Tunn3l-pass"
+    public = service.get(conn_id)["ssh"]
+    assert public["has_password"] and "password" not in public
+    assert public["host_key"] == tested["ssh_fingerprint"]
+
+    page = sqlops.browse(user_id, conn_id, database, schema, "orders", limit=5, pk=["id"])
+    assert page["total"] == 137
+    engine_obj = pool.open(user_id, conn_id, database)[0]
+    tunnel = tunnel_of(engine_obj)
+    assert tunnel is not None and tunnel.healthy() and str(tunnel.port) in str(engine_obj.url)
+
+    # A dropped SSH connection: the pool builds a new engine and tunnel.
+    tunnel._client.close()
+    assert not tunnel.healthy()
+    assert sqlops.ping(user_id, conn_id)["version"]
+    assert tunnel_of(pool.open(user_id, conn_id, database)[0]) is not tunnel
+
+    # Saving without new secrets keeps them; a changed host forgets the pin.
+    again = service.save(conn_id, f"{engine} via ssh", engine, password="\x00unchanged\x00",
+                         ssh={k: v for k, v in SSH.items() if k != "password"}, **values)
+    assert again["ok"] and fetch_connection(conn_id, user_id)["ssh"]["password"] == "Tunn3l-pass"
+    assert fetch_connection(conn_id, user_id)["ssh"]["host_key"] == tested["ssh_host_key"]
+
+    # A pinned key that does not match is refused.
+    from services.db import encode_options
+
+    wrong = {**fetch_connection(conn_id, user_id)["ssh"],
+             "host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"}
+    with get_db() as conn:
+        conn.execute("UPDATE connections SET ssh = ? WHERE id = ?", (encode_options(wrong), conn_id))
+    pool.close(user_id, conn_id)
+    with pytest.raises(Exception, match="has changed"):
+        sqlops.ping(user_id, conn_id)
+    forgot = service.save(conn_id, f"{engine} via ssh", engine, password="\x00unchanged\x00",
+                          ssh={**SSH, "forget_host_key": True}, **values)
+    assert forgot["ok"] and not fetch_connection(conn_id, user_id)["ssh"]["host_key"]
+    assert sqlops.ping(user_id, conn_id)["version"]          # pinned again on first use
+    assert fetch_connection(conn_id, user_id)["ssh"]["host_key"] == tested["ssh_host_key"]
+
+    # Bad SSH credentials are the error, not a driver's.
+    bad = service.test(None, engine, password=PASSWORD, ssh={**SSH, "password": "nope"}, **values)
+    assert not bad["ok"] and "uthentication" in bad["error"]
+
+    # Keys: plain and with a passphrase; a wrong passphrase is a field error.
+    if (SSH_KEYS / "id_ed25519").exists():
+        key = (SSH_KEYS / "id_ed25519").read_text()
+        locked = (SSH_KEYS / "id_ed25519_locked").read_text()
+        by_key = {**SSH, "auth": "key", "private_key": key}
+        del by_key["password"]
+        assert service.test(None, engine, password=PASSWORD, ssh=by_key, **values)["ok"]
+        assert service.test(None, engine, password=PASSWORD, **values,
+                            ssh={**by_key, "private_key": locked, "passphrase": "sesame"})["ok"]
+        refused = service.save(name="x", engine=engine, password=PASSWORD, **values,
+                               ssh={**by_key, "private_key": locked, "passphrase": "wrong"})
+        assert "ssh_private_key" in refused["errors"]
+        switched = service.save(conn_id, f"{engine} via ssh", engine, password="\x00unchanged\x00",
+                                ssh=by_key, **values)
+        assert switched["ok"]
+        stored = fetch_connection(conn_id, user_id)["ssh"]
+        assert stored["auth"] == "key" and stored["password"] == ""   # the old secret is dropped
+        assert sqlops.ping(user_id, conn_id)["version"]
+    service.delete(conn_id)

@@ -81,7 +81,12 @@ test.
   views in the diagram; edge routing around boxes (orthogonal lines); create
   a foreign key by dragging between columns; print / PDF.
 - **Data compare / schema compare** between two connections.
-- **SSH tunnels** for connections (paramiko; IguanaXterm has the know-how).
+- ~~**SSH tunnels**~~ — done (2026-10-26): password or private-key sign-in,
+  host key pinned on first use (forgettable), a tunnel per pooled engine
+  dialled before the driver connects, rebuilt when it drops. Follow-ups: jump
+  hosts (a tunnel through a tunnel); TLS hostname verification through the
+  tunnel (send the real host name as SNI); keyboard-interactive / 2FA
+  sign-in.
 - **More engines** through the adapter: MariaDB-specific bits, CockroachDB
   (PostgreSQL dialect), DuckDB, Oracle (oracledb thin mode), BriskDB.
 - **Install story** like Monguana's: compose files, INSTALL.md, Windows
