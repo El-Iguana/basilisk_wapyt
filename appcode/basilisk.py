@@ -4013,10 +4013,20 @@ class Basilisk(MainWindow):
         if tab is None:
             return
         pick = tab["sides"][side]
+        # A newer choice on this side makes this load stale: its answers are dropped.
+        gens = tab.setdefault("gens", {})
+        gens[side] = gens.get(side, 0) + 1
+        gen = gens[side]
+
+        def stale() -> bool:
+            return tid not in self._tabs or gens.get(side) != gen
+
         levels = (self._conn(pick["conn"]) or {}).get("levels") or []
         lists = {"dbs": [], "schemas": [], "tables": []}
         if "database" in levels:
             result = await SqlService().databases_async(pick["conn"], False)
+            if stale():
+                return
             if result.get("ok"):
                 rows = result.get("value") or []
                 lists["dbs"] = [row["name"] for row in rows]
@@ -4027,6 +4037,8 @@ class Basilisk(MainWindow):
                 self._status(tid, result.get("error", "Could not list the databases"))
         if "schema" in levels:
             result = await SqlService().schemas_async(pick["conn"], pick["db"], False)
+            if stale():
+                return
             if result.get("ok"):
                 lists["schemas"] = [row["name"] for row in result.get("schemas") or []]
                 if pick["schema"] not in lists["schemas"]:
@@ -4037,6 +4049,8 @@ class Basilisk(MainWindow):
                 self._status(tid, result.get("error", "Could not list the schemas"))
         if tab["kind"] == "datacmp":
             result = await SqlService().objects_async(pick["conn"], pick["db"], pick["schema"])
+            if stale():
+                return
             if result.get("ok"):
                 lists["tables"] = [row["name"] for row in result.get("tables") or []]
                 if pick["table"] not in lists["tables"]:
@@ -4045,7 +4059,7 @@ class Basilisk(MainWindow):
                         lists["tables"][0] if lists["tables"] else "")
             else:
                 self._status(tid, result.get("error", "Could not list the tables"))
-        if tid in self._tabs:
+        if not stale():
             tab["lists"][side] = lists
             self._cmp_fill(tid, side)
 
@@ -4112,6 +4126,9 @@ class Basilisk(MainWindow):
             if tab["busy"]:
                 return
             sides, lists = tab["sides"], tab["lists"]
+            gens = tab.setdefault("gens", {})
+            for side in ("src", "tgt"):     # loads under way were for the other side
+                gens[side] = gens.get(side, 0) + 1
             sides["src"], sides["tgt"] = sides["tgt"], sides["src"]
             lists["src"], lists["tgt"] = lists["tgt"], lists["src"]
             self._cmp_fill(tid, "src")
