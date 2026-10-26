@@ -50,6 +50,9 @@ running in Pyodide) and the wapyt widget set.
   actual rows and times) for all four engines.
 - **Export** a table (with its filter) or a query result to CSV or JSON,
   streamed from the server.
+- **SSH tunnels**: reach a database through an SSH server, with a password
+  or a private key (any type `ssh-keygen` makes, with a passphrase or not);
+  the server's host key is pinned on first use.
 - Multi-user, passwords encrypted at rest, sign-in required.
 
 ## Run it

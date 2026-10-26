@@ -757,6 +757,71 @@ def er_checks(page: Page, engine: str, name: str) -> None:
           f"{engine}: a table's diagram shows its neighbours ({shown})")
 
 
+def ssh_up() -> bool:
+    import socket
+
+    try:
+        socket.create_connection(("127.0.0.1", 52222), timeout=2).close()
+        return True
+    except OSError:
+        return False
+
+
+def ssh_checks(page: Page, engine: str) -> None:
+    """A connection through the test SSH server (tests/smoke/ssh_server.sh)."""
+    if engine == "sqlite":
+        return
+    if not ssh_up():
+        print(f"  skip {engine}: no SSH server on 127.0.0.1:52222", flush=True)
+        return
+    spec = ENGINES[engine]
+    name = f"Smoke {engine} SSH"
+    form = ".wapyt-modal"
+    page.click('.wapyt-toolbar [data-id="new_conn"]')
+    page.wait_for_selector(f'{form} input[name="name"]')
+    page.click(f'{form} [data-field-id="engine"] [data-value="{engine}"]')
+    time.sleep(0.2)
+    check(not page.is_visible(f'{form} input[name="ssh_host"]'), f"{engine}: SSH fields start hidden")
+    page.fill(f'{form} input[name="name"]', name)
+    page.fill(f'{form} input[name="host"]', "127.0.0.1")
+    page.fill(f'{form} input[name="port"]', spec["port"])
+    page.fill(f'{form} input[name="username"]', spec["username"])
+    page.fill(f'{form} input[name="password"]', DB_PASSWORD)
+    page.fill(f'{form} input[name="database"]', spec["database"])
+    page.click(f'{form} [data-field-id="ssh_enabled"] input, {form} [data-field-id="ssh_enabled"] [role="switch"]')
+    page.wait_for_selector(f'{form} input[name="ssh_host"]', state="visible", timeout=5000)
+    page.fill(f'{form} input[name="ssh_host"]', "127.0.0.1")
+    page.fill(f'{form} input[name="ssh_port"]', "52222")
+    page.fill(f'{form} input[name="ssh_username"]', "tunnel")
+    page.fill(f'{form} input[name="ssh_password"]', "Tunn3l-pass")
+    shot(page, f"smoke-{engine}-17-ssh-editor")
+    page.click(f'{form} [data-button-id="test"]')
+    ok = wait_text(page, f'{form} [data-field-id="test_result"]', "through SSH", 30000)
+    pinned = wait_text(page, f'{form} [data-field-id="ssh_host_key"]', "pinned when you save", 5000)
+    check(ok and pinned, f"{engine}: Test connects through SSH and shows the new host key")
+    page.click(f'{form} button[type="submit"]')
+    page.wait_for_selector(".wapyt-modal", state="detached", timeout=15000)
+    exact_tree_row(page, name).first.click()
+    page.keyboard.press("ArrowRight")
+    page.wait_for_selector('.wapyt-tree-row:has(.wapyt-tree-label:text-is("customers"))',
+                           timeout=30000)
+    exact_tree_row(page, "customers").first.dblclick()
+    page.wait_for_selector('.bk-view:visible tr[data-row-id="r0"]', timeout=30000)
+    check("14 rows" in page.inner_text(".bk-view:visible .bk-head-stats"),
+          f"{engine}: a table opens through the tunnel")
+    close_tabs(page)
+    exact_tree_row(page, name).first.click(button="right")
+    page.click('.wapyt-tree-menu [data-action-id]:has-text("Edit connection")')
+    page.wait_for_selector(f'{form} [data-field-id="ssh_host_key"]', timeout=10000)
+    shown = page.inner_text(f'{form} [data-field-id="ssh_host_key"]')
+    stored = page.get_attribute(f'{form} input[name="ssh_password"]', "placeholder") or ""
+    check("SHA256:" in shown and "stored" in stored,
+          f"{engine}: the editor shows the pinned key, never the SSH password")
+    page.click(f'{form} [data-button-id="cancel"], {form} button:has-text("Cancel")')
+    page.wait_for_selector(".wapyt-modal", state="detached", timeout=10000)
+    delete_connection(page, engine, name)
+
+
 def close_tabs(page: Page) -> None:
     for _ in range(10):
         close = page.locator(".wapyt-tab-close").first
@@ -823,6 +888,8 @@ def main() -> int:
                 session_checks(page, engine, name)
                 close_tabs(page)
                 er_checks(page, engine, name)
+                close_tabs(page)
+                ssh_checks(page, engine)
             except Exception as exc:  # noqa: BLE001 - report and carry on
                 check(False, f"{engine}: {type(exc).__name__}: {str(exc).splitlines()[0]}")
                 shot(page, f"smoke-{engine}-error")

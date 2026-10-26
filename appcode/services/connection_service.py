@@ -4,7 +4,8 @@ BFF: saved connection profiles.
 Every query is scoped by the caller's own ``user_id``. The password never
 travels back to the browser: ``list``/``get`` return ``has_password``, and
 :meth:`save` overwrites it only when a replacement is supplied — so "leave
-unchanged" and "clear it" are different requests.
+unchanged" and "clear it" are different requests. The SSH tunnel's secrets
+follow the same rule (``tunnels.merge_settings`` / ``public_settings``).
 """
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ from services.db import encode_options, encrypt, fetch_connection, get_db
 
 _PUBLIC_COLUMNS = (
     "id, name, engine, folder, host, port, database, username, options, read_only, "
-    "timeout_s, env, notes, created_at"
+    "timeout_s, env, notes, created_at, ssh"
 )
 
 _SENTINEL_UNCHANGED = "\x00unchanged\x00"
@@ -109,10 +110,12 @@ class ConnectionService:
         timeout_s: int = 60,
         env: str = "",
         notes: str = "",
+        ssh: Optional[dict] = None,
     ) -> dict:
         """
         Create or update a profile. ``password`` is three-state: omitted
         leaves the stored one, ``""`` clears it, anything else replaces it.
+        ``ssh`` None leaves the tunnel settings as stored.
         """
         if not self._user_id:
             return {"ok": False, "error": "Not authenticated"}
@@ -121,10 +124,17 @@ class ConnectionService:
             "options": options or {}, "read_only": read_only,
         }
         errors = self._validate(name, profile, timeout_s, env)
+        from services import engines, tunnels
+
+        stored_ssh: dict = {}
+        if conn_id:
+            stored_ssh = (fetch_connection(int(conn_id), self._user_id) or {}).get("ssh") or {}
+        ssh_settings = tunnels.merge_settings(stored_ssh, ssh if isinstance(ssh, dict) else None)
+        if engine == "sqlite":
+            ssh_settings = {}
+        errors.update(tunnels.validate(ssh_settings))
         if errors:
             return {"ok": False, "errors": errors}
-
-        from services import engines
 
         spec = engines.get(engine)
         values: dict[str, Any] = {
@@ -140,6 +150,7 @@ class ConnectionService:
             "timeout_s": int(timeout_s),
             "env": env or "",
             "notes": notes or "",
+            "ssh": encode_options(ssh_settings) if ssh_settings else "",
         }
         if password != _SENTINEL_UNCHANGED:
             values["password"] = encrypt(password or "") if spec.uses_server else ""
@@ -201,9 +212,9 @@ class ConnectionService:
         with get_db() as conn:
             cursor = conn.execute(
                 "INSERT INTO connections (user_id, name, engine, folder, host, port, database, "
-                "  username, password, options, read_only, timeout_s, env, notes) "
+                "  username, password, options, read_only, timeout_s, env, notes, ssh) "
                 "SELECT user_id, name || ' (copy)', engine, folder, host, port, database, "
-                "  username, password, options, read_only, timeout_s, env, notes "
+                "  username, password, options, read_only, timeout_s, env, notes, ssh "
                 "FROM connections WHERE id = ? AND user_id = ?",
                 (int(conn_id), self._user_id),
             )
@@ -226,10 +237,13 @@ class ConnectionService:
         password: str = _SENTINEL_UNCHANGED,
         options: Optional[dict] = None,
         read_only: bool = False,
+        ssh: Optional[dict] = None,
     ) -> dict:
         """
         Connect with the editor's current values, saved or not. For a stored
-        profile an omitted password falls back to the stored one.
+        profile an omitted password falls back to the stored one. Through SSH,
+        the answer carries the host key it saw (``ssh_host_key``) so the
+        editor can pin it on Save.
         """
         if not self._user_id:
             return {"ok": False, "error": "Not authenticated"}
@@ -243,7 +257,14 @@ class ConnectionService:
             "username": username, "options": options or {}, "read_only": read_only,
             "password": stored.get("password", "") if password == _SENTINEL_UNCHANGED else password,
         }
+        from services import tunnels
+
+        profile["ssh"] = tunnels.merge_settings(stored.get("ssh") or {},
+                                                ssh if isinstance(ssh, dict) else None)
+        if engine == "sqlite":
+            profile["ssh"] = {}
         errors = self._validate("x", profile, 60, "")
+        errors.update(tunnels.validate(profile["ssh"]))
         if errors:
             return {"ok": False, "error": next(iter(errors.values()))}
 
@@ -255,8 +276,10 @@ class ConnectionService:
         spec = engines.get(engine)
         started = time.monotonic()
         built = None
+        seen: dict = {}
         try:
-            built = build_engine(spec, profile, spec.database_for(profile, None))
+            built = build_engine(spec, profile, spec.database_for(profile, None),
+                                 lambda serialized: seen.update(key=serialized))
             from sqlalchemy import text
 
             with built.connect() as conn:
@@ -267,7 +290,15 @@ class ConnectionService:
         finally:
             if built is not None:
                 dispose_quietly(built)
-        return {"ok": True, "version": version, "ms": int((time.monotonic() - started) * 1000)}
+        answer = {"ok": True, "version": version,
+                  "ms": int((time.monotonic() - started) * 1000)}
+        if (profile["ssh"] or {}).get("enabled"):
+            from services.ssh import fingerprint_of
+
+            pinned = seen.get("key") or profile["ssh"].get("host_key") or ""
+            answer.update(ssh=True, ssh_host_key=seen.get("key") or "",
+                          ssh_fingerprint=fingerprint_of(pinned), ssh_new_key=bool(seen))
+        return answer
 
     def disconnect(self, conn_id: int) -> dict:
         from services import sessions
@@ -285,9 +316,11 @@ class ConnectionService:
     def _public(row: Any, open_ids: set) -> dict:
         from services import engines
         from services.db import decode_options
+        from services.tunnels import public_settings
 
         data = dict(row)
         options = decode_options(data.pop("options", "") or "")
+        data["ssh"] = public_settings(decode_options(data.pop("ssh", "") or ""))
         try:
             spec = engines.get(data.get("engine") or "")
             data["engine_label"] = spec.label

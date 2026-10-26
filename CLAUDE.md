@@ -38,6 +38,8 @@ appcode/                   # pytincture modules_path
                            #     routines / sequences / triggers / roles (lists and object info)
       postgresql.py mysql.py mssql.py sqlite.py
     engine_pool.py         #   SQLAlchemy engines per (user, connection, database) — plain module
+    tunnels.py             #   SSH tunnels: the local forwarder, profile SSH settings — plain module
+    ssh.py                 #   paramiko helpers from IguanaXterm: key loading, host-key pinning
     sessions.py            #   manual commit mode: pinned connection per SQL tab, idle reaper — plain module
     sqlops.py              #   everything done to a database; the running-statement registry
     ddl.py                 #   object actions' statements (create/rename/drop/truncate, columns, indexes) — pure
@@ -60,7 +62,7 @@ appcode/                   # pytincture modules_path
 docs/basilisk.webp         # the README's picture (both cut from the original artwork, 1254 px)
 tools/codemirror/          # its recipe: pinned package.json, entry.js, build.sh
 tests/                     # test_units.py, test_plans.py, test_value_panel.py, test_grid_tools.py,
-                           # test_import_tools.py, test_er_layout.py, test_bff_state.py, test_live.py (needs the databases)
+                           # test_import_tools.py, test_er_layout.py, test_tunnels.py, test_bff_state.py, test_live.py (needs the databases)
 tests/smoke/               # seed_sample.py + ui_smoke.py (Playwright, all four engines)
 Containerfile, scripts/podman-run.sh   # image + dev container "basilisk"
 ```
@@ -102,7 +104,8 @@ podman run -d --name basilisk-mysql -p 127.0.0.1:53306:3306 -e MYSQL_ROOT_PASSWO
 podman run -d --name basilisk-mssql -p 127.0.0.1:51433:1433 -e ACCEPT_EULA=Y \
   -e MSSQL_SA_PASSWORD="$PW" -e MSSQL_PID=Developer mcr.microsoft.com/mssql/server:2022-latest
 uv run python tests/smoke/seed_sample.py          # the shop sample in all four (SQLite: data/sqlite/shop.db)
-uv run --group dev pytest -q tests/test_live.py   # 112 live tests
+tests/smoke/ssh_server.sh                         # SSH server basilisk-ssh on 127.0.0.1:52222 (tunnel tests)
+uv run --group dev pytest -q tests/test_live.py   # 115 live tests
 BASILISK_PASS=… python3 tests/smoke/ui_smoke.py   # ~85 UI checks per engine
 ```
 
@@ -378,6 +381,33 @@ Basilisk's own pooled connections costs nothing but that statement.
   table's own diagram (**ER diagram around this table**) is not saved.
   **Pointer capture sends `dblclick` to the host, not the table**: two clicks
   on one table within 400 ms open it instead.
+
+### SSH tunnels (`tunnels.py`, milestone 3)
+
+- A profile's `ssh` column is encrypted JSON: enabled, host, port, username,
+  auth (`password` | `key`), password or private_key + passphrase, and the
+  pinned `host_key`. The browser gets `tunnels.public_settings` only: no
+  secrets, the key as its `SHA256:` fingerprint. Secrets are three-state as
+  the database password (absent keeps, `""` clears; the editor sends a single
+  space to clear); switching auth drops the other secret.
+  `tunnels.merge_settings` forgets the pin when the SSH host or port changes.
+- `engine_pool.build_engine` gives each engine with SSH on its own
+  `Tunnel`: the SSH connection is made **then** (so its error is the one
+  shown), a loopback listener on an ephemeral port forwards each driver
+  connection over `direct-tcpip`, and the URL points at it. Disposing the
+  engine closes the tunnel (`_tunnels`, keyed by the engine). The pool builds
+  engines **outside its lock** now (an SSH dial can take seconds) and rebuilds
+  one whose tunnel is no longer healthy; a tunnel also redials by itself for
+  its next connection.
+- **Host keys**: pinned on first use like IguanaXterm (`ssh.PinnedHostKeyPolicy`);
+  the pool saves it (`db.pin_ssh_host_key`, never over an existing pin), and
+  Test returns the key it saw so the editor pins it on Save. A changed key is
+  refused with `HostKeyChanged`; the editor's "Forget the pinned key" clears
+  it. Never the server's own agent or `~/.ssh` keys (`allow_agent=False`).
+- The test SSH server (`tests/smoke/ssh_server.sh`) is Alpine + OpenSSH on
+  the host network, so "127.0.0.1:55432" is the database as it sees it.
+- TLS with hostname verification (PostgreSQL `verify-full`) checks the
+  certificate against `127.0.0.1`, the tunnel's end, and fails.
 
 ### SQL editor
 
