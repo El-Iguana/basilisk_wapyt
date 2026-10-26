@@ -65,7 +65,23 @@ running in Pyodide) and the wapyt widget set.
   the server's host key is pinned on first use.
 - Multi-user, passwords encrypted at rest, sign-in required.
 
-## Run it
+## Install
+
+**[INSTALL.md](INSTALL.md)** has it all, step by step:
+
+- **With Docker or Podman** on Windows, macOS or Linux:
+  ```bash
+  cp .env.example .env          # set BASILISK_ADMIN_PASS
+  docker compose up -d --build  # http://127.0.0.1:8768/basilisk
+  ```
+  (`--profile postgres` adds a PostgreSQL to try it with;
+  `compose.host-network.yaml` on Linux reaches databases on the host's
+  127.0.0.1.)
+- **Windows without Docker**: `Basilisk-<version>-setup.exe` from the
+  [releases](https://github.com/El-Iguana/basilisk_wapyt/releases), a
+  per-user install with a tray icon.
+
+From source, for development:
 
 ```bash
 cp .env.example .env          # set BASILISK_ADMIN_PASS
@@ -74,8 +90,8 @@ uv sync
 uv run python service.py      # http://127.0.0.1:8768/basilisk/
 ```
 
-Or in a container: `scripts/podman-run.sh` (Linux + Podman, host networking so
-connections can reach databases on the same machine).
+`scripts/podman-run.sh` builds the development container (Linux + Podman,
+host networking, the sibling wapyt checkout).
 
 SQLite and DuckDB connections open files inside one folder on the server
 (`BASILISK_SQLITE_ROOT`, by default `data/sqlite`). DuckDB opens a file one way

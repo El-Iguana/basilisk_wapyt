@@ -116,8 +116,16 @@ test.
   needs a routing key, so SQLAlchemy cannot list or read its tables. Revisit
   when BriskDB offers catalog queries (or Basilisk grows a non-SQLAlchemy
   adapter for its embedded API).
-- **Install story** like Monguana's: compose files, INSTALL.md, Windows
-  installer.
+- ~~**Install story**~~ — done (2026-10-26): `compose.yaml` (bridge, an
+  optional bundled PostgreSQL) and `compose.host-network.yaml` (Linux),
+  INSTALL.md (engines, connecting from a container, files, SSH, backups,
+  updating, troubleshooting, what was tested), and a native per-user Windows
+  installer (embeddable CPython, Inno Setup, a tray launcher) built and
+  install-tested by the `windows` workflow, attached to releases on a `v*`
+  tag. Follow-ups: code-signing the installer; a hand test of the installer on
+  a Windows desktop and of an in-place upgrade (docs/UPGRADE_TEST.md);
+  macOS (native app or Homebrew); published images (GHCR) so compose need not
+  build.
 
 ## Small items
 

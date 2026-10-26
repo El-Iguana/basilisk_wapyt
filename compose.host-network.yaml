@@ -1,0 +1,51 @@
+# Basilisk on the host's network — Linux only (Docker Engine or Podman).
+#
+#   docker compose -f compose.host-network.yaml up -d --build
+#   podman compose -f compose.host-network.yaml up -d --build
+#
+# Use this instead of compose.yaml when the database servers you manage listen
+# on this machine's 127.0.0.1 only: with host networking, 127.0.0.1 inside the
+# container *is* this machine, so a connection can say host 127.0.0.1. With
+# compose.yaml's bridge network, host.docker.internal reaches only servers
+# listening beyond loopback (INSTALL.md, "A database on the same computer").
+#
+# Basilisk then binds to 127.0.0.1 itself, so it is still not on the network.
+# Docker Desktop (Windows, macOS) and Podman machines run containers in a VM,
+# where host networking means the VM's network: use compose.yaml there.
+
+name: basilisk
+
+services:
+  basilisk:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: localhost/basilisk:latest
+    container_name: basilisk
+    hostname: basilisk
+    labels:
+      app: Basilisk
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    environment:
+      BASILISK_DATA_DIR: /data
+      BASILISK_BIND: ${BASILISK_HOST:-127.0.0.1}
+      PORT: ${BASILISK_PORT:-8768}
+      BASILISK_CANONICAL_ORIGIN: ${BASILISK_CANONICAL_ORIGIN:-http://${BASILISK_HOST:-127.0.0.1}:${BASILISK_PORT:-8768}}
+      BASILISK_ALLOWED_HOSTS: ${BASILISK_ALLOWED_HOSTS:-}
+    volumes:
+      - basilisk-data:/data
+      # SQLite and DuckDB files: see compose.yaml.
+      # - ./databases:/data/sqlite:z
+    healthcheck:
+      test: ["CMD", "python", "manage.py", "health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
+
+volumes:
+  basilisk-data:
+    name: basilisk-data
