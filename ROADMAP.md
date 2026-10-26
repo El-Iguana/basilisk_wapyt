@@ -74,8 +74,12 @@ test.
 
 ## Milestone 3: bigger pieces
 
-- **ER diagram** of a schema (tables, columns, FK lines), auto-laid-out, export
-  as SVG.
+- ~~**ER diagram**~~ — done (2026-10-26): a schema's tables or one table and
+  its neighbours, laid out by foreign keys, crow's-foot lines, drag
+  (remembered per schema), pan and zoom, all columns / keys / names, find,
+  SVG export; tables in other schemas as ghost boxes. Follow-ups: PNG export;
+  views in the diagram; edge routing around boxes (orthogonal lines); create
+  a foreign key by dragging between columns; print / PDF.
 - **Data compare / schema compare** between two connections.
 - **SSH tunnels** for connections (paramiko; IguanaXterm has the know-how).
 - **More engines** through the adapter: MariaDB-specific bits, CockroachDB

@@ -54,12 +54,13 @@ appcode/                   # pytincture modules_path
   ui/value_panel.py        #   the value panel (Pyodide; pure helpers at the top, tested in CPython)
   ui/grid_tools.py         #   grids: column layouts, column filters, copy as INSERT / Markdown, FK rows — pure
   ui/import_tools.py       #   the Import CSV dialog: sniffing, preview, column matching — pure
+  ui/er_layout.py          #   the ER diagram: model, layout, SVG — pure
   static/                  #   basilisk_avatar.webp: logo, login page, favicon, About
   vendor/codemirror/       #   the SQL editor bundle (built, committed), served at /vendor
 docs/basilisk.webp         # the README's picture (both cut from the original artwork, 1254 px)
 tools/codemirror/          # its recipe: pinned package.json, entry.js, build.sh
 tests/                     # test_units.py, test_plans.py, test_value_panel.py, test_grid_tools.py,
-                           # test_import_tools.py, test_bff_state.py, test_live.py (needs the databases)
+                           # test_import_tools.py, test_er_layout.py, test_bff_state.py, test_live.py (needs the databases)
 tests/smoke/               # seed_sample.py + ui_smoke.py (Playwright, all four engines)
 Containerfile, scripts/podman-run.sh   # image + dev container "basilisk"
 ```
@@ -101,8 +102,8 @@ podman run -d --name basilisk-mysql -p 127.0.0.1:53306:3306 -e MYSQL_ROOT_PASSWO
 podman run -d --name basilisk-mssql -p 127.0.0.1:51433:1433 -e ACCEPT_EULA=Y \
   -e MSSQL_SA_PASSWORD="$PW" -e MSSQL_PID=Developer mcr.microsoft.com/mssql/server:2022-latest
 uv run python tests/smoke/seed_sample.py          # the shop sample in all four (SQLite: data/sqlite/shop.db)
-uv run --group dev pytest -q tests/test_live.py   # 108 live tests
-BASILISK_PASS=… python3 tests/smoke/ui_smoke.py   # ~80 UI checks per engine
+uv run --group dev pytest -q tests/test_live.py   # 112 live tests
+BASILISK_PASS=… python3 tests/smoke/ui_smoke.py   # ~85 UI checks per engine
 ```
 
 Users: `postgres` / `root` / `sa`. The sample (`seed_sample.py`): customers,
@@ -354,6 +355,29 @@ has only `KILL`, which refuses to run inside a transaction: it runs on a raw
 auto-commit connection that is then thrown away. Refused on read-only
 profiles; production asks in red. The pool pre-pings, so ending one of
 Basilisk's own pooled connections costs nothing but that statement.
+
+### ER diagram (`ui/er_layout.py`, milestone 3)
+
+- `sqlops.er_model` reads a location with SQLAlchemy's bulk reflection
+  (`get_multi_columns` / `_pk_constraint` / `_foreign_keys`: one query per
+  kind, not per table), at most 400 tables. Types lose `COLLATE` and
+  character sets (`_short_type`); `ref_schema` is None for the same schema
+  (MySQL reports the database).
+- `er_layout` is pure and drawn by character count (monospace text): layers
+  by longest path from the referenced tables (cycles broken by a DFS), a
+  table only referenced from far away pulled next to its nearest referrer,
+  barycentre sweeps per layer, connected groups packed in rows, unconnected
+  tables last. A table in another schema is a dashed **ghost** box. Lines are
+  cubic curves between facing sides at the columns' rows: a crow's foot at
+  the referencing end (a circle when its columns are nullable), two bars at
+  the referenced end. One `<style>` inside the SVG serves the page (dark)
+  and the export (light, `standalone=True`, own size and background).
+- The tab pans (drag the background), zooms (wheel, around the cursor) and
+  drags tables, redrawing only their lines. Positions and the column mode are
+  saved per schema and user (`er:<conn>:<db>:<schema>` in `ui_state`); a
+  table's own diagram (**ER diagram around this table**) is not saved.
+  **Pointer capture sends `dblclick` to the host, not the table**: two clicks
+  on one table within 400 ms open it instead.
 
 ### SQL editor
 

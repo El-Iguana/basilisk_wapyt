@@ -982,3 +982,21 @@ def test_sessions_list_and_stop(user_id, profile):
     # The pool notices the ended connection and gives a working one next.
     ran = sqlops.execute(user_id, conn_id, database, "SELECT 1")
     assert not ran["results"][0].get("error"), ran
+
+
+def test_er_model(user_id, profile):
+    from services import sqlops
+
+    engine, conn_id = profile
+    database, schema = LOCATION[engine]
+    model = sqlops.er_model(user_id, conn_id, database, schema)
+    tables = {t["name"]: t for t in model["tables"]}
+    assert {"customers", "products", "orders", "order_items", "audit_log"} <= set(tables)
+    items = tables["order_items"]
+    assert items["pk"] == ["order_id", "sku"]
+    refs = {(fk["ref_schema"], fk["ref_table"], tuple(fk["ref_columns"])) for fk in items["fks"]}
+    assert refs == {(None, "orders", ("id",)), (None, "products", ("sku",))}
+    assert tables["orders"]["fks"][0]["columns"] == ["customer_id"]
+    types = " ".join(c["type"] for t in model["tables"] for c in t["columns"]).upper()
+    assert "COLLATE" not in types and "CHARACTER SET" not in types
+    assert not model["truncated"]

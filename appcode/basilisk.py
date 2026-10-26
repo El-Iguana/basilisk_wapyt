@@ -72,6 +72,16 @@ from services.sql_service import SqlService
 from services.ui_state_service import UiStateService
 from services.user_service import UserService
 from services.values import MAX_CELL_CHARS
+from ui.er_layout import (
+    MODES as ER_MODES,
+    bounds as er_bounds,
+    edge_path as er_edge_path,
+    edges as er_edges,
+    layout as er_layout_boxes,
+    nodes as er_nodes,
+    render as er_render,
+    resize as er_resize,
+)
 from ui.grid_tools import (
     FILTER_OPS,
     MAX_FROZEN,
@@ -179,6 +189,11 @@ def _esc(value) -> str:
 def _node_id(kind: str, *parts) -> str:
     """Deterministic tree ids, so the Tree keeps expansion across ``set_items``."""
     return ":".join([kind, *(quote(str(part), safe="") for part in parts)])
+
+
+def _css_attr(value: str) -> str:
+    """A value inside a double-quoted CSS attribute selector."""
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _jsobj(value):
@@ -314,6 +329,10 @@ class Basilisk(MainWindow):
                     TreeAction("refresh", "Refresh", "mdi-refresh",
                                kinds=["database", "schema", "group", "roles"]),
                     TreeAction("sessions", "Sessions…", "mdi-pulse", kinds=server),
+                    TreeAction("er", "ER diagram", "mdi-graph-outline",
+                               kinds=["server", "database", "schema", "group"]),
+                    TreeAction("er_table", "ER diagram around this table", "mdi-graph-outline",
+                               kinds=["table"]),
                     TreeAction("disconnect", "Disconnect", "mdi-lan-disconnect", kinds=server),
                     TreeAction(separator=True),
                     TreeAction("edit_conn", "Edit connection…", "mdi-pencil", kinds=server),
@@ -376,6 +395,7 @@ class Basilisk(MainWindow):
 
         self._listen("click", self._on_click)
         self._listen("change", self._on_change)
+        self._listen("input", self._on_input)
         self._listen("keydown", self._on_keydown)
         before = create_proxy(self._on_before_unload)
         self._proxies.append(before)
@@ -433,6 +453,8 @@ class Basilisk(MainWindow):
             self._object_action(tid, action, button)
         elif tab["kind"] == "sessions":
             self._sessions_action(tid, action, button)
+        elif tab["kind"] == "er":
+            self._er_action(tid, action, button)
         else:
             self._sql_action(tid, action, button)
 
@@ -459,6 +481,14 @@ class Basilisk(MainWindow):
                 _spawn(self._sql_switch_db(tid, str(target.value), target), "database")
             elif role == "max_rows":
                 tab["max_rows"] = int(target.value)
+
+    def _on_input(self, event) -> None:
+        target = event.target
+        if not target or not hasattr(target, "closest"):
+            return
+        tid = self._tab_of(target)
+        if tid is not None and _attr(target, "data-role") == "er_find":
+            self._er_find(tid, str(target.value or ""))
 
     def _on_keydown(self, event) -> None:
         target = event.target
@@ -977,6 +1007,10 @@ class Basilisk(MainWindow):
             self._open_object(data)
         elif action == "sessions":
             self._open_sessions(conn_id)
+        elif action == "er":
+            self._open_er(data)
+        elif action == "er_table":
+            self._open_er(data, focus=name)
         elif action == "trigger_table":
             self._open_table(self._loc(data), data.get("table") or "", "table")
         elif action == "export_csv":
@@ -3235,6 +3269,417 @@ class Basilisk(MainWindow):
             kind = self._tabs[tid]["object_kind"]
             self._close_tab(tid)
             self._open_table(loc, name, kind, was or sub)
+
+    # ------------------------------------------------------------------
+    # ER diagram (milestone 3): ui/er_layout.py lays out and draws the
+    # SVG; this tab pans, zooms, drags tables (their places are remembered
+    # per schema), highlights relations and exports a light SVG.
+    # ------------------------------------------------------------------
+
+    ER_ZOOM = (0.15, 3.0)
+
+    def _open_er(self, data: dict, focus: str | None = None) -> str | None:
+        conn = self._conn(data.get("conn")) or {}
+        levels = conn.get("levels") or []
+        loc = self._loc(data)
+        if ("schema" in levels and not loc[2]) or ("database" in levels and not loc[1]):
+            self._toast("Choose a " + ("schema" if "schema" in levels else "database")
+                        + " in the navigator for its diagram.", kind="warning")
+            return None
+        for tid, tab in self._tabs.items():
+            if tab["kind"] == "er" and tab["loc"] == loc and tab["focus"] == focus:
+                self.tabs.set_active(tid)
+                return tid
+        where = ".".join(part for part in loc[1:] if part) or conn.get("name", "")
+        title = f"ER · {focus}" if focus else f"ER · {where}"
+        tid, container = self._new_tab(title, "mdi-graph-outline")
+        modes = "".join(
+            f'<button type="button" class="bk-seg-btn" data-bk="er_mode" data-mode="{key}" '
+            f'aria-pressed="{"true" if key == "all" else "false"}">{label}</button>'
+            for key, label in (("all", "All columns"), ("keys", "Keys"), ("none", "Names")))
+        container.innerHTML = f"""
+<div class="bk-view" data-tab="{tid}">
+  <div class="bk-head">{self._crumbs(conn, loc[1], loc[2], focus or "ER diagram",
+                                     "mdi-table" if focus else "mdi-graph-outline")}
+    <span class="bk-head-stats" id="{tid}-stats"></span></div>
+  <div class="bk-bar">
+    <span class="bk-seg" role="group" aria-label="Columns shown">{modes}</span>
+    <span class="bk-bar-sep"></span>
+    <input class="bk-input bk-er-find" data-role="er_find" id="{tid}-find" spellcheck="false"
+      autocomplete="off" placeholder="Find a table" aria-label="Find a table">
+    <span class="bk-bar-sep"></span>
+    <button type="button" class="bk-btn" data-bk="er_zoom" data-z="-1" title="Zoom out">
+      <span class="mdi mdi-magnify-minus-outline"></span></button>
+    <span class="bk-note bk-er-zoom" id="{tid}-zoom">100%</span>
+    <button type="button" class="bk-btn" data-bk="er_zoom" data-z="1" title="Zoom in">
+      <span class="mdi mdi-magnify-plus-outline"></span></button>
+    <button type="button" class="bk-btn" data-bk="er_fit" title="Fit the diagram to the window">
+      <span class="mdi mdi-fit-to-screen-outline"></span><span>Fit</span></button>
+    <button type="button" class="bk-btn" data-bk="er_layout" title="Lay the tables out again (forgets moved ones)">
+      <span class="mdi mdi-auto-fix"></span><span>Re-layout</span></button>
+    <button type="button" class="bk-btn" data-bk="er_all" {"" if focus else "hidden"}
+      title="The diagram of every table here">
+      <span class="mdi mdi-graph-outline"></span><span>Whole schema</span></button>
+    <span class="bk-spacer"></span>
+    <button type="button" class="bk-btn" data-bk="er_refresh" title="Read the tables again">
+      <span class="mdi mdi-refresh"></span></button>
+    <button type="button" class="bk-btn" data-bk="er_svg" title="Save the diagram as an SVG picture">
+      <span class="mdi mdi-download-outline"></span><span>SVG</span></button>
+  </div>
+  <div class="bk-status" id="{tid}-status" hidden></div>
+  <div class="bk-er-host" id="{tid}-er" tabindex="0"><div class="bk-vp-empty">Reading the tables…</div></div>
+  <div class="bk-foot"><code>Drag a table to move it · drag the background to pan · the wheel zooms ·
+    click a table to pick out its relations · double-click to open it</code></div>
+</div>"""
+        self._tabs[tid] = {
+            "tid": tid, "kind": "er", "conn": loc[0], "db": loc[1], "loc": loc, "focus": focus,
+            "name": focus or "ER diagram", "model": None, "tables": {}, "edges": [],
+            "mode": "all", "boxes": {}, "zoom": 1.0, "px": 40.0, "py": 40.0, "drag": None,
+            "picked": None, "saved_gen": 0,
+        }
+        self._er_events(tid)
+        self.tabs.set_active(tid)
+        _spawn(self._load_er(tid), "er diagram")
+        return tid
+
+    def _er_key(self, tab: dict) -> str:
+        conn_id, db, schema = tab["loc"]
+        return f"er:{conn_id}:{db}:{schema}"
+
+    async def _load_er(self, tid: str, relayout: bool = False) -> None:
+        tab = self._tabs.get(tid)
+        if tab is None:
+            return
+        conn_id, db, schema = tab["loc"]
+        result = await SqlService().er_model_async(conn_id, db, schema)
+        if tid not in self._tabs:
+            return
+        if not result.get("ok"):
+            self._status(tid, result.get("error", "Could not read the tables"))
+            return
+        self._status(tid, "Only the first 400 tables are drawn." if result.get("truncated")
+                     else "", kind="warning")
+        saved = {}
+        if not tab["focus"]:
+            state = await UiStateService().get_async(self._er_key(tab))
+            if state.get("ok") and isinstance(state.get("value"), dict):
+                saved = state["value"]
+                if saved.get("mode") in ER_MODES:
+                    tab["mode"] = saved["mode"]
+        tab["model"] = result
+        tab["tables"] = er_nodes(result, tab["focus"])
+        tab["edges"] = er_edges(tab["tables"])
+        boxes = er_layout_boxes(tab["tables"], tab["mode"])
+        if not relayout:
+            for key, place in (saved.get("positions") or {}).items():
+                if key in boxes and isinstance(place, list) and len(place) == 2:
+                    boxes[key] = {**boxes[key], "x": float(place[0]), "y": float(place[1])}
+        tab["boxes"] = boxes
+        count = len([t for t in tab["tables"].values() if not t.get("ghost")])
+        _el(f"{tid}-stats").textContent = (
+            f"{count} table{'s' if count != 1 else ''} · {len(tab['edges'])} foreign key"
+            f"{'s' if len(tab['edges']) != 1 else ''}")
+        self._er_mode_buttons(tid)
+        self._er_draw(tid)
+        self._er_fit(tid)
+
+    def _er_mode_buttons(self, tid: str) -> None:
+        root = js.document.querySelector(f'.bk-view[data-tab="{tid}"]')
+        for button in root.querySelectorAll('[data-bk="er_mode"]'):
+            button.setAttribute("aria-pressed", "true" if _attr(button, "data-mode")
+                                == self._tabs[tid]["mode"] else "false")
+
+    def _er_draw(self, tid: str) -> None:
+        tab = self._tabs[tid]
+        host = _el(f"{tid}-er")
+        if not tab["tables"]:
+            host.innerHTML = '<div class="bk-vp-empty">No tables here.</div>'
+            return
+        host.innerHTML = er_render(tab["tables"], tab["mode"], tab["boxes"])
+        self._er_transform(tid)
+        if tab["picked"] in tab["tables"]:
+            self._er_pick(tid, tab["picked"])
+
+    def _er_transform(self, tid: str) -> None:
+        tab = self._tabs[tid]
+        root = js.document.querySelector(f"#{tid}-er .bk-er-root")
+        if root:
+            root.setAttribute("transform", f"translate({tab['px']:.1f},{tab['py']:.1f}) "
+                                           f"scale({tab['zoom']:.4f})")
+        _el(f"{tid}-zoom").textContent = f"{round(tab['zoom'] * 100)}%"
+
+    def _er_fit(self, tid: str) -> None:
+        tab = self._tabs[tid]
+        host = _el(f"{tid}-er")
+        x0, y0, x1, y1 = er_bounds(tab["boxes"])
+        width, height = float(host.clientWidth or 800), float(host.clientHeight or 500)
+        if x1 <= x0 or y1 <= y0:
+            return
+        zoom = min(1.25, (width - 60) / (x1 - x0), (height - 60) / (y1 - y0))
+        tab["zoom"] = max(self.ER_ZOOM[0], zoom)
+        tab["px"] = (width - (x1 - x0) * tab["zoom"]) / 2 - x0 * tab["zoom"]
+        tab["py"] = max(20.0, (height - (y1 - y0) * tab["zoom"]) / 2) - y0 * tab["zoom"]
+        self._er_transform(tid)
+
+    def _er_zoom(self, tid: str, factor: float, cx: float | None = None,
+                 cy: float | None = None) -> None:
+        tab = self._tabs[tid]
+        host = _el(f"{tid}-er")
+        if cx is None:
+            cx, cy = float(host.clientWidth) / 2, float(host.clientHeight) / 2
+        zoom = min(self.ER_ZOOM[1], max(self.ER_ZOOM[0], tab["zoom"] * factor))
+        # Keep the point under the cursor where it is.
+        tab["px"] = cx - (cx - tab["px"]) * zoom / tab["zoom"]
+        tab["py"] = cy - (cy - tab["py"]) * zoom / tab["zoom"]
+        tab["zoom"] = zoom
+        self._er_transform(tid)
+
+    def _er_events(self, tid: str) -> None:
+        host = _el(f"{tid}-er")
+
+        def local(event) -> tuple:
+            rect = host.getBoundingClientRect()
+            return float(event.clientX) - float(rect.left), float(event.clientY) - float(rect.top)
+
+        def table_of(event):
+            node = event.target.closest(".bk-er-table") if hasattr(event.target, "closest") else None
+            return _attr(node, "data-t") if node else ""
+
+        def on_down(event) -> None:
+            tab = self._tabs.get(tid)
+            if tab is None or int(event.button) != 0:
+                return
+            key = table_of(event)
+            x, y = local(event)
+            box = tab["boxes"].get(key) if key else None
+            tab["drag"] = {"key": key, "x": x, "y": y, "moved": False,
+                           "bx": box["x"] if box else 0, "by": box["y"] if box else 0,
+                           "px": tab["px"], "py": tab["py"]}
+            host.setPointerCapture(event.pointerId)
+            host.focus()
+            event.preventDefault()
+
+        def on_move(event) -> None:
+            tab = self._tabs.get(tid)
+            drag = tab and tab["drag"]
+            if not drag:
+                return
+            x, y = local(event)
+            dx, dy = x - drag["x"], y - drag["y"]
+            if not drag["moved"] and abs(dx) + abs(dy) < 4:
+                return
+            drag["moved"] = True
+            if drag["key"]:
+                self._er_move(tid, drag["key"], drag["bx"] + dx / tab["zoom"],
+                              drag["by"] + dy / tab["zoom"])
+            else:
+                tab["px"], tab["py"] = drag["px"] + dx, drag["py"] + dy
+                self._er_transform(tid)
+                host.classList.add("bk-er-panning")
+
+        def on_up(event) -> None:
+            tab = self._tabs.get(tid)
+            drag = tab and tab["drag"]
+            if not drag:
+                return
+            tab["drag"] = None
+            host.classList.remove("bk-er-panning")
+            if drag["moved"]:
+                if drag["key"]:
+                    self._er_remember(tid)
+                return
+            # Pointer capture sends dblclick to the host, not the table:
+            # two clicks on one table within 400 ms open it.
+            now = float(js.Date.now())
+            last = tab.get("last_click") or ("", 0.0)
+            tab["last_click"] = (drag["key"], now)
+            if drag["key"] and last[0] == drag["key"] and now - last[1] < 400:
+                tab["last_click"] = ("", 0.0)
+                open_table(drag["key"])
+                return
+            self._er_pick(tid, drag["key"] or None)
+
+        def on_wheel(event) -> None:
+            if tid not in self._tabs:
+                return
+            event.preventDefault()
+            x, y = local(event)
+            step = 1.0015 ** (-float(event.deltaY) * (0.05 if int(event.deltaMode) == 0 else 1.6))
+            self._er_zoom(tid, max(0.5, min(2.0, step)), x, y)
+
+        def open_table(key: str) -> None:
+            tab = self._tabs.get(tid)
+            if tab is None:
+                return
+            table = tab["tables"].get(key) or {}
+            if table.get("ghost"):
+                self._toast(f"{key} is in another schema.", kind="warning")
+                return
+            self._open_table(tab["loc"], key, "table")
+
+        def on_over(event) -> None:
+            self._er_hover(tid, table_of(event), True)
+
+        def on_out(event) -> None:
+            self._er_hover(tid, table_of(event), False)
+
+        for name, handler in (("pointerdown", on_down), ("pointermove", on_move),
+                              ("pointerup", on_up), ("pointercancel", on_up),
+                              ("pointerover", on_over),
+                              ("pointerout", on_out)):
+            proxy = create_proxy(handler)
+            self._proxies.append(proxy)
+            host.addEventListener(name, proxy)
+        wheel = create_proxy(on_wheel)
+        self._proxies.append(wheel)
+        host.addEventListener("wheel", wheel, _jsobj({"passive": False}))
+
+    def _er_move(self, tid: str, key: str, x: float, y: float) -> None:
+        """Move one box and redraw the lines that touch it."""
+        tab = self._tabs[tid]
+        tab["boxes"][key] = {**tab["boxes"][key], "x": round(x), "y": round(y)}
+        host = _el(f"{tid}-er")
+        group = host.querySelector(f'.bk-er-table[data-t="{_css_attr(key)}"]')
+        if group:
+            group.setAttribute("transform", f"translate({round(x)},{round(y)})")
+        for number, edge in enumerate(tab["edges"]):
+            if key in (edge["child"], edge["parent"]):
+                path = host.querySelector(f'.bk-er-edge[data-e="{number}"]')
+                if path:
+                    path.setAttribute("d", er_edge_path(tab["tables"], tab["mode"],
+                                                        tab["boxes"], edge))
+
+    def _er_related(self, tab: dict, key: str) -> tuple:
+        """The tables and edge numbers that touch ``key``."""
+        tables, numbers = {key}, set()
+        for number, edge in enumerate(tab["edges"]):
+            if key in (edge["child"], edge["parent"]):
+                numbers.add(number)
+                tables |= {edge["child"], edge["parent"]}
+        return tables, numbers
+
+    def _er_hover(self, tid: str, key: str, on: bool) -> None:
+        tab = self._tabs.get(tid)
+        if tab is None or not key or tab["drag"]:
+            return
+        host = _el(f"{tid}-er")
+        _tables, numbers = self._er_related(tab, key)
+        group = host.querySelector(f'.bk-er-table[data-t="{_css_attr(key)}"]')
+        if group:
+            group.classList.toggle("bk-er-hot", on or tab["picked"] == key)
+        for number in numbers:
+            path = host.querySelector(f'.bk-er-edge[data-e="{number}"]')
+            if path:
+                path.classList.toggle("bk-er-hot", on or number in self._er_picked_edges(tab))
+                hot = on or number in self._er_picked_edges(tab)
+                path.setAttribute("marker-start", path.getAttribute("marker-start")
+                                  .replace("-hot)", ")").replace(")", "-hot)" if hot else ")"))
+                path.setAttribute("marker-end", "url(#bk-er-one-hot)" if hot
+                                  else "url(#bk-er-one)")
+
+    def _er_picked_edges(self, tab: dict) -> set:
+        return self._er_related(tab, tab["picked"])[1] if tab["picked"] else set()
+
+    def _er_pick(self, tid: str, key: str | None) -> None:
+        """Pick out one table's relations (the rest dims); None clears."""
+        tab = self._tabs[tid]
+        tab["picked"] = key if key in tab["tables"] else None
+        host = _el(f"{tid}-er")
+        tables, numbers = self._er_related(tab, tab["picked"]) if tab["picked"] else (set(), set())
+        for group in host.querySelectorAll(".bk-er-table"):
+            name = _attr(group, "data-t")
+            group.classList.toggle("bk-er-dim", bool(tab["picked"]) and name not in tables)
+            group.classList.toggle("bk-er-hot", name == tab["picked"])
+        for path in host.querySelectorAll(".bk-er-edge"):
+            number = int(_attr(path, "data-e") or -1)
+            hot = number in numbers
+            path.classList.toggle("bk-er-dim", bool(tab["picked"]) and not hot)
+            path.classList.toggle("bk-er-hot", hot)
+            start = path.getAttribute("marker-start").replace("-hot)", ")")
+            path.setAttribute("marker-start", start.replace(")", "-hot)") if hot else start)
+            path.setAttribute("marker-end", "url(#bk-er-one-hot)" if hot else "url(#bk-er-one)")
+
+    def _er_find(self, tid: str, text: str) -> None:
+        tab = self._tabs[tid]
+        needle = text.strip().lower()
+        if not needle:
+            self._er_pick(tid, None)
+            return
+        names = sorted(tab["boxes"], key=lambda k: (not k.lower().startswith(needle), len(k), k))
+        found = next((k for k in names if needle in k.lower()), None)
+        if found is None:
+            return
+        self._er_pick(tid, found)
+        box = tab["boxes"][found]
+        host = _el(f"{tid}-er")
+        tab["px"] = float(host.clientWidth) / 2 - (box["x"] + box["w"] / 2) * tab["zoom"]
+        tab["py"] = float(host.clientHeight) / 2 - (box["y"] + box["h"] / 2) * tab["zoom"]
+        self._er_transform(tid)
+
+    def _er_remember(self, tid: str) -> None:
+        """Moved tables and the column mode, per schema and user (not for a focused diagram)."""
+        tab = self._tabs[tid]
+        if tab["focus"]:
+            return
+        tab["saved_gen"] += 1
+        _spawn(self._er_save_later(tid, tab["saved_gen"]), "save diagram")
+
+    async def _er_save_later(self, tid: str, generation: int) -> None:
+        await asyncio.sleep(0.5)
+        tab = self._tabs.get(tid)
+        if tab is None or tab["saved_gen"] != generation:
+            return
+        value = {"mode": tab["mode"], "positions": {
+            key: [box["x"], box["y"]] for key, box in tab["boxes"].items()}}
+        result = await UiStateService().set_async(self._er_key(tab), value)
+        if not result.get("ok"):
+            js.console.warn(f"[basilisk] diagram not saved: {result.get('error')}")
+
+    def _er_action(self, tid: str, action: str, button) -> None:
+        tab = self._tabs[tid]
+        if action == "er_zoom":
+            self._er_zoom(tid, 1.25 if _attr(button, "data-z") == "1" else 0.8)
+        elif action == "er_fit":
+            self._er_fit(tid)
+        elif action == "er_refresh":
+            _spawn(self._load_er(tid), "er diagram")
+        elif action == "er_all":
+            data = {"conn": tab["loc"][0], "db": tab["loc"][1], "schema": tab["loc"][2]}
+            self._open_er(data)
+        elif not tab["tables"]:
+            return
+        elif action == "er_mode":
+            mode = _attr(button, "data-mode")
+            if mode in ER_MODES and mode != tab["mode"]:
+                tab["mode"] = mode
+                tab["boxes"] = er_resize(tab["tables"], mode, tab["boxes"])
+                self._er_mode_buttons(tid)
+                self._er_draw(tid)
+                self._er_remember(tid)
+        elif action == "er_layout":
+            tab["boxes"] = er_layout_boxes(tab["tables"], tab["mode"])
+            self._er_draw(tid)
+            self._er_fit(tid)
+            self._er_remember(tid)
+        elif action == "er_svg":
+            conn = self._conn(tab["conn"]) or {}
+            where = ".".join(part for part in tab["loc"][1:] if part) or conn.get("name", "")
+            title = f"{where} · {tab['focus']}" if tab["focus"] else where
+            svg = er_render(tab["tables"], tab["mode"], tab["boxes"], theme="light",
+                            standalone=True, title=title)
+            blob = js.Blob.new(to_js([svg]), _jsobj({"type": "image/svg+xml"}))
+            url = js.URL.createObjectURL(blob)
+            anchor = js.document.createElement("a")
+            anchor.href = url
+            anchor.download = "-".join(part for part in (where.replace(".", "-"), tab["focus"], "er")
+                                       if part) + ".svg"
+            js.document.body.appendChild(anchor)
+            anchor.click()
+            anchor.remove()
+            revoke = create_proxy(lambda: js.URL.revokeObjectURL(url))
+            self._proxies.append(revoke)
+            js.setTimeout(revoke, 10_000)
+            self._toast("Saved the diagram as SVG.", kind="success")
 
     # ------------------------------------------------------------------
     # Session manager (milestone 2): what runs on a server now, refreshed
@@ -5916,6 +6361,15 @@ th.bk-fkcol .wapyt-datatable-header-label::before,th.bk-fkcol > span:first-child
 .bk-console-log{min-height:120px;white-space:pre-wrap;word-break:break-word;font-size:12px;}
 @container (max-width: 760px){.bk-import-opts{grid-template-columns:repeat(3,minmax(0,1fr));}
   .bk-import-main{flex-direction:column;}.bk-import-map{flex-basis:auto;max-height:45%;}}
+
+/* ER diagram. */
+.bk-er-host{position:relative;flex:1 1 auto;min-height:0;overflow:hidden;background:var(--bk-deep);
+  cursor:grab;user-select:none;touch-action:none;outline:none;}
+.bk-er-host.bk-er-panning{cursor:grabbing;}
+.bk-er-svg{position:absolute;inset:0;width:100%;height:100%;display:block;}
+.bk-er-table{cursor:move;}
+.bk-er-find{width:180px;}
+.bk-er-zoom{min-width:42px;text-align:center;font-variant-numeric:tabular-nums;}
 
 /* Session manager. */
 tr.bk-active td:first-child{box-shadow:inset 3px 0 0 #22c55e;}

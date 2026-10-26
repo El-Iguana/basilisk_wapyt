@@ -107,6 +107,10 @@ class SqlService:
     def script(self, conn_id: int, database: str, schema: str, name: str, kind: str) -> dict:
         return self._call("script", int(conn_id), database or "", schema or "", name, kind)
 
+    def er_model(self, conn_id: int, database: str = "", schema: str = "") -> dict:
+        """Tables, columns, keys and foreign keys of a location, for the ER diagram."""
+        return self._call("er_model", int(conn_id), database or "", schema or "")
+
     # Session manager ----------------------------------------------------------
 
     def sessions(self, conn_id: int, include_idle: bool = False) -> dict:
