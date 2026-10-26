@@ -96,7 +96,10 @@ def message(text: str, title: str = "Basilisk", error: bool = False) -> None:
         return
     stream = sys.stderr if error else sys.stdout
     if stream is not None:
-        print(text, file=stream, flush=True)
+        # A Windows console's code page (cp1252 on CI) cannot encode every
+        # character; a message must never be what stops the launcher.
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        print(text.encode(encoding, "replace").decode(encoding), file=stream, flush=True)
 
 
 # ── the running instance ────────────────────────────────────────────────────
@@ -267,8 +270,8 @@ def launch() -> tuple[subprocess.Popen, int] | None:
             "Basilisk will ask you to choose your own password each time it "
             "loads until you do. Forgot it later? Use \"Reset Basilisk "
             "password\" in the Start menu.\n\n"
-            "SQLite and DuckDB files go in this folder (tray icon → Database "
-            f"files):\n{files_dir()}",
+            "SQLite and DuckDB files go in this folder (the tray icon's "
+            f"Database files folder):\n{files_dir()}",
             title="Basilisk — first run",
         )
     return server, port

@@ -61,3 +61,14 @@ def test_a_stale_state_file_is_not_a_running_instance(launcher):
     launcher.STATE.write_text('{"port": 1, "server_pid": 1, "launcher_pid": 1}', encoding="utf-8")
     assert launcher.read_state() is None
     assert launcher.main(["--status"]) == 1
+
+
+def test_a_message_survives_a_console_that_cannot_encode_it(launcher, monkeypatch):
+    import io
+
+    out = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(launcher, "IS_WINDOWS", False)
+    launcher.message("arrow → and lizard 🦎")
+    out.flush()
+    assert out.buffer.getvalue().startswith(b"arrow ? and lizard ?")
