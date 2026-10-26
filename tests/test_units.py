@@ -275,3 +275,33 @@ def test_ddl_sql_bits_refuse_statement_breakers():
             sql_bit(bad, "Default")
     with pytest.raises(DdlError, match="required"):
         sql_bit(" ", "Type", required=True)
+
+
+def test_duckdb_reflection_helpers():
+    from sqlalchemy import types as T
+
+    from services.engines.duckdb_dialect import DuckDBNamed, _index_columns, column_type
+
+    assert isinstance(column_type("INTEGER"), T.Integer)
+    numeric = column_type("DECIMAL(10,2)")
+    assert (numeric.precision, numeric.scale) == (10, 2)
+    assert column_type("TIMESTAMP WITH TIME ZONE").timezone
+    assert isinstance(column_type("BLOB"), T.LargeBinary)
+    assert isinstance(column_type("VARCHAR"), T.String)
+    assert isinstance(column_type("INTEGER[]"), DuckDBNamed)
+    assert _index_columns("[placed]") == (["placed"], [None])
+    assert _index_columns('[a, "b c"]') == (["a", "b c"], [None, None])
+    assert _index_columns("[lower(name), id]") == ([None, "id"], ["lower(name)", None])
+
+
+def test_new_engine_literals_and_filters():
+    from services.engines import get
+    from ui.grid_tools import filter_sql, literal
+
+    duck = get("duckdb")
+    assert duck.sql_bytes_literal(b"\x00\xff") == "'\\x00\\xff'::BLOB"
+    assert literal("duckdb", "0x00ff", "bin") == "'\\x00\\xff'::BLOB"
+    assert "ILIKE" in filter_sql("duckdb", {"column": "name", "op": "contains", "value": "a"})
+    crdb = get("cockroachdb")
+    assert crdb.family == "postgresql" and crdb.has_matviews and crdb.savepoints
+    assert duck.family == "duckdb" and not duck.uses_server and duck.identity_clause is None

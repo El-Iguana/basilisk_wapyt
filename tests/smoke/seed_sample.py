@@ -7,11 +7,12 @@ navigator's other objects where the engine has them: functions (one
 overloaded, one returning a table), a procedure with an output argument, a
 sequence, a trigger and (PostgreSQL) a materialized view.
 
-    uv run python tests/smoke/seed_sample.py            # all four
+    uv run python tests/smoke/seed_sample.py            # all six
     uv run python tests/smoke/seed_sample.py postgresql # one
 
 Idempotent: it drops and recreates the sample each time. The SQLite file goes
-to ``$BASILISK_SQLITE_ROOT/shop.db`` (default ``data/sqlite/shop.db``).
+to ``$BASILISK_SQLITE_ROOT/shop.db`` (default ``data/sqlite/shop.db``), the
+DuckDB file beside it (``shop.duckdb``).
 """
 from __future__ import annotations
 
@@ -24,7 +25,8 @@ import uuid
 from pathlib import Path
 
 from sqlalchemy import (JSON, BigInteger, Boolean, Column, Date, DateTime, ForeignKey, Integer,
-                        LargeBinary, MetaData, Numeric, String, Table, Text, Time, Unicode, UnicodeText, Uuid,
+                        LargeBinary, MetaData, Numeric, Sequence, String, Table, Text, Time, Unicode,
+                        UnicodeText, Uuid,
                         create_engine, text, URL)
 
 PASSWORD = os.environ.get("BASILISK_TEST_PASSWORD", "B@sil:isk/1")
@@ -34,19 +36,34 @@ SERVERS = {
     "postgresql": URL.create("postgresql+psycopg", "postgres", PASSWORD, "127.0.0.1", 55432, "postgres"),
     "mysql": URL.create("mysql+pymysql", "root", PASSWORD, "127.0.0.1", 53306, None),
     "mssql": URL.create("mssql+pymssql", "sa", PASSWORD, "127.0.0.1", 51433, "master"),
+    # tests/smoke/cockroach.sh: an insecure single node, user root, no password.
+    "cockroachdb": URL.create("cockroachdb+psycopg", "root", None, "127.0.0.1", 56257,
+                              "defaultdb", query={"sslmode": "disable"}),
 }
+sys.path.insert(0, str(ROOT / "appcode"))
 
 
-def sqlite_path() -> Path:
+def sqlite_path(name: str = "shop.db") -> Path:
     root = Path(os.environ.get("BASILISK_SQLITE_ROOT", ROOT / "data" / "sqlite"))
     root.mkdir(parents=True, exist_ok=True)
-    return root / "shop.db"
+    return root / name
 
 
-def metadata(schema: str | None) -> MetaData:
+def metadata(schema: str | None, dialect: str = "") -> MetaData:
+    """DuckDB has no SERIAL (a sequence default numbers its rows) and no ON DELETE actions."""
+    duck = dialect == "duckdb"
+    cascade = None if duck else "CASCADE"
     md = MetaData(schema=schema)
+
+    def numbered(table: str, start: int) -> dict:
+        """DuckDB: a sequence (made with the tables) as the column's server default."""
+        if not duck:
+            return {}
+        Sequence(f"{table}_id_seq", start=start, metadata=md)
+        return {"server_default": text(f"nextval('{table}_id_seq')")}
     Table("customers", md,
-          Column("id", Integer, primary_key=True, autoincrement=True),
+          Column("id", Integer, primary_key=True, autoincrement=not duck,
+                 **numbered("customers", 100)),
           Column("name", Unicode(100), nullable=False),
           Column("email", String(200), unique=True),
           Column("vip", Boolean, nullable=False, default=False),
@@ -61,14 +78,16 @@ def metadata(schema: str | None) -> MetaData:
           Column("attributes", JSON),
           Column("photo", LargeBinary))
     Table("orders", md,
-          Column("id", Integer, primary_key=True, autoincrement=True),
-          Column("customer_id", Integer, ForeignKey("customers.id", ondelete="CASCADE"), nullable=False, index=True),
+          Column("id", Integer, primary_key=True, autoincrement=not duck,
+                 **numbered("orders", 1000)),
+          Column("customer_id", Integer, ForeignKey("customers.id", ondelete=cascade), nullable=False, index=True),
           Column("placed_at", DateTime, nullable=False),
           Column("ship_by", Time),
           Column("token", Uuid),
           Column("status", String(20), nullable=False, default="new"))
     Table("order_items", md,
-          Column("order_id", Integer, ForeignKey("orders.id", ondelete="CASCADE"), primary_key=True),
+          Column("order_id", Integer, ForeignKey("orders.id", ondelete=cascade), primary_key=True,
+                 autoincrement=False),
           Column("sku", String(20), ForeignKey("products.sku"), primary_key=True),
           Column("qty", Integer, nullable=False))
     Table("audit_log", md,  # no primary key: read-only in the grid
@@ -136,7 +155,7 @@ VIEW = ("CREATE VIEW {q}order_totals AS SELECT o.id AS order_id, c.name AS custo
 
 
 def load(engine, schema: str | None) -> None:
-    md = metadata(schema)
+    md = metadata(schema, engine.dialect.name)
     q = f"{schema}." if schema else ""
     with engine.begin() as conn:
         conn.execute(text(f"DROP VIEW IF EXISTS {q}order_totals"))
@@ -210,6 +229,9 @@ EXTRAS = {
         "SET NOCOUNT ON; IF EXISTS (SELECT 1 FROM inserted WHERE status = '') "
         "THROW 50000, 'status cannot be empty', 1; END",
     ],
+    "duckdb": [
+        "CREATE SEQUENCE {q}invoice_no START WITH 1000",
+    ],
     "sqlite": [
         "CREATE TRIGGER orders_status_check BEFORE UPDATE OF status ON orders "
         "WHEN NEW.status = '' BEGIN SELECT RAISE(ABORT, 'status cannot be empty'); END",
@@ -217,11 +239,23 @@ EXTRAS = {
 }
 
 
+# CockroachDB runs PostgreSQL's (functions, a procedure, a trigger, a
+# materialized view) where its version can; any it refuses is left out.
+EXTRAS["cockroachdb"] = [sql.replace("UPDATE OF status", "UPDATE")   # no column lists
+                         for sql in EXTRAS["postgresql"]]
+
+
 def extras(engine, schema: str | None) -> None:
     q = f"{schema}." if schema else ""
-    with engine.begin() as conn:
-        for sql in EXTRAS[engine.dialect.name]:
-            conn.execute(text(sql.format(q=q)))
+    lenient = engine.dialect.name == "cockroachdb"
+    for sql in EXTRAS[engine.dialect.name]:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(sql.format(q=q)))
+        except Exception as exc:  # noqa: BLE001
+            if not lenient:
+                raise
+            print(f"  cockroachdb skips: {sql[:60]}… ({str(exc).splitlines()[0][:90]})")
 
 
 def seed(which: str) -> None:
@@ -233,10 +267,25 @@ def seed(which: str) -> None:
         extras(engine, None)
         print(f"sqlite: {path}")
         return
+    if which == "duckdb":
+        from services.engines import duckdb_dialect
+
+        duckdb_dialect.register()
+        path = sqlite_path("shop.duckdb")
+        path.unlink(missing_ok=True)
+        engine = create_engine(URL.create("duckdb+basilisk", database=str(path)))
+        load(engine, None)
+        extras(engine, None)
+        engine.dispose()
+        print(f"duckdb: {path}")
+        return
     admin = create_engine(SERVERS[which], isolation_level="AUTOCOMMIT")
     with admin.connect() as conn:
         if which == "postgresql":
             conn.execute(text("DROP DATABASE IF EXISTS shop WITH (FORCE)"))
+            conn.execute(text("CREATE DATABASE shop"))
+        elif which == "cockroachdb":
+            conn.execute(text("DROP DATABASE IF EXISTS shop CASCADE"))
             conn.execute(text("CREATE DATABASE shop"))
         elif which == "mysql":
             conn.execute(text("DROP DATABASE IF EXISTS shop"))
@@ -251,7 +300,7 @@ def seed(which: str) -> None:
     engine = create_engine(url)
     load(engine, None)
     extras(engine, None)
-    if which in ("postgresql", "mssql"):
+    if which in ("postgresql", "mssql", "cockroachdb"):
         with engine.begin() as conn:
             conn.execute(text("CREATE SCHEMA sales"))
         load(engine, "sales")
@@ -261,5 +310,5 @@ def seed(which: str) -> None:
 
 
 if __name__ == "__main__":
-    for name in sys.argv[1:] or ["postgresql", "mysql", "mssql", "sqlite"]:
+    for name in sys.argv[1:] or ["postgresql", "mysql", "mssql", "sqlite", "duckdb", "cockroachdb"]:
         seed(name)

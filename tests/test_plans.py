@@ -101,3 +101,90 @@ def test_mysql_classic_table():
     child = result["plan"]["children"][0]
     assert child["op"] == "SIMPLE ALL" and child["object"] == "o" and child["est_rows"] == 137
     assert child["detail"] == "extra: Using where"
+
+
+# CockroachDB EXPLAIN ANALYZE, as captured (v26.3), with the trailing advice.
+CRDB_ANALYZE = """planning time: 273µs
+execution time: 1.5ms
+distribution: local
+
+• group (hash)
+│ execution time: 33µs
+│ actual row count: 14
+│ estimated row count: 14
+│ group by: name
+│
+└── • merge join
+    │ execution time: 37µs
+    │ actual row count: 137
+    │ estimated row count: 137
+    │ equality: (customer_id) = (id)
+    │ right cols are key
+    │
+    ├── • scan
+    │     actual row count: 137
+    │     estimated row count: 137 (100% of the table; stats collected 2 seconds ago)
+    │     table: orders@ix_orders_customer_id
+    │     spans: FULL SCAN
+    │
+    └── • scan
+          actual row count: 14
+          estimated row count: 1,000 (100% of the table)
+          table: customers@customers_pkey
+          spans: FULL SCAN
+
+index recommendations: 1
+1. type: index creation
+   SQL command: CREATE INDEX ON shop.public.orders (status, customer_id);""".splitlines()
+
+
+def test_cockroach_text_tree():
+    from services.plans import flatten, parse_cockroach
+
+    result = parse_cockroach(CRDB_ANALYZE)
+    assert result["summary"] == {"cost": None, "planning_ms": 0.273, "execution_ms": 1.5}
+    rows = flatten(result["plan"])
+    assert [(r["op"], r["depth"]) for r in rows] == [
+        ("Group (Hash)", 0), ("Merge Join", 1), ("Scan", 2), ("Scan", 2)]
+    join = rows[1]
+    assert join["act_rows"] == 137 and join["time_ms"] == 0.037
+    assert join["detail"] == "equality: (customer_id) = (id)"
+    assert ["right cols are key", ""] in join["extra"]
+    last = rows[3]
+    assert last["object"] == "customers@customers_pkey" and last["est_rows"] == 1000
+    # The advice after the tree belongs to no node.
+    assert not any("SQL command" in key for row in rows for key, _ in row["extra"])
+
+
+DUCK_ESTIMATED = [{"name": "PROJECTION", "extra_info": {"Projections": ["name"]}, "children": [
+    {"name": "HASH_JOIN", "extra_info": {"Join Type": "INNER", "Conditions": "customer_id = id",
+                                         "Estimated Cardinality": "~137"}, "children": [
+        {"name": "SEQ_SCAN", "extra_info": {"Table": "t.main.orders", "Estimated Cardinality": "137"},
+         "children": []},
+        {"name": "SEQ_SCAN", "extra_info": {"Table": "t.main.customers", "Type": "Sequential Scan"},
+         "children": []}]}]}]
+
+DUCK_ANALYZED = {"latency": 0.0025, "children": [
+    {"operator_type": "EXPLAIN_ANALYZE", "operator_name": "EXPLAIN_ANALYZE", "children": [
+        {"operator_type": "HASH_GROUP_BY", "operator_name": "HASH_GROUP_BY",
+         "operator_timing": 0.0004, "operator_cardinality": 14,
+         "extra_info": {"Groups": "#0"}, "children": [
+             {"operator_type": "TABLE_SCAN", "operator_name": "TABLE_SCAN",
+              "operator_timing": 0.0001, "operator_cardinality": 137,
+              "extra_info": {"Table": "orders"}, "children": []}]}]}]}
+
+
+def test_duckdb_json_plans():
+    from services.plans import flatten, parse_duckdb
+
+    rows = flatten(parse_duckdb(DUCK_ESTIMATED)["plan"])
+    assert [(r["op"], r["depth"]) for r in rows] == [
+        ("Projection", 0), ("Hash Join", 1), ("Seq Scan", 2), ("Seq Scan", 2)]
+    assert rows[1]["est_rows"] == 137 and "Join Type: INNER" in rows[1]["detail"]
+    assert rows[2]["object"] == "t.main.orders" and rows[2]["act_rows"] is None
+    assert ["Type", "Sequential Scan"] in rows[3]["extra"]
+    analyzed = parse_duckdb(DUCK_ANALYZED)
+    assert analyzed["summary"]["execution_ms"] == 2.5
+    rows = flatten(analyzed["plan"])
+    assert rows[0]["op"] == "Hash Group By" and rows[0]["act_rows"] == 14
+    assert abs(rows[0]["time_ms"] - 0.4) < 1e-9 and rows[1]["object"] == "orders"

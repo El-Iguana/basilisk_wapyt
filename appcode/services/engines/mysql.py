@@ -15,6 +15,7 @@ TLS_MODES = (
 class MySQL(Engine):
     name = "mysql"
     label = "MySQL / MariaDB"
+    family = "mysql"
     icon = "mdi-dolphin"
     default_port = 3306
     levels = ("database",)

@@ -155,7 +155,7 @@ def objects(user_id: int, conn_id: int, database: str = "", schema: str = "") ->
         tables = sorted(insp.get_table_names(schema=target))
         views = sorted(insp.get_view_names(schema=target))
         materialized: list = []
-        if spec.name == "postgresql":
+        if spec.has_matviews:
             materialized = sorted(insp.get_materialized_view_names(schema=target))
         try:
             estimates = spec.row_estimates(conn, target)
@@ -228,7 +228,7 @@ def object_info(user_id: int, conn_id: int, database: str, schema: str, kind: st
         prep = conn.dialect.identifier_preparer
         qualified = found["name"] if kind == "role" else prep.quote(found["name"])
         # PostgreSQL trigger names belong to their table, not the schema.
-        if target and kind != "role" and not (kind == "trigger" and spec.name == "postgresql"):
+        if target and kind != "role" and not (kind == "trigger" and spec.family == "postgresql"):
             qualified = f"{prep.quote_schema(target)}.{qualified}"
         found["qualified"] = qualified
         if kind in ("function", "procedure"):
@@ -296,8 +296,8 @@ def refresh_matview(user_id: int, conn_id: int, database: str, schema: str, name
     from sqlalchemy import text
 
     engine, spec, profile = pool.open(user_id, conn_id, database)
-    if spec.name != "postgresql":
-        raise OpError("Only PostgreSQL has materialized views to refresh")
+    if not spec.has_matviews:
+        raise OpError(f"{spec.label} has no materialized views to refresh")
     with connect(user_id, conn_id, database) as (conn, spec, _p, _engine):
         target = spec.schema_for(database, schema) or "public"
         row = conn.execute(text(
@@ -354,7 +354,7 @@ def table_info(user_id: int, conn_id: int, database: str, schema: str, name: str
         insp = _inspector(conn)
         target = spec.schema_for(database, schema)
         views = set(insp.get_view_names(schema=target))
-        if spec.name == "postgresql":
+        if spec.has_matviews:
             views |= set(insp.get_materialized_view_names(schema=target))
         kind = "view" if name in views else "table"
         try:
@@ -588,7 +588,7 @@ def _count(conn: Any, spec: Any, database: str, schema: str, name: str,
     dbapi = conn.connection.dbapi_connection
     try:
         spec.set_timeout(dbapi, COUNT_TIMEOUT_S)
-        if spec.name == "postgresql":
+        if spec.savepoints:
             # A timed-out statement aborts the transaction; a savepoint keeps it.
             with conn.begin_nested():
                 return int(conn.execute(stmt).scalar() or 0), True
@@ -775,9 +775,10 @@ def save_changes(user_id: int, conn_id: int, database: str, schema: str, name: s
             with conn.begin():
                 for row_id, op, stmt in statements:
                     result = conn.execute(stmt)
-                    if op != "insert" and result.rowcount != 1:
+                    matched = spec.affected_rows(result) if op != "insert" else 1
+                    if matched != 1:
                         raise OpError(
-                            f"Row {row_id}: {op} matched {result.rowcount} rows instead of 1. "
+                            f"Row {row_id}: {op} matched {matched} rows instead of 1. "
                             "Nothing was saved; refresh to see the current data.")
             spec.set_timeout(dbapi, 0)
     except OpError:
@@ -1246,7 +1247,8 @@ def _run_piece(spec: Any, dbapi: Any, piece: Any, index: int, max_rows: int,
     savepoint = manual and spec.savepoints and first_word(piece.text) not in _TXN_WORDS
     from services.engines.base import strip_trailing_semicolon
 
-    text = piece.text if spec.name in ("postgresql", "sqlite") else strip_trailing_semicolon(piece.text)
+    text = piece.text if spec.family in ("postgresql", "sqlite", "duckdb") \
+        else strip_trailing_semicolon(piece.text)
     base = {"index": index, "start": piece.start, "end": piece.end, "sql": piece.text[:2000]}
     started = time.monotonic()
     cur = dbapi.cursor()
@@ -1257,7 +1259,10 @@ def _run_piece(spec: Any, dbapi: Any, piece: Any, index: int, max_rows: int,
         cur.execute(text)
         while True:
             entry = dict(base)
-            if cur.description:
+            count = spec.dml_count(cur, text)
+            if count is not None:
+                entry.update(columns=None, rowcount=count)
+            elif cur.description:
                 columns = [str(desc[0]) if desc[0] else f"column{i + 1}"
                            for i, desc in enumerate(cur.description)]
                 fetched = cur.fetchmany(max_rows + 1)

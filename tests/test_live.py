@@ -23,13 +23,19 @@ PROFILES = {
     "mysql": dict(host="127.0.0.1", port=53306, username="root", database="shop"),
     "mssql": dict(host="127.0.0.1", port=51433, username="sa", database="shop"),
     "sqlite": dict(database="shop.db"),
+    "duckdb": dict(database="shop.duckdb"),
+    "cockroachdb": dict(host="127.0.0.1", port=56257, username="root", database="shop",
+                        options={"sslmode": "disable"}),
 }
+FILE_ENGINES = ("sqlite", "duckdb")
 # Where the sample lives in each engine's tree: (database, schema).
 LOCATION = {
     "postgresql": ("shop", "public"),
     "mysql": ("shop", ""),
     "mssql": ("shop", "dbo"),
     "sqlite": ("", ""),
+    "duckdb": ("", ""),
+    "cockroachdb": ("shop", "public"),
 }
 
 
@@ -48,7 +54,7 @@ def _make_profile(user_id: int, engine: str, **extra) -> int:
     from services.connection_service import ConnectionService
 
     values = {**PROFILES[engine], **extra}
-    password = PASSWORD if engine != "sqlite" else ""
+    password = "" if engine in FILE_ENGINES else PASSWORD
     result = ConnectionService({"user_id": user_id}).save(
         name=f"{engine} test", engine=engine, password=password, **values)
     assert result["ok"], result
@@ -58,11 +64,11 @@ def _make_profile(user_id: int, engine: str, **extra) -> int:
 @pytest.fixture(scope="session", params=list(PROFILES))
 def profile(request, user_id):
     engine = request.param
-    if engine == "sqlite":
-        source = ROOT / "data" / "sqlite" / "shop.db"
+    if engine in FILE_ENGINES:
+        source = ROOT / "data" / "sqlite" / PROFILES[engine]["database"]
         if not source.exists():
             pytest.skip("run tests/smoke/seed_sample.py first")
-        target = Path(os.environ["BASILISK_SQLITE_ROOT"]) / "shop.db"
+        target = Path(os.environ["BASILISK_SQLITE_ROOT"]) / PROFILES[engine]["database"]
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(source, target)
     conn_id = _make_profile(user_id, engine)
@@ -86,7 +92,7 @@ def test_tree(user_id, profile):
     if schema:
         names = [row["name"] for row in sqlops.schemas(user_id, conn_id, database)["schemas"]]
         assert schema in names
-        if engine in ("postgresql", "mssql"):
+        if engine in ("postgresql", "mssql", "cockroachdb"):
             assert "sales" in names
             assert not any(n.startswith("pg_") or n == "sys" for n in names)
     found = sqlops.objects(user_id, conn_id, database, schema)
@@ -232,7 +238,12 @@ def test_execute_script_statement_and_errors(user_id, profile):
 def test_read_only_profile_refuses_writes(user_id, profile):
     from services import sqlops
 
-    engine, _ = profile
+    engine, conn_id = profile
+    if engine == "duckdb":
+        # DuckDB opens a file one way per process: close the read-write one first.
+        from services.engine_pool import pool
+
+        pool.close(user_id, conn_id)
     ro = _make_profile(user_id, engine, read_only=True)
     database, schema = LOCATION[engine]
     out = sqlops.execute(user_id, ro, database, "UPDATE orders SET status = 'x' WHERE id = 2")
@@ -243,6 +254,10 @@ def test_read_only_profile_refuses_writes(user_id, profile):
     with pytest.raises(sqlops.OpError, match="read-only"):
         sqlops.save_changes(user_id, ro, database, schema, "orders", [
             {"row": "r", "op": "delete", "key": {"id": ["i", "2"]}}])
+    if engine == "duckdb":
+        from services.engine_pool import pool
+
+        pool.close(user_id, ro)
 
 
 def test_prod_profile_asks_before_writing(user_id, profile):
@@ -270,6 +285,9 @@ def test_cancel_and_timeout(user_id, profile):
         "mssql": "WAITFOR DELAY '00:00:30'",
         "sqlite": "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) "
                   "SELECT COUNT(*) FROM c",
+        "duckdb": "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) "
+                  "SELECT COUNT(*) FROM c",
+        "cockroachdb": "SELECT pg_sleep(30)",
     }[engine]
     box: dict = {}
     worker = threading.Thread(target=lambda: box.update(
@@ -303,7 +321,7 @@ def test_completion_and_scripts(user_id, profile):
     engine, conn_id = profile
     database, schema = LOCATION[engine]
     found = sqlops.completion(user_id, conn_id, database)
-    tables = found["schema"] if engine == "sqlite" else found["schema"][schema or database]
+    tables = found["schema"] if engine in FILE_ENGINES else found["schema"][schema or database]
     assert "email" in tables["customers"]
     for kind in ("select", "insert", "update", "delete", "ddl"):
         text = sqlops.script(user_id, conn_id, database, schema, "customers", kind)
@@ -609,7 +627,10 @@ GROUPS = {
     "mysql": ["functions", "procedures", "triggers"],
     "mssql": ["functions", "procedures", "sequences", "triggers"],
     "sqlite": ["triggers"],
+    "duckdb": ["sequences"],
+    "cockroachdb": ["functions", "procedures", "sequences", "triggers"],
 }
+PG_LIKE = ("postgresql", "cockroachdb")
 
 
 def test_navigator_lists_routines_sequences_triggers(user_id, profile):
@@ -619,6 +640,10 @@ def test_navigator_lists_routines_sequences_triggers(user_id, profile):
     database, schema = LOCATION[engine]
     found = sqlops.objects(user_id, conn_id, database, schema)
     assert found["groups"] == GROUPS[engine] and found["errors"] == {}
+    if engine == "duckdb":
+        assert {s["name"] for s in found["sequences"]} >= {"invoice_no", "customers_id_seq"}
+        assert not found.get("routines") and not found.get("triggers")
+        return
     triggers = {(t["name"], t["table"]) for t in found["triggers"]}
     assert ("orders_status_check", "orders") in triggers
     trigger = next(t for t in found["triggers"] if t["name"] == "orders_status_check")
@@ -629,12 +654,15 @@ def test_navigator_lists_routines_sequences_triggers(user_id, profile):
         assert routines == set() and sequences == set()
         return
     assert {("order_total", "function"), ("archive_order", "procedure")} <= routines
-    if engine == "postgresql":
+    if engine in PG_LIKE:
         overloads = [r for r in found["routines"] if r["name"] == "order_total"]
+        integer = "integer" if engine == "postgresql" else "int8"
         assert sorted(r["args"] for r in overloads) == [
-            "p_order integer", "p_order integer, p_tax numeric"]
+            f"p_order {integer}", f"p_order {integer}, p_tax numeric"]
         assert len({r["id"] for r in overloads}) == 2
-        assert {"invoice_no", "customers_id_seq"} <= sequences
+        assert "invoice_no" in sequences
+        if engine == "postgresql":      # CockroachDB's SERIAL is unique_rowid(), no sequence
+            assert "customers_id_seq" in sequences
         assert any(v["name"] == "product_sales" and v["materialized"] for v in found["views"])
     if engine == "mssql":
         assert "invoice_no" in sequences
@@ -647,6 +675,11 @@ def test_object_info_definitions_and_call_templates(user_id, profile):
     engine, conn_id = profile
     database, schema = LOCATION[engine]
     found = sqlops.objects(user_id, conn_id, database, schema)
+    if engine == "duckdb":
+        seq = sqlops.object_info(user_id, conn_id, database, schema, "sequence", "invoice_no")
+        assert dict(seq["properties"])["Start"] == "1000"
+        assert seq["definition"].upper().startswith("CREATE SEQUENCE")
+        return
     trigger = sqlops.object_info(user_id, conn_id, database, schema, "trigger",
                                  "orders_status_check", "orders")
     assert "orders_status_check" in trigger["definition"]
@@ -664,7 +697,8 @@ def test_object_info_definitions_and_call_templates(user_id, profile):
     assert "order_total" in total["call_sql"] and "NULL" in total["call_sql"]
     proc = sqlops.object_info(user_id, conn_id, database, schema, "procedure",
                               by_name["archive_order"]["id"])
-    first = {"postgresql": "CALL", "mysql": "CALL", "mssql": "DECLARE"}[engine]
+    first = {"postgresql": "CALL", "cockroachdb": "CALL", "mysql": "CALL",
+             "mssql": "DECLARE"}[engine]
     assert proc["call_sql"].startswith(first), proc["call_sql"]
     if engine == "mysql":
         assert "@p_moved" in proc["call_sql"] and proc["call_sql"].rstrip().endswith("SELECT @p_moved;")
@@ -673,12 +707,12 @@ def test_object_info_definitions_and_call_templates(user_id, profile):
         table_fn = sqlops.object_info(user_id, conn_id, database, schema, "function",
                                       by_name["customer_orders"]["id"])
         assert table_fn["call_sql"].startswith("SELECT * FROM")
-    if engine == "postgresql":
+    if engine in PG_LIKE:
         table_fn = sqlops.object_info(user_id, conn_id, database, schema, "function",
                                       by_name["customer_orders"]["id"])
         assert table_fn["call_sql"].startswith("SELECT * FROM")
         assert dict(total["properties"])["Comment"] == "Sum of an order's lines"
-    if engine in ("postgresql", "mssql"):
+    if engine in ("postgresql", "mssql", "cockroachdb"):
         seq = sqlops.object_info(user_id, conn_id, database, schema, "sequence", "invoice_no")
         assert dict(seq["properties"])["Start"] == "1000"
         assert seq["definition"].startswith("CREATE SEQUENCE")
@@ -695,10 +729,10 @@ def test_roles_listing(user_id, profile):
 
     engine, conn_id = profile
     listed = sqlops.roles(user_id, conn_id)
-    if engine == "sqlite":
+    if engine in FILE_ENGINES:
         assert listed == []
         return
-    me = {"postgresql": "postgres", "mysql": "root@%", "mssql": "sa"}[engine]
+    me = {"postgresql": "postgres", "cockroachdb": "root", "mysql": "root@%", "mssql": "sa"}[engine]
     row = next(r for r in listed if r["name"] == me)
     assert row["login"] and row["admin"]
     shown = sqlops.object_info(user_id, conn_id, "", "", "role", me)
@@ -719,8 +753,8 @@ def test_refresh_materialized_view(user_id, profile):
 
     engine, conn_id = profile
     database, schema = LOCATION[engine]
-    if engine != "postgresql":
-        with pytest.raises(sqlops.OpError, match="Only PostgreSQL"):
+    if engine not in PG_LIKE:
+        with pytest.raises(sqlops.OpError, match="no materialized views"):
             sqlops.refresh_matview(user_id, conn_id, database, schema, "order_totals", True)
         return
     plan = sqlops.refresh_matview(user_id, conn_id, database, schema, "product_sales", True)
@@ -743,7 +777,20 @@ TYPES = {
     "mysql": ("int", "varchar(50)"),
     "mssql": ("int", "nvarchar(50)"),
     "sqlite": ("INTEGER", "TEXT"),
+    "duckdb": ("INTEGER", "VARCHAR"),
+    "cockroachdb": ("integer", "varchar(50)"),
 }
+
+
+def _id_column(user_id, conn_id, engine, table):
+    """A self-numbering key column; DuckDB has none, so a sequence default stands in."""
+    from services import sqlops
+
+    if engine != "duckdb":
+        return {"name": "id", "type": TYPES[engine][0], "pk": True, "identity": True}
+    database, _schema = LOCATION[engine]
+    sqlops.execute(user_id, conn_id, database, f"CREATE SEQUENCE IF NOT EXISTS {table}_seq")
+    return {"name": "id", "type": "INTEGER", "pk": True, "default": f"nextval('{table}_seq')"}
 
 
 def test_object_actions_round_trip(user_id, profile):
@@ -762,13 +809,13 @@ def test_object_actions_round_trip(user_id, profile):
 
     plan = sqlops.alter(user_id, conn_id, database, schema, "", "create_table", {
         "name": "bk_scratch", "columns": [
-            {"name": "id", "type": int_type, "pk": True, "identity": True},
+            _id_column(user_id, conn_id, engine, "bk_scratch"),
             {"name": "label", "type": text_type, "not_null": True, "default": "'none: yet'"},
         ]}, True)
     assert plan["sql"][0].startswith("CREATE TABLE") and plan["note"]
     assert ("cannot be rolled back" in plan["note"]) == (engine == "mysql")
     alter("", "create_table", **{"name": "bk_scratch", "columns": [
-        {"name": "id", "type": int_type, "pk": True, "identity": True},
+        _id_column(user_id, conn_id, engine, "bk_scratch"),
         {"name": "label", "type": text_type, "not_null": True, "default": "'none: yet'"}]})
     info = sqlops.table_info(user_id, conn_id, database, schema, "bk_scratch")
     assert info["pk"] == ["id"] and [c["name"] for c in info["columns"]] == ["id", "label"]
@@ -799,6 +846,8 @@ def test_object_actions_round_trip(user_id, profile):
     with pytest.raises(sqlops.OpError, match="cannot contain"):
         sqlops.alter(user_id, conn_id, database, schema, "orders", "add_column",
                      {"name": "x", "type": "int; DROP TABLE orders"}, True)
+    if engine == "duckdb":      # one way per process: test_read_only_profile_refuses_writes
+        return
     ro = _make_profile(user_id, engine, read_only=True)
     preview = sqlops.alter(user_id, ro, database, schema, "orders", "truncate", {}, True)
     assert preview["read_only"]
@@ -833,7 +882,7 @@ def test_csv_import(user_id, profile):
     sqlops.execute(user_id, conn_id, database, "DROP TABLE IF EXISTS bk_import")
     made = sqlops.alter(user_id, conn_id, database, schema, "", "create_table", {
         "name": "bk_import", "columns": [
-            {"name": "id", "type": int_type, "pk": True, "identity": True},
+            _id_column(user_id, conn_id, engine, "bk_import"),
             {"name": "label", "type": text_type, "not_null": True},
             {"name": "amount", "type": "NUMERIC(10,2)"},
             {"name": "seen", "type": "DATE"}]})
@@ -913,6 +962,8 @@ def test_csv_import(user_id, profile):
         with pytest.raises(csv_import.CsvError, match="view"):
             csv_import.check(user_id, conn_id, database, schema, "order_totals",
                              {"mapping": [["id", 0]]})
+        if engine == "duckdb":  # one way per process: test_read_only_profile_refuses_writes
+            return
         ro = _make_profile(user_id, engine, read_only=True)
         with pytest.raises(csv_import.CsvError, match="read-only"):
             csv_import.check(user_id, ro, database, schema, "bk_import",
@@ -937,7 +988,7 @@ def test_sessions_list_and_stop(user_id, profile):
 
     engine, conn_id = profile
     database, _schema = LOCATION[engine]
-    if engine == "sqlite":
+    if engine in ("sqlite", "duckdb", "cockroachdb"):
         with pytest.raises(sqlops.OpError, match="no server sessions"):
             sqlops.sessions(user_id, conn_id)
         return
@@ -1007,7 +1058,9 @@ def test_er_model(user_id, profile):
 # schema, run the script on the target, compare again: nothing is left.
 # ---------------------------------------------------------------------------
 
-CMP_AUTO = {"postgresql": "INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY",
+CMP_AUTO = {"duckdb": "INTEGER DEFAULT nextval('ids') PRIMARY KEY",
+            "cockroachdb": "INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY",
+            "postgresql": "INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY",
             "mysql": "INTEGER AUTO_INCREMENT PRIMARY KEY",
             "mssql": "INTEGER IDENTITY(1,1) PRIMARY KEY", "sqlite": "INTEGER PRIMARY KEY"}
 CMP_SOURCE = [
@@ -1053,23 +1106,36 @@ def _run_ddl(user_id, conn_id, database, statements):
 
 def _cmp_location(user_id, engine, conn_id, name, statements):
     """A fresh schema (database, SQLite file) ``name`` holding ``statements``: (conn, db, schema)."""
-    if engine == "sqlite":
-        path = Path(os.environ["BASILISK_SQLITE_ROOT"]) / f"{name}.db"
+    if engine in FILE_ENGINES:
+        suffix = ".db" if engine == "sqlite" else ".duckdb"
+        if engine == "duckdb":
+            # DuckDB keeps a file's database open in the process: a new name each time.
+            import uuid
+
+            name = f"{name}_{uuid.uuid4().hex[:8]}"
+        path = Path(os.environ["BASILISK_SQLITE_ROOT"]) / f"{name}{suffix}"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.unlink(missing_ok=True)
-        import sqlite3
+        if engine == "sqlite":
+            import sqlite3
 
-        sqlite3.connect(path).close()
-        conn_id = _make_profile(user_id, "sqlite", database=f"{name}.db")
-        _run_ddl(user_id, conn_id, "", [st.format(s="", auto=CMP_AUTO[engine])
-                                        for st in statements])
+            sqlite3.connect(path).close()
+            prepare = []
+        else:
+            # No ON DELETE actions, and a sequence default for the numbered keys.
+            statements = [st.replace(" ON DELETE CASCADE", "") for st in statements]
+            prepare = ["CREATE SEQUENCE ids"]
+        conn_id = _make_profile(user_id, engine, database=f"{name}{suffix}",
+                                options={"create": True})
+        _run_ddl(user_id, conn_id, "", prepare + [st.format(s="", auto=CMP_AUTO[engine])
+                                                  for st in statements])
         return conn_id, "", ""
     database = LOCATION[engine][0]
     if engine == "mysql":
         _run_ddl(user_id, conn_id, "", [f"DROP DATABASE IF EXISTS {name}",
                                         f"CREATE DATABASE {name}"])
         database = name
-    elif engine == "postgresql":
+    elif engine in ("postgresql", "cockroachdb"):
         _run_ddl(user_id, conn_id, database, [f"DROP SCHEMA IF EXISTS {name} CASCADE",
                                               f"CREATE SCHEMA {name}"])
     else:
@@ -1110,13 +1176,25 @@ def test_schema_compare_round_trip(user_id, profile):
             ("alter", "view", "big_orders")} <= found
     if engine != "sqlite":
         named = {(d["change"], d["kind"], d["group"], d["name"]) for d in first["diffs"]}
-        assert {("add", "column", "customers", "email"), ("alter", "column", "customers", "name"),
-                ("drop", "column", "customers", "phone"), ("alter", "column", "orders", "status"),
-                ("add", "index", "orders", "ix_orders_status"),
-                ("alter", "fk", "orders", "fk_orders_customer"),
-                ("add", "fk", "order_tags", "fk_tags_order")} <= named, named
-    assert again["diffs"] == [], again["diffs"]
-    assert again["same_tables"] == 4 and again["same_views"] == 1
+        wanted = {("add", "column", "customers", "email"), ("alter", "column", "customers", "name"),
+                  ("drop", "column", "customers", "phone"), ("alter", "column", "orders", "status"),
+                  ("add", "index", "orders", "ix_orders_status"),
+                  ("alter", "fk", "orders", "fk_orders_customer"),
+                  ("add", "fk", "order_tags", "fk_tags_order")}
+        if engine == "duckdb":     # no ON DELETE actions; foreign keys get its own names
+            wanted -= {("alter", "fk", "orders", "fk_orders_customer"),
+                       ("add", "fk", "order_tags", "fk_tags_order")}
+            assert any(d["kind"] == "fk" and d["group"] == "order_tags" for d in first["diffs"])
+        assert wanted <= named, named
+    if engine == "duckdb":
+        # What DuckDB cannot change in place (keys, columns of a table an index or a
+        # foreign key depends on) stays, marked "by hand"; everything else went.
+        assert again["diffs"] and all(d["manual"] for d in again["diffs"]), again["diffs"]
+        assert {d["group"] for d in again["diffs"]} <= {"customers", "order_tags"}
+        assert again["same_views"] == 1
+    else:
+        assert again["diffs"] == [], again["diffs"]
+        assert again["same_tables"] == 4 and again["same_views"] == 1
     page = sqlops.browse(user_id, tgt[0], tgt[1], tgt[2], "orders", pk=["id"])
     assert page["total"] == 1
 
@@ -1160,6 +1238,8 @@ DCMP_TYPES = {
     "mysql": {"bool": "BOOLEAN", "when": "DATETIME(6)", "bin": "VARBINARY(32)", "id": "INTEGER"},
     "mssql": {"bool": "BIT", "when": "DATETIME2", "bin": "VARBINARY(32)", "id": "INTEGER"},
     "sqlite": {"bool": "BOOLEAN", "when": "DATETIME", "bin": "BLOB", "id": "INTEGER"},
+    "duckdb": {"bool": "BOOLEAN", "when": "TIMESTAMP", "bin": "BLOB", "id": "INTEGER"},
+    "cockroachdb": {"bool": "BOOL", "when": "TIMESTAMP", "bin": "BYTES", "id": "INTEGER"},
 }
 DCMP_DDL = ("CREATE TABLE {s}items (id {id} NOT NULL PRIMARY KEY, name VARCHAR(60) NOT NULL, "
             "price NUMERIC(10,2), flag {bool}, seen {when}, raw {bin}, note VARCHAR(200))")
@@ -1310,8 +1390,8 @@ def test_ssh_tunnel(user_id, profile):
     from services.engine_pool import pool, tunnel_of
 
     engine, _plain = profile
-    if engine == "sqlite":
-        pytest.skip("SQLite files are local")
+    if engine in FILE_ENGINES:
+        pytest.skip("database files are local")
     if not _ssh_up():
         pytest.skip("run tests/smoke/ssh_server.sh first")
     database, schema = LOCATION[engine]

@@ -97,13 +97,14 @@ def script(result: dict, chosen, header: list = ()) -> str:
         if diff["id"] not in chosen:
             continue
         for index, (phase, statement) in enumerate(diff.get("sql") or []):
-            pieces.append((int(phase), order, index, statement))
+            pieces.append((float(phase), order, index, statement))
     pieces.sort(key=lambda piece: piece[:3])
     out = [f"-- {line}" for line in header]
     if not pieces:
         out += ["", "-- Nothing to run: tick the differences to apply."]
     current = None
-    for phase, _order, _index, statement in pieces:
+    for exact, _order, _index, statement in pieces:
+        phase = int(exact)      # a fraction orders statements inside a phase
         if phase != current:
             current = phase
             name = phases[phase] if 0 <= phase < len(phases) else f"Step {phase + 1}"
