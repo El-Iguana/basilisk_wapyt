@@ -805,3 +805,180 @@ def test_object_actions_round_trip(user_id, profile):
     with pytest.raises(sqlops.OpError, match="read-only"):
         sqlops.alter(user_id, ro, database, schema, "orders", "truncate", {})
     assert sqlops.browse(user_id, conn_id, database, schema, "orders", pk=["id"])["total"] == 137
+
+
+# ---------------------------------------------------------------------------
+# Import CSV (services/csv_import.py), run the way the job runs it
+# ---------------------------------------------------------------------------
+
+def _run_import(user_id, conn_id, engine, table, text, progress=None, **options):
+    from services import csv_import, jobs
+
+    database, schema = LOCATION[engine]
+    plan = csv_import.check(user_id, conn_id, database, schema, table, options)
+    path = jobs.new_file(".csv")
+    path.write_bytes(text.encode(options.get("_codec", "utf-8")))
+    try:
+        return csv_import.run(user_id, plan, path, progress or jobs.Progress())
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_csv_import(user_id, profile):
+    from services import csv_import, jobs, sqlops
+
+    engine, conn_id = profile
+    database, schema = LOCATION[engine]
+    int_type, text_type = TYPES[engine]
+    sqlops.execute(user_id, conn_id, database, "DROP TABLE IF EXISTS bk_import")
+    made = sqlops.alter(user_id, conn_id, database, schema, "", "create_table", {
+        "name": "bk_import", "columns": [
+            {"name": "id", "type": int_type, "pk": True, "identity": True},
+            {"name": "label", "type": text_type, "not_null": True},
+            {"name": "amount", "type": "NUMERIC(10,2)"},
+            {"name": "seen", "type": "DATE"}]})
+    assert made["ok"], made
+
+    def rows():
+        page = sqlops.browse(user_id, conn_id, database, schema, "bk_import", pk=["id"])
+        return page["rows"]
+
+    plain = [["label", 0], ["amount", 1], ["seen", 2]]
+    try:
+        done = _run_import(user_id, conn_id, engine, "bk_import",
+                           'Label,Amount,Seen\n"a, with comma",1.50,2026-10-24\n'
+                           '"two\nlines",,\nñandú 🐍,3,2026-01-02\n\n',
+                           mapping=plain)
+        assert done["inserted"] == 3 and done["skipped"] == 0
+        got = rows()
+        assert [row[1] for row in got] == ["a, with comma", "two\nlines", "ñandú 🐍"]
+        assert got[1][2] is None and got[1][3] is None          # empty fields are NULL
+        assert got[0][2] in ("1.50", "1.5") and got[0][3].startswith("2026-10-24")
+
+        # Explicit numbers in the self-numbering column; it carries on after them.
+        done = _run_import(user_id, conn_id, engine, "bk_import", "10;x\n11;y\n",
+                           delimiter=";", header=False, mapping=[["id", 0], ["label", 1]])
+        assert done["inserted"] == 2
+        ran = sqlops.execute(user_id, conn_id, database,
+                             "INSERT INTO bk_import (label) VALUES ('next')")
+        assert not ran["results"][0].get("error"), ran
+        assert [row[0] for row in rows()][-3:] == ["10", "11", "12"]
+
+        # A value that does not fit: stop (nothing kept) or skip that row.
+        bad = "label,amount\nok,1\nbroken,abc\nfine,2\n"
+        with pytest.raises(csv_import.CsvError, match="Row 3 .*amount.*Nothing was imported"):
+            _run_import(user_id, conn_id, engine, "bk_import", bad, mapping=plain[:2])
+        assert len(rows()) == 6
+        done = _run_import(user_id, conn_id, engine, "bk_import", bad, mapping=plain[:2],
+                           on_error="skip")
+        assert done == {**done, "inserted": 2, "skipped": 1}
+        assert len(rows()) == 8
+
+        # The database refusing a row (NOT NULL) rolls the whole file back.
+        with pytest.raises(csv_import.CsvError, match="refused"):
+            _run_import(user_id, conn_id, engine, "bk_import", "label\nfirst\n\"\"\n",
+                        mapping=[["label", 0]])
+        assert len(rows()) == 8
+        # ... unless empty fields are empty text.
+        done = _run_import(user_id, conn_id, engine, "bk_import", "label\n\"\"\n",
+                           mapping=[["label", 0]], empty="empty")
+        assert done["inserted"] == 1 and rows()[-1][1] == ""
+
+        # Replace: the rows that were there go, in the same transaction.
+        done = _run_import(user_id, conn_id, engine, "bk_import", "label\nonly\n",
+                           mapping=[["label", 0]], mode="replace", null_text="NULL")
+        assert done["deleted"] == 9 and [row[1] for row in rows()] == ["only"]
+
+        # Cancel between batches: nothing stays.
+        job = jobs.Job(user_id, "import", "test")
+        job.cancel_event.set()
+        many = "label\n" + "".join(f"r{i}\n" for i in range(csv_import.BATCH_ROWS + 10))
+        with pytest.raises(jobs.Cancelled):
+            _run_import(user_id, conn_id, engine, "bk_import", many, jobs.Progress(job),
+                        mapping=[["label", 0]])
+        assert [row[1] for row in rows()] == ["only"]
+
+        # Windows-1252 text.
+        done = _run_import(user_id, conn_id, engine, "bk_import", "label\ncafé\n",
+                           mapping=[["label", 0]], encoding="cp1252", _codec="cp1252")
+        assert rows()[-1][1] == "café"
+        with pytest.raises(csv_import.CsvError, match="not utf-8"):
+            _run_import(user_id, conn_id, engine, "bk_import", "label\ncafé\n",
+                        mapping=[["label", 0]], _codec="cp1252")
+
+        # Refusals before anything is uploaded.
+        with pytest.raises(csv_import.CsvError, match="no column"):
+            csv_import.check(user_id, conn_id, database, schema, "bk_import",
+                             {"mapping": [["nope", 0]]})
+        with pytest.raises(csv_import.CsvError, match="view"):
+            csv_import.check(user_id, conn_id, database, schema, "order_totals",
+                             {"mapping": [["id", 0]]})
+        ro = _make_profile(user_id, engine, read_only=True)
+        with pytest.raises(csv_import.CsvError, match="read-only"):
+            csv_import.check(user_id, ro, database, schema, "bk_import",
+                             {"mapping": [["label", 0]]})
+    finally:
+        sqlops.execute(user_id, conn_id, database, "DROP TABLE IF EXISTS bk_import")
+
+
+# ---------------------------------------------------------------------------
+# Session manager
+# ---------------------------------------------------------------------------
+
+SLEEP_SQL = {
+    "postgresql": "SELECT pg_sleep(20) /* bk-sleeper */",
+    "mysql": "SELECT SLEEP(20) /* bk-sleeper */",
+    "mssql": "WAITFOR DELAY '00:00:20' /* bk-sleeper */",
+}
+
+
+def test_sessions_list_and_stop(user_id, profile):
+    from services import sqlops
+
+    engine, conn_id = profile
+    database, _schema = LOCATION[engine]
+    if engine == "sqlite":
+        with pytest.raises(sqlops.OpError, match="no server sessions"):
+            sqlops.sessions(user_id, conn_id)
+        return
+    everything = sqlops.sessions(user_id, conn_id, True)["sessions"]
+    assert any(row["own"] for row in everything)
+    assert all(isinstance(row["id"], int) for row in everything)
+
+    finished = {}
+
+    def sleeper():
+        started = time.monotonic()
+        finished["result"] = sqlops.execute(user_id, conn_id, database, SLEEP_SQL[engine])
+        finished["seconds"] = time.monotonic() - started
+
+    thread = threading.Thread(target=sleeper, daemon=True)
+    thread.start()
+    target = None
+    for _ in range(40):
+        time.sleep(0.25)
+        busy = sqlops.sessions(user_id, conn_id)["sessions"]
+        target = next((row for row in busy if "bk-sleeper" in row["query"] and not row["own"]),
+                      None)
+        if target:
+            break
+    assert target, "the sleeping statement never showed up"
+    assert target["seconds"] is not None and target["user"]
+    if engine == "postgresql":
+        assert target["application"] == "Basilisk"
+    mode = "terminate" if engine == "mssql" else "cancel"
+    with pytest.raises(sqlops.OpError, match="cancel or terminate"):
+        sqlops.kill_session(user_id, conn_id, target["id"], "nuke")
+    if engine == "mssql":
+        with pytest.raises(sqlops.OpError, match="only end a session"):
+            sqlops.kill_session(user_id, conn_id, target["id"], "cancel")
+    ro = _make_profile(user_id, engine, read_only=True)
+    with pytest.raises(sqlops.OpError, match="read-only"):
+        sqlops.kill_session(user_id, ro, target["id"], mode)
+    done = sqlops.kill_session(user_id, conn_id, target["id"], mode)
+    assert str(target["id"]) in done["sql"]
+    thread.join(15)
+    assert not thread.is_alive() and finished["seconds"] < 15
+    # The pool notices the ended connection and gives a working one next.
+    ran = sqlops.execute(user_id, conn_id, database, "SELECT 1")
+    assert not ran["results"][0].get("error"), ran

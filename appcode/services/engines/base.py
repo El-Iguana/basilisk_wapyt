@@ -258,6 +258,39 @@ class Engine:
         """Statements a column's drop needs first (SQL Server: its default constraint)."""
         return []
 
+    # ------------------------------------------------------------------
+    # CSV import (services/csv_import.py)
+    # ------------------------------------------------------------------
+
+    def import_wrappers(self, conn: Any, prep: Any, schema: Optional[str], table: str,
+                        columns: list) -> tuple:
+        """
+        ``(before, after)`` statements around an import that fills ``columns``:
+        what lets explicit values into a self-numbering column, and what moves
+        its counter past them afterwards. MySQL and SQLite need neither.
+        """
+        return [], []
+
+    # ------------------------------------------------------------------
+    # Session manager (sqlops.sessions / kill_session)
+    # ------------------------------------------------------------------
+    has_sessions = False
+    # Stop a session's statement but keep the session (SQL Server can only end it).
+    can_cancel_query = True
+
+    def list_sessions(self, conn: Any, include_idle: bool) -> list:
+        """
+        ``[{"id", "user", "database", "client", "application", "state",
+        "started", "seconds", "wait", "blocked_by", "query", "own", "txn"}]``:
+        the server's client sessions, the busiest first. ``own`` marks the
+        connection asking; ``seconds`` is how long the state has lasted.
+        """
+        return []
+
+    def kill_session(self, engine: Any, conn: Any, session_id: int, mode: str) -> str:
+        """Cancel the statement (``mode="cancel"``) or end the session; returns the SQL used."""
+        raise EngineError(f"{self.label} sessions cannot be stopped here")
+
 
     # ------------------------------------------------------------------
     # Scripts

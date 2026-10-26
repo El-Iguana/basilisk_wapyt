@@ -103,6 +103,34 @@ class MySQL(Engine):
         finally:
             raw.close()
 
+    has_sessions = True
+
+    def list_sessions(self, conn: Any, include_idle: bool) -> list:
+        from sqlalchemy import text
+
+        own = conn.execute(text("SELECT CONNECTION_ID()")).scalar()
+        found = []
+        for row in conn.execute(text("SHOW FULL PROCESSLIST")).all():
+            command = str(row[4] or "")
+            if not include_idle and command in ("Sleep", "Daemon", "Binlog Dump"):
+                continue
+            found.append({
+                "id": row[0], "user": row[1], "database": row[3], "client": row[2],
+                "application": "", "state": command + (f": {row[6]}" if row[6] else ""),
+                "started": None, "seconds": row[5], "wait": "", "blocked_by": [],
+                "query": row[7], "own": row[0] == own, "txn": False,
+            })
+        found.sort(key=lambda item: (not str(item["state"]).startswith("Query"),
+                                     -(item["seconds"] or 0)))
+        return found
+
+    def kill_session(self, engine: Any, conn: Any, session_id: int, mode: str) -> str:
+        from sqlalchemy import text
+
+        sql = f"KILL {'QUERY ' if mode == 'cancel' else ''}{int(session_id)}"
+        conn.execute(text(sql))
+        return sql
+
     def list_databases(self, conn: Any) -> list:
         from sqlalchemy import text
 

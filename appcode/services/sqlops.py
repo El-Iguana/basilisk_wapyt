@@ -789,6 +789,86 @@ def save_changes(user_id: int, conn_id: int, database: str, schema: str, name: s
 
 
 # ---------------------------------------------------------------------------
+# Session manager: the server's client sessions, and stopping one
+# ---------------------------------------------------------------------------
+
+SESSION_QUERY_CHARS = 20_000
+
+
+def sessions(user_id: int, conn_id: int, include_idle: bool = False) -> dict:
+    """What runs on the server now (``pg_stat_activity``, ``SHOW PROCESSLIST``, DMVs)."""
+    started = time.monotonic()
+    with connect(user_id, conn_id, None, CATALOG_TIMEOUT_S) as (conn, spec, _p, _engine):
+        if not spec.has_sessions:
+            raise OpError(f"{spec.label} has no server sessions to list")
+        try:
+            rows = spec.list_sessions(conn, bool(include_idle))
+        except Exception as exc:
+            raise OpError(error_text(exc)) from None
+    found = []
+    for row in rows:
+        query = row.get("query")
+        query = None if query is None else str(query)
+        seconds = row.get("seconds")
+        try:
+            seconds = None if seconds is None else max(0.0, round(float(seconds), 1))
+        except (TypeError, ValueError):
+            seconds = None
+        found.append({
+            "id": int(row["id"]),
+            "user": "" if row.get("user") is None else str(row["user"]),
+            "database": "" if row.get("database") is None else str(row["database"]),
+            "client": "" if row.get("client") is None else str(row["client"]),
+            "application": "" if row.get("application") is None else str(row["application"]),
+            "state": "" if row.get("state") is None else str(row["state"]),
+            "started": _when(row.get("started")),
+            "seconds": seconds,
+            "wait": "" if row.get("wait") is None else str(row["wait"]),
+            "blocked_by": [int(pid) for pid in row.get("blocked_by") or []],
+            "query": query[:SESSION_QUERY_CHARS] if query else "",
+            "own": bool(row.get("own")),
+            "txn": bool(row.get("txn")),
+        })
+    return {"sessions": found, "can_cancel": spec.can_cancel_query,
+            "ms": int((time.monotonic() - started) * 1000)}
+
+
+def _when(value: Any) -> Optional[str]:
+    """A session's start time to the second (drivers give microseconds and zones)."""
+    import datetime as dt
+
+    if isinstance(value, dt.datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return cell(value)[0]
+
+
+def kill_session(user_id: int, conn_id: int, session_id: int, mode: str) -> dict:
+    """Cancel a session's statement, or end the session. Refused on read-only profiles."""
+    if mode not in ("cancel", "terminate"):
+        raise OpError("mode must be cancel or terminate")
+    _engine, spec, profile = pool.open(user_id, conn_id, None)
+    if profile.get("read_only"):
+        raise OpError("This connection is read-only: it does not stop sessions")
+    if not spec.has_sessions:
+        raise OpError(f"{spec.label} has no server sessions")
+    if mode == "cancel" and not spec.can_cancel_query:
+        raise OpError(f"{spec.label} can only end a session (KILL), not cancel its statement")
+    with connect(user_id, conn_id, None, CATALOG_TIMEOUT_S) as (conn, spec, _p, engine):
+        mine = spec.session_id(conn.connection.dbapi_connection)
+        if mine is not None and int(mine) == int(session_id):
+            raise OpError("That is the connection asking; it cannot stop itself")
+        try:
+            sql = spec.kill_session(engine, conn, int(session_id), mode)
+        except Exception as exc:
+            from services.engines import EngineError
+
+            if isinstance(exc, EngineError):
+                raise OpError(str(exc)) from None
+            raise OpError(error_text(exc)) from None
+    return {"sql": sql}
+
+
+# ---------------------------------------------------------------------------
 # Running SQL
 # ---------------------------------------------------------------------------
 

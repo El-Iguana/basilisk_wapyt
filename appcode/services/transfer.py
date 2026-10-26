@@ -11,6 +11,8 @@ token the way pytincture's BFF handler does.
 * ``POST /bk/export-query/<conn_id>``: one SELECT from the SQL editor.
 * ``GET /bk/cell/<conn_id>``: one cell's value as a file (the value panel's
   Save to file), whatever its size.
+* ``POST /bk/import/<plan>``: a CSV file to import, as planned by
+  ``JobService.plan_import``; starts the import job.
 """
 from __future__ import annotations
 
@@ -226,3 +228,62 @@ def download_cell(request: Request, conn_id: int, table: str, column: str, key: 
         "Cache-Control": "no-store",
         "X-Content-Type-Options": "nosniff",
     })
+
+
+def max_import_bytes() -> int:
+    import os
+
+    try:
+        return max(1, int(os.environ.get("BASILISK_IMPORT_MAX_BYTES", 1024 * 1024 * 1024)))
+    except ValueError:
+        return 1024 * 1024 * 1024
+
+
+@router.post("/import/{plan_id}")
+async def import_csv(request: Request, plan_id: str):
+    """
+    The CSV file of a planned import (``JobService.plan_import``), as the raw
+    request body, not a form: nothing needs parsing, and nothing is read
+    until the caller is authenticated, the CSRF token checks out and the
+    plan is theirs. It goes to a file, since the job outlives this request.
+    """
+    import anyio
+    from fastapi.responses import JSONResponse
+
+    from services import csv_import, jobs
+
+    user_id = _require_user(request)
+    _require_csrf(request)
+    plan = jobs.take_plan(plan_id, user_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="That import has expired; start it again")
+    limit = max_import_bytes()
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > limit:
+        raise HTTPException(status_code=413, detail=f"Larger than the {limit:,}-byte limit")
+    upload = jobs.new_file(".csv")
+    try:
+        received = 0
+        with open(upload, "wb") as out:
+            async for block in request.stream():
+                received += len(block)
+                if received > limit:
+                    raise HTTPException(status_code=413,
+                                        detail=f"Larger than the {limit:,}-byte limit")
+                await anyio.to_thread.run_sync(out.write, block)
+    except BaseException:
+        upload.unlink(missing_ok=True)
+        raise
+
+    def work(progress) -> dict:
+        try:
+            return csv_import.run(user_id, plan, upload, progress)
+        finally:
+            upload.unlink(missing_ok=True)
+
+    try:
+        job = jobs.start(user_id, "import", f"Import into {plan['table']}", work)
+    except jobs.JobLimit as exc:
+        upload.unlink(missing_ok=True)
+        raise HTTPException(status_code=429, detail=str(exc)) from None
+    return JSONResponse({"ok": True, "job": job.id, "bytes": received})

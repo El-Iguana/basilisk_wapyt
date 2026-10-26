@@ -171,6 +171,10 @@ def build_app():
     )
 
     check_at_startup()
+    # Job files (uploaded imports) belong to jobs that died with the last process.
+    from services.jobs import clear_leftovers
+
+    clear_leftovers()
     application.add_middleware(LoginPageMiddleware)
     application.include_router(transfer_router)
 

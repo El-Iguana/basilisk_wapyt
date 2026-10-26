@@ -14,7 +14,7 @@ CSV/JSON export of tables and query results; users, password reminder,
 About; container image. 58 unit and live tests, a 4-engine Playwright smoke
 test.
 
-## Milestone 2: DBeaver parity, the everyday parts
+## Milestone 2: DBeaver parity, the everyday parts — done (2026-10-26)
 
 - ~~**Manual commit mode**~~ — done (2026-10-24): Auto-commit | Manual switch,
   pinned connection per tab, Commit / Rollback, transaction indicator and tab
@@ -47,14 +47,30 @@ test.
   per engine; SQLite needs a table rebuild); foreign keys and check
   constraints; PostgreSQL DROP … CASCADE; create view; drop routines,
   sequences and triggers.
-- **Import CSV** into a table (column mapping, type coercion, one transaction,
-  progress through a job like Monguana's dumps).
-- **Column layout memory** per table (widths, order, hidden), as Monguana's
-  phase 35.
-- **Result grid niceties**: frozen first column, per-column filter, copy as
-  INSERT / Markdown, open a foreign key's row from a cell.
-- **Session manager**: running queries per server with kill (pg_stat_activity,
-  SHOW PROCESSLIST, sys.dm_exec_requests).
+- ~~**Import CSV**~~ — done (2026-10-26): from a table's menu or its Data
+  bar; delimiter and encoding guessed, columns matched by header, a preview,
+  then a job (upload progress, a bar, the log, Cancel) that inserts the whole
+  file in one transaction; bad values stop it or skip their row; append or
+  replace; SQL Server identity and PostgreSQL sequences handled. Follow-ups:
+  date formats other than ISO (a format box per column); skipping rows the
+  database refuses (savepoints per batch); Excel files; import into a new
+  table (create it from the file's columns).
+- ~~**Column layout memory**~~ — done (2026-10-26): widths, order, hidden
+  columns and frozen count per table and user, on the server; a Columns
+  dialog (show / hide, freeze, reset). Follow-ups: a header menu in wapyt's
+  DataTable (hide / freeze from the header itself).
+- ~~**Result grid niceties**~~ — done (2026-10-26): freeze the first columns;
+  column filters as chips (server-side WHERE on tables, the fetched rows on
+  results); copy rows as INSERT (into the result's table when the query reads
+  one) or a Markdown table; open a foreign key's row from its cell.
+  Follow-ups: filter inputs under each header (wapyt); open the rows that
+  reference this one (the reverse direction); copy as CSV with options.
+- ~~**Session manager**~~ — done (2026-10-26): a Sessions tab per server
+  (PostgreSQL, MySQL / MariaDB, SQL Server): user, database, client,
+  application, state, how long, waits, blocking sessions, the statement;
+  refreshed every 5 s; Cancel query and End session. Follow-ups: locks and
+  the blocking tree; per-database filter; MySQL's transaction state from
+  `information_schema.INNODB_TRX`.
 
 ## Milestone 3: bigger pieces
 
@@ -70,7 +86,8 @@ test.
 ## Small items
 
 - wapyt: TabWidget ignores `TabConfig.icon`; its badge needs dark colours.
-- The pager wraps onto a second toolbar row on narrow windows; give it its own
-  row below a width.
+- The pager wraps onto a second toolbar row on narrow windows (the less-used
+  buttons now drop their labels below 1,300 px); give it its own row below a
+  width on purpose.
 - Statement mode for T-SQL splits on `;`, which breaks `DECLARE` scope; a
   smarter splitter (blank lines as delimiters, as DBeaver offers) would help.
