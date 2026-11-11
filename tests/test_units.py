@@ -74,10 +74,43 @@ def test_tsql_batches_and_statement_mode():
     sql = "DECLARE @x int = 1;\nSELECT @x;\nGO\n  go -- trailing\nSELECT 2;\n"
     batches = ms.split(sql)
     assert [b.text for b in batches] == ["DECLARE @x int = 1;\nSELECT @x;", "SELECT 2;"]
+    # Statement mode keeps a DECLARE with the lines that use it.
     picked = sqlops.pick(ms, sql, "statement", sql.index("@x;"))
-    assert [p.text for p in picked] == ["SELECT @x;"]
+    assert [p.text for p in picked] == ["DECLARE @x int = 1;\nSELECT @x;"]
     with pytest.raises(ValueError):
         ms.split("SELECT 1\nGO 5\n")
+    # Statement mode tolerates GO 5: it only runs the block at the caret.
+    assert [p.text for p in ms.split_statements("SELECT 1\nGO 5\nSELECT 2")] == ["SELECT 1", "SELECT 2"]
+
+
+def test_tsql_statements_split_on_blank_lines():
+    from services import engines, sqlops
+
+    ms = engines.get("mssql")
+    sql = ("DECLARE @n int = 3;\nSELECT @n;\n\n"
+           "-- a note\nSELECT 'one;\n\ntwo' AS s, [a\n\nb] AS q;\n\n"
+           "/* outer /* inner */\n\n still comment */\nSELECT 3;\n"
+           "\n\n  \n"
+           "IF @n > 1\nBEGIN\n  SELECT 4;\n\n  SELECT CASE WHEN 1 = 1\n\n THEN 5 END;\nEND\n\n"
+           "BEGIN TRAN;\n\nCOMMIT;\n\n"
+           "SELECT (1\n\n + 1);\nGO\n"
+           "CREATE OR ALTER PROCEDURE p AS\nSELECT 1;\n\nSELECT 2;\nGO\n"
+           "-- comment only\n\nSELECT 6")
+    pieces = ms.split_statements(sql)
+    assert [sql[p.start:p.end] for p in pieces] == [p.text for p in pieces]
+    assert [p.text.splitlines()[0] for p in pieces] == [
+        "DECLARE @n int = 3;", "-- a note", "/* outer /* inner */", "IF @n > 1",
+        "BEGIN TRAN;", "COMMIT;", "SELECT (1", "CREATE OR ALTER PROCEDURE p AS", "SELECT 6"]
+    assert pieces[3].text.endswith("THEN 5 END;\nEND")
+    assert pieces[7].text.endswith("SELECT 2;")
+    # The caret on a blank line picks the block above, as for other engines.
+    gap = sql.index("SELECT @n;\n\n") + len("SELECT @n;\n")
+    assert sqlops.pick(ms, sql, "statement", gap)[0].text.startswith("DECLARE @n")
+    # Script mode still sends whole GO batches.
+    assert len(ms.split(sql)) == 3
+    # Other engines keep splitting on ';'.
+    pg = engines.get("postgresql")
+    assert [p.text for p in sqlops.pick(pg, "SELECT 1;\nSELECT 2;", "statement", 12)] == ["SELECT 2;"]
 
 
 def test_statement_at_caret():

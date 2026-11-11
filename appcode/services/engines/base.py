@@ -396,6 +396,10 @@ class Engine:
     # Scripts
     # ------------------------------------------------------------------
 
+    def split_statements(self, sql: str) -> list:
+        """What statement mode picks from: the script's single statements."""
+        return Engine.split(self, sql)
+
     def split(self, sql: str) -> list:
         """Statements of a script, with offsets, comments-only pieces dropped."""
         import sqlparse

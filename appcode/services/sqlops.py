@@ -1004,12 +1004,8 @@ def first_word(sql: str) -> str:
 
 def pick(spec: Any, sql: str, mode: str, caret: int) -> list:
     """The pieces to run: the statement at the caret, or the whole script."""
-    from services.engines.base import Engine
-
     if mode == "statement":
-        # Statement-by-statement even for T-SQL, whose script mode runs
-        # whole GO batches.
-        pieces = Engine.split(spec, sql)
+        pieces = spec.split_statements(sql)
         if not pieces:
             return []
         caret = max(0, min(int(caret or 0), len(sql)))

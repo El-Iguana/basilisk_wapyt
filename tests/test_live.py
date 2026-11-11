@@ -235,6 +235,20 @@ def test_execute_script_statement_and_errors(user_id, profile):
     assert sqlops.history(user_id, conn_id)[0]["sql"].startswith("SELECT * FROM orders")
 
 
+def test_tsql_statement_keeps_its_declare(user_id, profile):
+    from services import sqlops
+
+    engine, conn_id = profile
+    if engine != "mssql":
+        pytest.skip("T-SQL only")
+    database, _schema = LOCATION[engine]
+    script = "DECLARE @n int = 41;\nSELECT @n + 1 AS answer;\n\nSELECT 'other' AS s;\n"
+    out = sqlops.execute(user_id, conn_id, database, script, mode="statement",
+                         caret=script.index("answer"))
+    assert out["ok"], out
+    assert [r["rows"] for r in out["results"] if r.get("columns")] == [[["42"]]]
+
+
 def test_read_only_profile_refuses_writes(user_id, profile):
     from services import sqlops
 
