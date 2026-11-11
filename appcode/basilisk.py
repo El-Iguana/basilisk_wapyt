@@ -1678,6 +1678,9 @@ class Basilisk(MainWindow):
     <div class="bk-bar" data-ddl-bar="1" hidden>
       <button type="button" class="bk-btn" data-bk="col_add" title="Add a column to the table">
         <span class="mdi mdi-table-column-plus-after"></span><span>Add column</span></button>
+      <button type="button" class="bk-btn" data-bk="col_alter"
+        title="Change the selected column's type, NULL or default">
+        <span class="mdi mdi-table-column-width"></span><span>Change…</span></button>
       <button type="button" class="bk-btn" data-bk="col_rename" title="Rename the selected column">
         <span class="mdi mdi-rename-box"></span><span>Rename</span></button>
       <button type="button" class="bk-btn" data-bk="col_drop" title="Drop the selected column">
@@ -2007,7 +2010,8 @@ class Basilisk(MainWindow):
         elif action == "ddl_sql":
             info = tab.get("info") or {}
             self._open_sql(tab["conn"], tab["db"], info.get("ddl") or "")
-        elif action in ("col_add", "col_rename", "col_drop", "ix_create", "ix_drop"):
+        elif action in ("col_add", "col_alter", "col_rename", "col_drop", "ix_create",
+                        "ix_drop"):
             _spawn(self._tab_ddl(tid, action), action)
         elif action in ("col_filter", "columns", "freeze", "unfilter", "clear_filters"):
             self._grid_tool(tid, action, button)
@@ -3381,6 +3385,37 @@ class Basilisk(MainWindow):
                               'spellcheck="false" autocomplete="off">')
                 + '<label class="bk-check"><input type="checkbox" data-p="not_null"> NOT NULL'
                   "</label>")
+
+    async def _alter_column(self, loc: tuple, name: str, column: str, info: dict) -> None:
+        """Change a column's type, NULL and default; the fields start as it is now."""
+        col = next((c for c in info.get("columns") or [] if c["name"] == column), None)
+        if col is None:
+            self._toast(f"{column} is not in {name} any more: reopen the table.", kind="warning")
+            return
+        if col.get("computed"):
+            self._toast(f"{column} is a computed column: change it in the SQL editor.",
+                        kind="warning")
+            return
+        conn = self._conn(loc[0]) or {}
+        auto = bool(col.get("autoincrement"))
+        default_input = (
+            '<input class="bk-input bk-code" data-p="default" spellcheck="false" '
+            f'autocomplete="off" value="{_esc(col.get("default") or "")}"'
+            + (' disabled title="The column numbers itself"' if auto else
+               ' placeholder="none (an SQL expression: 0, &#39;text&#39;, now())"') + ">")
+        fields = (
+            f'<input type="hidden" data-p="column" value="{_esc(column)}">'
+            + self._field("Type", '<input class="bk-input bk-code" data-p="type" '
+                          f'list="bk-types-{conn.get("id")}" spellcheck="false" '
+                          f'autocomplete="off" value="{_esc(col.get("type") or "")}">')
+            + self._field("Default", default_input)
+            + '<label class="bk-check"><input type="checkbox" data-p="not_null"'
+            + ("" if col.get("nullable") else " checked")
+            + (" disabled" if col.get("pk") else "") + "> NOT NULL</label>")
+        if await self._ddl_dialog(loc, name, "alter_column", f"Change column {column}", fields,
+                                  ok_text="Change", height=580):
+            self._toast(f"Changed {column}.", kind="success")
+            await self._after_table_change(loc, name)
 
     async def _after_table_change(self, loc: tuple, name: str, sub: str = "columns") -> None:
         """Reopen a table's tabs so they show its new columns and indexes."""
@@ -5275,13 +5310,16 @@ class Basilisk(MainWindow):
         if action == "ix_create":
             await self._create_index(loc, name)
             return
-        if action in ("col_rename", "col_drop"):
+        if action in ("col_alter", "col_rename", "col_drop"):
             picked = tab["cols_table"].get_selected_ids() if tab.get("cols_table") else []
             if not picked:
                 self._toast("Select a column first.", kind="warning")
                 return
             column = str(picked[0])
             if not self._writable(loc[0]) or self._edits_pending(loc, name):
+                return
+            if action == "col_alter":
+                await self._alter_column(loc, name, column, info)
                 return
             if action == "col_rename":
                 fields = self._field("New name", self._name_input("new_name", column)) + (
@@ -7012,7 +7050,7 @@ td.bk-num{font-variant-numeric:tabular-nums;}
 .bk-ddl-boxes .bk-check{max-width:100%;min-width:0;white-space:nowrap;}
 .bk-ddl-boxes small{overflow:hidden;text-overflow:ellipsis;min-width:0;}
 .bk-order{display:inline-block;min-width:14px;text-align:center;color:var(--bk-accent);font-weight:600;}
-.bk-ddl-sql{flex:1 1 auto;min-height:70px;white-space:pre-wrap;word-break:break-word;}
+.bk-ddl-sql{flex:1 1 0;min-height:70px;overflow:auto;white-space:pre-wrap;word-break:break-word;}
 .bk-hint[data-kind="error"]{color:#fca5a5;}
 .bk-ddl-cols{border-collapse:collapse;width:100%;}
 .bk-ddl-cols th{text-align:left;font:600 11px system-ui,sans-serif;color:var(--bk-muted);

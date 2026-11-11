@@ -457,6 +457,25 @@ def _ddl(conn: Any, spec: Any, insp: Any, target: Optional[str], name: str,
 # Object actions: create / rename / drop / truncate, columns, indexes
 # ---------------------------------------------------------------------------
 
+def _table_now(conn: Any, spec: Any, database: str, schema: str, table: str) -> dict:
+    """
+    The table as schema compare reads it, for Change column. DuckDB reads
+    the whole schema (a foreign key elsewhere blocks the change); SQLite
+    adds the table's triggers, which its rebuild makes again.
+    """
+    from services import schema_compare
+
+    only = None if spec.alter_blocked_by_dependents else [table]
+    model = schema_compare.snapshot(conn, spec, database, schema, only=only)
+    tbl = model["tables"].get(table)
+    if tbl is not None and spec.rebuilds_tables:
+        rows = conn.exec_driver_sql(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ? "
+            "AND sql IS NOT NULL ORDER BY name", (table,)).all()
+        tbl["triggers"] = [row[0] for row in rows]
+    return model
+
+
 def alter(user_id: int, conn_id: int, database: str, schema: str, table: str, action: str,
           params: dict, dry_run: bool = False) -> dict:
     """
@@ -471,8 +490,10 @@ def alter(user_id: int, conn_id: int, database: str, schema: str, table: str, ac
     with connect(user_id, conn_id, database) as (conn, spec, _p, _engine):
         prep = conn.dialect.identifier_preparer
         target = spec.schema_for(database, schema)
+        current = _table_now(conn, spec, database, schema, table) \
+            if action == "alter_column" else None
         try:
-            statements = ddl.build(spec, prep, action, target, table, params)
+            statements = ddl.build(spec, prep, action, target, table, params, current)
         except ddl.DdlError as exc:
             raise OpError(str(exc)) from None
         if action == "drop_column":
@@ -480,6 +501,9 @@ def alter(user_id: int, conn_id: int, database: str, schema: str, table: str, ac
                                                  str(params.get("column") or "")) + statements
     note = ("Runs in one transaction." if spec.ddl_transactional else
             f"{spec.label} commits DDL as it runs: it cannot be rolled back.")
+    if action == "alter_column" and spec.rebuilds_tables:
+        note = (f"{spec.label} cannot change a column in place: the table is made again "
+                "(rows copied, indexes and triggers recreated) in one transaction.")
     preview = [statement + ";" for statement in statements]
     if dry_run:
         return {"ok": True, "sql": preview, "note": note,
@@ -494,11 +518,26 @@ def alter(user_id: int, conn_id: int, database: str, schema: str, table: str, ac
             if "database" in spec.levels and database and \
                     spec.database_for(profile, database) is None:
                 spec.use_database(dbapi, database)
-            with conn.begin():
-                for statement in statements:
-                    # Not text(): a default such as '10:30' is not a bind parameter.
-                    conn.exec_driver_sql(statement)
+            # SQLite's rebuild: foreign keys off outside the transaction, back on after.
+            fk_off = statements[:1] == [ddl.FK_OFF]
+            if fk_off:
+                # On the driver: through SQLAlchemy it would open the transaction early.
+                dbapi.execute(ddl.FK_OFF)
+                statements = statements[1:-1]
+            try:
+                with conn.begin():
+                    for statement in statements:
+                        # Not text(): a default such as '10:30' is not a bind parameter.
+                        result = conn.exec_driver_sql(statement)
+                        if statement.startswith(ddl.FK_CHECK) and result.fetchall():
+                            raise OpError("The rebuilt table has rows whose foreign keys "
+                                          "point nowhere: nothing was changed")
+            finally:
+                if fk_off:
+                    dbapi.execute(ddl.FK_ON)
             spec.set_timeout(dbapi, 0)
+    except OpError:
+        raise
     except Exception as exc:
         raise OpError(error_text(exc)) from None
     # The table's name afterwards, for the page to open or reopen it.

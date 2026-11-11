@@ -870,6 +870,83 @@ def test_object_actions_round_trip(user_id, profile):
     assert sqlops.browse(user_id, conn_id, database, schema, "orders", pk=["id"])["total"] == 137
 
 
+def test_alter_column(user_id, profile):
+    from services import sqlops
+
+    engine, conn_id = profile
+    database, schema = LOCATION[engine]
+    int_type, text_type = TYPES[engine]
+    wide = {"mssql": "nvarchar(200)", "sqlite": "VARCHAR(200)", "duckdb": "VARCHAR"}.get(
+        engine, "varchar(200)")
+    big = "BIGINT" if engine != "postgresql" else "bigint"
+    for name in ("bk_alter_child", "bk_alter"):
+        sqlops.execute(user_id, conn_id, database, f"DROP TABLE IF EXISTS {name}")
+    setup = [f"CREATE TABLE bk_alter (id {int_type} PRIMARY KEY, label {text_type}, "
+             f"qty {int_type} NOT NULL DEFAULT 0)",
+             "INSERT INTO bk_alter (id, label, qty) VALUES (1, 'one', 5)",
+             "INSERT INTO bk_alter (id, label, qty) VALUES (2, NULL, 6)"]
+    if engine != "duckdb":      # DuckDB cannot change a table an index depends on
+        setup.append("CREATE INDEX ix_bk_alter_label ON bk_alter (label)")
+        setup.append(f"CREATE TABLE bk_alter_child (id {int_type} PRIMARY KEY, "
+                     f"parent {int_type}, FOREIGN KEY (parent) REFERENCES bk_alter (id))")
+        setup.append("INSERT INTO bk_alter_child (id, parent) VALUES (1, 1)")
+    if engine == "sqlite":
+        setup.append("CREATE TRIGGER bk_alter_t AFTER UPDATE ON bk_alter "
+                     "BEGIN UPDATE bk_alter SET qty = qty WHERE 0; END")
+    _run_ddl(user_id, conn_id, database, setup)
+
+    def column(name):
+        info = sqlops.table_info(user_id, conn_id, database, schema, "bk_alter")
+        return next(c for c in info["columns"] if c["name"] == name), info
+
+    def change(name, preview=False, **params):
+        return sqlops.alter(user_id, conn_id, database, schema, "bk_alter", "alter_column",
+                            {"column": name, **params}, preview)
+
+    label, _info = column("label")
+    plan = change("label", True, type=wide, not_null=False, default="'x'")
+    assert plan["sql"] and "200" in " ".join(plan["sql"]) or engine == "duckdb"
+    done = change("label", type=wide, not_null=False, default="'x'")
+    assert done["ok"], done
+    label, info = column("label")
+    assert label["nullable"] and "x" in (label["default"] or "")
+    assert engine == "duckdb" or "200" in label["type"]
+    qty, _info = column("qty")
+    change("qty", type=big, not_null=False, default="")
+    qty, info = column("qty")
+    assert qty["nullable"] and not qty["default"]
+    # CockroachDB's INTEGER already is INT8, so BIGINT reads back as INTEGER.
+    assert "BIG" in qty["type"].upper() or engine == "cockroachdb"
+    change("qty", type=qty["type"], not_null=True, default="7")
+    qty, info = column("qty")
+    assert not qty["nullable"] and "7" in qty["default"]
+    rows = sqlops.browse(user_id, conn_id, database, schema, "bk_alter", pk=["id"])["rows"]
+    assert rows == [["1", "one", "5"], ["2", None, "6"]]
+    # Row 2's label is NULL: the change fails and leaves the table as it was.
+    with pytest.raises(sqlops.OpError):
+        change("label", type=label["type"], not_null=True, default=label["default"])
+    assert sqlops.browse(user_id, conn_id, database, schema, "bk_alter", pk=["id"])["rows"] == rows
+    assert column("label")[0]["nullable"]
+    if engine != "duckdb":
+        assert any(ix["name"] == "ix_bk_alter_label" for ix in info["indexes"])
+        broken = sqlops.execute(user_id, conn_id, database,
+                                "INSERT INTO bk_alter_child (id, parent) VALUES (2, 99)")
+        assert broken["results"][-1].get("error"), "the foreign key still holds"
+    if engine == "sqlite":
+        trig = sqlops.execute(user_id, conn_id, database,
+                              "SELECT name FROM sqlite_master WHERE type = 'trigger'")
+        assert ["bk_alter_t"] in trig["results"][0]["rows"]
+
+    with pytest.raises(sqlops.OpError, match="Nothing to change"):
+        change("qty", True, type=qty["type"], not_null=True, default=qty["default"])
+    with pytest.raises(sqlops.OpError, match="primary key"):
+        change("id", True, type=int_type, not_null=False)
+    with pytest.raises(sqlops.OpError, match="no column"):
+        change("nope", True, type=int_type)
+    for name in ("bk_alter_child", "bk_alter"):
+        sqlops.execute(user_id, conn_id, database, f"DROP TABLE IF EXISTS {name}")
+
+
 # ---------------------------------------------------------------------------
 # Import CSV (services/csv_import.py), run the way the job runs it
 # ---------------------------------------------------------------------------

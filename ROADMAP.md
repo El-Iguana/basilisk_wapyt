@@ -43,8 +43,9 @@ test.
   primary key, an auto-numbered column), rename, truncate, drop tables and
   views; add / rename / drop columns; create / drop indexes. Each previews
   its SQL live and runs in one transaction where the engine allows.
-  Follow-ups: change a column's type / NULL / default (ALTER COLUMN differs
-  per engine; SQLite needs a table rebuild); foreign keys and check
+  ~~Change a column's type / NULL / default~~ — done (2026-11-11): a
+  Change… button on the Columns tab, every engine; SQLite rebuilds the table
+  in one transaction (indexes and triggers made again). Follow-ups: foreign keys and check
   constraints; PostgreSQL DROP … CASCADE; create view; drop routines,
   sequences and triggers.
 - ~~**Import CSV**~~ — done (2026-10-26): from a table's menu or its Data
