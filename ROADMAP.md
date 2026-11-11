@@ -133,5 +133,5 @@ test.
 - The pager wraps onto a second toolbar row on narrow windows (the less-used
   buttons now drop their labels below 1,300 px); give it its own row below a
   width on purpose.
-- Statement mode for T-SQL splits on `;`, which breaks `DECLARE` scope; a
-  smarter splitter (blank lines as delimiters, as DBeaver offers) would help.
+- ~~Statement mode for T-SQL splits on `;`~~ — done (2026-11-11): blank lines
+  delimit statements inside a `GO` batch, so `DECLARE` scope holds.

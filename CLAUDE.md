@@ -574,8 +574,11 @@ from `completion()` via `get_multi_columns`), built by `tools/codemirror/` into
 `window.BkEditor`. **Ctrl+Enter** runs the selection or the statement at the
 caret (split server-side by sqlparse, with offsets), **Ctrl+Shift+Enter / Alt+X**
 the script, stopping at the first error, which is underlined (PostgreSQL gives
-a position; MySQL a line). SQL Server scripts run as **`GO` batches**; statement
-mode still splits on `;`. Statements run in **auto-commit**; a read-only
+a position; MySQL a line). SQL Server scripts run as **`GO` batches**; its
+statement mode (`split_statements`) splits a batch on **blank lines** outside
+strings, comments, brackets and `BEGIN/CASE … END`, never on `;` (that broke
+`DECLARE` scope), and a `CREATE`/`ALTER` of a routine, trigger or view takes the
+rest of its batch. Statements run in **auto-commit**; a read-only
 profile runs them in one transaction that is rolled back. A **production**
 profile (`env=prod`) asks before running anything whose first word is not a
 read (`_READ_FIRST_WORDS`) — a safety net, not a security check. Results:

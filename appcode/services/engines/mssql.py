@@ -17,6 +17,92 @@ ENCRYPTION = (
 _GO = re.compile(r"^[ \t]*GO(?:[ \t]+(\d+))?[ \t]*(?:--[^\n]*)?$", re.I | re.M)
 
 
+# These must be the only statement of their batch, so they run to its end.
+_WHOLE_BATCH = re.compile(
+    r"(?:CREATE(?:\s+OR\s+ALTER)?|ALTER)\s+(?:PROC|PROCEDURE|FUNCTION|TRIGGER|VIEW)\b", re.I)
+_COMMENTS_AHEAD = re.compile(r"\A(?:\s+|--[^\n]*|/\*.*?\*/)*", re.S)
+# BEGIN that opens no block: BEGIN TRAN, BEGIN DISTRIBUTED TRAN, BEGIN DIALOG…
+_BEGIN_NO_BLOCK = re.compile(r"\s+(?:TRAN|TRANSACTION|DISTRIBUTED|DIALOG|CONVERSATION)\b", re.I)
+_WORD = re.compile(r"[A-Za-z_@#][\w@#$]*")
+_BLANK_LINE = re.compile(r"\n[ \t\r\f\v]*\n")
+
+
+def _batches(sql: str) -> list:
+    """``(start, end, repeat)`` of each GO batch; ``repeat`` is GO's count, if any."""
+    out: list = []
+    cursor = 0
+    for match in _GO.finditer(sql):
+        out.append((cursor, match.start(), match.group(1)))
+        cursor = match.end()
+    out.append((cursor, len(sql), None))
+    return out
+
+
+def _add_piece(pieces: list, sql: str, start: int, end: int) -> None:
+    chunk = sql[start:end]
+    if _only_comments(chunk):
+        return
+    lead = len(chunk) - len(chunk.lstrip())
+    body = chunk.strip()
+    pieces.append(Piece(start + lead, start + lead + len(body), body))
+
+
+def _blank_line_cuts(sql: str, start: int, end: int) -> list:
+    """Offsets of the blank lines in ``sql[start:end]`` that end a statement."""
+    cuts: list = []
+    depth = 0       # BEGIN … END and CASE … END
+    parens = 0
+    i = start
+    while i < end:
+        ch = sql[i]
+        two = sql[i:i + 2]
+        if two == "--":
+            stop = sql.find("\n", i, end)
+            i = end if stop < 0 else stop
+        elif two == "/*":           # T-SQL block comments nest
+            level, i = 1, i + 2
+            while i < end and level:
+                if sql.startswith("/*", i):
+                    level, i = level + 1, i + 2
+                elif sql.startswith("*/", i):
+                    level, i = level - 1, i + 2
+                else:
+                    i += 1
+        elif ch in "'\"[":
+            close = "]" if ch == "[" else ch
+            i += 1
+            while i < end:
+                if sql[i] == close:
+                    if sql[i + 1:i + 2] == close and i + 1 < end:   # doubled: escaped
+                        i += 2
+                        continue
+                    break
+                i += 1
+            i += 1
+        elif ch == "(":
+            parens, i = parens + 1, i + 1
+        elif ch == ")":
+            parens, i = max(0, parens - 1), i + 1
+        elif ch == "\n":
+            blank = _BLANK_LINE.match(sql, i, end)
+            if blank and depth == 0 and parens == 0:
+                cuts.append(i)
+                i = blank.end() - 1     # the next line starts after its newline
+            else:
+                i += 1
+        elif ch.isalpha() or ch in "_@#":
+            word = _WORD.match(sql, i, end)
+            text = word.group(0).upper()
+            if text == "CASE" or (text == "BEGIN" and not _BEGIN_NO_BLOCK.match(sql, word.end(), end)):
+                depth += 1
+            elif text == "END":
+                depth = max(0, depth - 1)
+            i = word.end()
+        else:
+            i += 1
+    return cuts
+
+
 class SQLServer(Engine):
     name = "mssql"
     label = "SQL Server"
@@ -204,17 +290,29 @@ class SQLServer(Engine):
     def split(self, sql: str) -> list:
         """T-SQL runs in batches separated by ``GO``; each batch is sent whole."""
         pieces: list = []
-        cursor = 0
-        bounds = [(m.start(), m.end(), m.group(1)) for m in _GO.finditer(sql)]
-        for start, end, repeat in bounds + [(len(sql), len(sql), None)]:
+        for start, end, repeat in _batches(sql):
             if repeat:
                 raise ValueError("GO with a repeat count is not supported")
-            chunk = sql[cursor:start]
-            if not _only_comments(chunk):
-                lead = len(chunk) - len(chunk.lstrip())
-                body = chunk.strip()
-                pieces.append(Piece(cursor + lead, cursor + lead + len(body), body))
-            cursor = end
+            _add_piece(pieces, sql, start, end)
+        return pieces
+
+    def split_statements(self, sql: str) -> list:
+        """
+        Statement mode: blank lines separate statements inside a batch, so a
+        ``DECLARE`` stays with the lines that use it (``;`` does not split).
+        Blank lines inside strings, comments, brackets, ``BEGIN … END`` and
+        ``CASE … END`` do not count, and a ``CREATE`` / ``ALTER`` of a
+        procedure, function, trigger or view takes the rest of its batch.
+        """
+        pieces: list = []
+        for start, end, _repeat in _batches(sql):
+            cuts = _blank_line_cuts(sql, start, end)
+            blocks = list(zip([start] + cuts, cuts + [end]))
+            for index, (a, b) in enumerate(blocks):
+                if _WHOLE_BATCH.match(_COMMENTS_AHEAD.sub("", sql[a:b])):
+                    _add_piece(pieces, sql, a, end)
+                    break
+                _add_piece(pieces, sql, a, b)
         return pieces
 
     # ------------------------------------------------------------------
