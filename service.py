@@ -218,7 +218,7 @@ if __name__ == "__main__":
  | |_) | (_| \\__ \\ | | \\__ \\   <
  |____/ \\__,_|___/_|_|_|___/_|\\_\\
   Browser-based SQL database manager — pytincture/wapyt
-  Developer : OldManGan <eliguana@protonmail.com>
+  Developer : OldManGan · https://github.com/El-Iguana/basilisk_wapyt
   URL       : {canonical_origin()}/{APPLICATION}/
 """,
         flush=True,

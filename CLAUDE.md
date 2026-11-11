@@ -9,7 +9,7 @@ and their drivers. Started 2026-10-24, modelled on **Monguana**
 page, profiles and container. Read Monguana's CLAUDE.md for the framework
 traps; the ones that bite here are summarised below, not re-explained.
 
-Private repo: El-Iguana/basilisk_wapyt. Next work: `ROADMAP.md`. Releases
+Repo: El-Iguana/basilisk_wapyt (MIT; made public in 2026-11). Next work: `ROADMAP.md`. Releases
 (`v*` tags, the Windows installer attached) since **0.1.0** (2026-10-26).
 **The wiki** (`basilisk_wapyt.wiki.git`, pushed directly, no PRs) is the user
 guide, one page per feature with screenshots in its `images/`: update the page
