@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/El-Iguana/basilisk_wapyt/releases/latest">Download 0.1.0</a> ·
+  <a href="https://github.com/El-Iguana/basilisk_wapyt/releases/latest">Download 0.2.0</a> ·
   <a href="INSTALL.md">Install guide</a> ·
   <a href="https://github.com/El-Iguana/basilisk_wapyt/wiki">Wiki</a> ·
   <a href="ROADMAP.md">Roadmap</a>
@@ -107,7 +107,7 @@ is Python running in your browser, through Pyodide) and the
   `--profile postgres` adds a PostgreSQL to try it with;
   `compose.host-network.yaml` (Linux) reaches databases on the host's
   127.0.0.1.
-- **Windows without Docker**: `Basilisk-0.1.0-setup.exe` from the
+- **Windows without Docker**: `Basilisk-0.2.0-setup.exe` from the
   [latest release](https://github.com/El-Iguana/basilisk_wapyt/releases/latest)
   — a per-user install with its own Python and a tray icon, no administrator
   rights needed.

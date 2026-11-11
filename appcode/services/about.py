@@ -13,7 +13,7 @@ import re
 __all__ = ["VERSION", "REPO", "REPO_URL", "WIKI_URL", "RELEASES_URL", "LICENSE",
            "parse_version", "is_newer"]
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 REPO = "El-Iguana/basilisk_wapyt"
 REPO_URL = f"https://github.com/{REPO}"
