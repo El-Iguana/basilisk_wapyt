@@ -18,10 +18,12 @@ few differences:
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 from sqlalchemy_cockroachdb.psycopg import CockroachDBDialect_psycopg
 
+from services.engines.base import Engine
 from services.engines.postgresql import PostgreSQL
 
 
@@ -207,8 +209,18 @@ class CockroachDB(PostgreSQL):
 
     def sql_alter_column(self, prep: Any, schema: Optional[str], table: str, column: str,
                          new: dict, old: dict, changed: set) -> list:
-        out = super().sql_alter_column(prep, schema, table, column, new, old, changed)
+        if "type" in changed and _base_type(new["type"]) == _base_type(old["type"]):
+            # Only the size changes (varchar(50) -> varchar(200)): no USING, which
+            # would force a rewrite that CockroachDB refuses on an indexed column.
+            out = Engine.sql_alter_column(self, prep, schema, table, column, new, old, changed)
+        else:
+            out = super().sql_alter_column(prep, schema, table, column, new, old, changed)
         if "type" in changed:
             # Changing a type in place (beyond a safe widening) is behind a setting.
             out.insert(0, "SET enable_experimental_alter_column_type_general = true")
         return out
+
+
+def _base_type(text: str) -> str:
+    """``VARCHAR(50)`` -> ``varchar``: a type without its size."""
+    return re.sub(r"\(.*", "", str(text or "")).strip().lower()

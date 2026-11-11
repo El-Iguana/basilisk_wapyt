@@ -196,8 +196,9 @@ def _ddl(engine: str):
 
     from services import engines
 
-    dialect = {"postgresql": postgresql, "mysql": mysql, "mssql": mssql,
-               "sqlite": sqlite}[engine].dialect()
+    # CockroachDB and DuckDB quote names as PostgreSQL does.
+    dialect = {"postgresql": postgresql, "mysql": mysql, "mssql": mssql, "sqlite": sqlite,
+               "cockroachdb": postgresql, "duckdb": postgresql}[engine].dialect()
     return engines.get(engine), dialect.identifier_preparer
 
 
@@ -261,6 +262,80 @@ def test_ddl_alter_statements_per_engine():
         built("postgresql", "rename_table", new_name="t")
     with pytest.raises(ddl.DdlError, match="at least one"):
         built("postgresql", "create_index", name="ix", columns=[])
+
+
+def _current(engine, columns, pk=("id",), indexes=(), fks=(), schema="s"):
+    """A ``schema_compare.snapshot`` model of table t, written by hand."""
+    spec, prep = _ddl(engine)
+    cols = [{"name": c[0], "type": None, "type_text": c[1], "nullable": c[2], "default": c[3],
+             "auto": c[4] if len(c) > 4 else False, "rowid": False, "computed": None,
+             "comment": c[5] if len(c) > 5 else None} for c in columns]
+    table = {"name": "t", "columns": cols, "fks": list(fks), "indexes": list(indexes),
+             "pk": {"name": None, "columns": list(pk)}}
+    return spec, {"engine": engine, "label": spec.label, "schema": schema,
+                  "dialect": prep.dialect, "tables": {"t": table}}
+
+
+def test_ddl_alter_column_per_engine():
+    from services import ddl
+
+    columns = [("id", "INTEGER", False, None, True), ("label", "VARCHAR(50)", True, "'a'"),
+               ("n", "INTEGER", False, "0", False, "it's counted")]
+
+    def altered(engine, **params):
+        spec, current = _current(engine, columns)
+        return ddl.alter_column(spec, current, {"table": "t", **params})[0]
+
+    assert altered("postgresql", column="label", type="VARCHAR(200)", default="'a'") == [
+        "ALTER TABLE s.t ALTER COLUMN label TYPE VARCHAR(200) USING label::VARCHAR(200)"]
+    assert altered("postgresql", column="n", type="INTEGER", default="") == [
+        "ALTER TABLE s.t ALTER COLUMN n DROP NOT NULL", "ALTER TABLE s.t ALTER COLUMN n DROP DEFAULT"]
+    # CockroachDB: a size change needs no USING (which would rewrite the column).
+    assert altered("cockroachdb", column="label", type="VARCHAR(200)", default="'a'") == [
+        "SET enable_experimental_alter_column_type_general = true",
+        "ALTER TABLE s.t ALTER COLUMN label SET DATA TYPE VARCHAR(200)"]
+    assert "USING label::INT8" in altered("cockroachdb", column="label", type="INT8",
+                                         default="'a'")[1]
+    # MySQL restates the whole column, its comment included.
+    assert altered("mysql", column="n", type="BIGINT", not_null=True, default="0") == [
+        "ALTER TABLE s.t MODIFY COLUMN n BIGINT NOT NULL DEFAULT 0 COMMENT 'it''s counted'"]
+    assert altered("mysql", column="id", type="BIGINT", not_null=True) == [
+        "ALTER TABLE s.t MODIFY COLUMN id BIGINT NOT NULL AUTO_INCREMENT"]
+    ms = altered("mssql", column="label", type="NVARCHAR(80)", not_null=True, default="'b'")
+    assert ms[0].startswith("DECLARE @df") and ms[1:] == [
+        "ALTER TABLE s.t ALTER COLUMN label NVARCHAR(80) NOT NULL",
+        "ALTER TABLE s.t ADD DEFAULT 'b' FOR label"]
+    sqlite = altered("sqlite", column="label", type="TEXT", default="'a'")
+    assert sqlite[:2] == [ddl.FK_OFF, "BEGIN"] and sqlite[-1] == ddl.FK_ON
+    assert sqlite[-2].startswith(ddl.FK_CHECK)
+    assert any("label TEXT DEFAULT 'a'" in step for step in sqlite)
+
+
+def test_ddl_alter_column_refusals():
+    from services import ddl
+
+    columns = [("id", "INTEGER", False, None, True), ("label", "VARCHAR(50)", True, "'a'")]
+    spec, current = _current("postgresql", columns)
+
+    def refused(match, **params):
+        with pytest.raises(ddl.DdlError, match=match):
+            ddl.alter_column(spec, current, {"table": "t", **params})
+
+    refused("Nothing to change", column="label", type="varchar( 50 )", default="'a'")
+    refused("primary key", column="id", type="INTEGER")
+    refused("numbers itself", column="id", type="INTEGER", not_null=True, default="5")
+    refused("no column", column="nope", type="INTEGER")
+    refused("cannot contain", column="label", type="text; DROP TABLE t")
+    refused("Type is required", column="label", type=" ")
+    current["tables"]["t"]["columns"][1]["computed"] = "upper(x)"
+    refused("computed", column="label", type="text")
+    # DuckDB cannot change a column while an index depends on the table.
+    spec, current = _current("duckdb", columns, indexes=[{"name": "ix", "columns": ["label"]}])
+    with pytest.raises(ddl.DdlError, match="index or a foreign key"):
+        ddl.alter_column(spec, current, {"table": "t", "column": "label", "type": "TEXT",
+                                         "default": "'a'"})
+    assert ddl.alter_column(spec, current, {"table": "t", "column": "label",
+                                            "type": "VARCHAR(50)", "default": "'b'"})[0]
 
 
 def test_ddl_sql_bits_refuse_statement_breakers():

@@ -1,6 +1,6 @@
 """
 Object actions (milestone 2): the DDL behind Create table, Rename, Drop,
-Truncate, Add / rename / drop column and Create / drop index.
+Truncate, Add / rename / change / drop column and Create / drop index.
 
 Pure: statements are built from the dialect's identifier preparer (names
 are always quoted) and the engine adapter's hooks (``engines.base``), so
@@ -15,10 +15,11 @@ A plain module, not a BFF.
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 ACTIONS = ("create_table", "rename_table", "drop", "truncate", "add_column",
-           "rename_column", "drop_column", "create_index", "drop_index")
+           "rename_column", "alter_column", "drop_column", "create_index", "drop_index")
 MAX_NAME = 128
 MAX_COLUMNS = 500
 
@@ -97,11 +98,16 @@ def column_sql(spec: Any, prep: Any, column: dict, *, inline_pk: bool = False) -
 
 
 def build(spec: Any, prep: Any, action: str, schema: Optional[str], table: str,
-          params: dict) -> list:
-    """The statements for one action, without trailing semicolons."""
+          params: dict, current: Optional[dict] = None) -> list:
+    """
+    The statements for one action, without trailing semicolons. ``alter_column``
+    needs ``current``: the table as ``schema_compare.snapshot`` reads it.
+    """
     if action not in ACTIONS:
         raise DdlError(f"Unknown action {action!r}")
     params = params or {}
+    if action == "alter_column":
+        return alter_column(spec, current or {}, {**params, "table": table})[0]
     if action == "create_table":
         return [_create_table(spec, prep, schema, params)]
     table = name(table, "Table")
@@ -179,3 +185,109 @@ def _create_table(spec: Any, prep: Any, schema: Optional[str], params: dict) -> 
         lines.append(f"PRIMARY KEY ({', '.join(prep.quote(col) for col in pk)})")
     body = ",\n  ".join(lines)
     return f"CREATE TABLE {spec.qualified(prep, schema, table)} (\n  {body}\n)"
+
+
+# ---------------------------------------------------------------------------
+# Change a column: type, NULL, default
+# ---------------------------------------------------------------------------
+
+# SQLite's rebuild starts and ends with these; sqlops runs them outside the
+# transaction (PRAGMA foreign_keys does nothing inside one).
+FK_OFF, FK_ON = "PRAGMA foreign_keys = OFF", "PRAGMA foreign_keys = ON"
+FK_CHECK = "PRAGMA foreign_key_check"
+
+
+def alter_column(spec: Any, current: dict, params: dict) -> tuple:
+    """
+    ``(statements, notes)`` that give a column the type, NULL and default in
+    ``params``. ``current`` is a ``schema_compare.snapshot`` model holding
+    the table (``tables``: one entry, plus the rest of the schema when the
+    engine needs it); SQLite's table also carries its ``triggers`` (their
+    SQL). Engines change the column in place (``Engine.sql_alter_column``);
+    SQLite rebuilds the table, as schema compare does.
+    """
+    from services.schema_compare import norm_default
+
+    table = name(params.get("table") or current.get("table"), "Table")
+    tbl = (current.get("tables") or {}).get(table)
+    if tbl is None:
+        raise DdlError(f"Table {table} was not found")
+    wanted = name(params.get("column"), "Column")
+    col = next((c for c in tbl["columns"] if c["name"] == wanted), None)
+    if col is None:
+        raise DdlError(f"{table} has no column {wanted}")
+    if col["computed"]:
+        raise DdlError(f"{wanted} is a computed column: change it in the SQL editor")
+    new_type = sql_bit(params.get("type"), "Type", required=True)
+    nullable = not _flag(params.get("not_null"))
+    default = sql_bit(params.get("default"), "Default") or None
+
+    changed = set()
+    if _type_key(new_type) != _type_key(col["type_text"]):
+        changed.add("type")
+    if nullable != col["nullable"]:
+        changed.add("nullable")
+    if norm_default(default) != norm_default(col["default"]):
+        changed.add("default")
+    if "default" in changed and col["auto"]:
+        raise DdlError(f"{wanted} numbers itself: its default cannot be changed here")
+    if nullable and col["name"] in tbl["pk"]["columns"]:
+        raise DdlError(f"{wanted} is in the primary key, so it cannot allow NULL")
+    if not changed:
+        raise DdlError("Nothing to change: the column already looks like this")
+
+    prep = current["dialect"].identifier_preparer
+    schema = current.get("schema")
+    notes: list = []
+    if spec.rebuilds_tables:
+        return _rebuild_for(spec, current, tbl, col, new_type, nullable, default), notes
+    if spec.alter_blocked_by_dependents and changed & {"type", "nullable"}:
+        referenced = any(fk["ref_table"].casefold() == table.casefold() and not fk["ref_schema"]
+                         for other in current["tables"].values() for fk in other["fks"])
+        if tbl["indexes"] or referenced:
+            raise DdlError(f"{spec.label} cannot change this column while an index or a "
+                           "foreign key depends on the table")
+    keep_default = None if col["auto"] else col["default"]
+    new = {"type": new_type, "nullable": nullable,
+           "default": col["default"] if col["auto"] else default, "auto": col["auto"],
+           "comment": col.get("comment")}
+    old = {"type": col["type_text"], "nullable": col["nullable"],
+           "default": keep_default, "auto": col["auto"]}
+    statements = spec.sql_alter_column(prep, schema, table, wanted, new, old, changed)
+    if not statements:
+        raise DdlError(f"{spec.label} has no statement for this change")
+    return statements, notes
+
+
+def _type_key(text: str) -> str:
+    """A type for comparing: ``varchar( 50 )`` is ``VARCHAR(50)``."""
+    return re.sub(r"\s*([(),])\s*", r"\1", " ".join(str(text or "").split())).upper()
+
+
+def _rebuild_for(spec: Any, current: dict, tbl: dict, col: dict, new_type: str,
+                 nullable: bool, default: Optional[str]) -> list:
+    """SQLite: the table made again with the changed column, in one transaction."""
+    import copy
+
+    from services.schema_compare import _Writer
+
+    source = copy.deepcopy({k: v for k, v in tbl.items()})
+    for c in source["columns"]:
+        if c["name"] == col["name"]:
+            c.update(type_text=new_type, nullable=nullable, default=default)
+            # The rowid stays the rowid only as an INTEGER.
+            if c.get("rowid") and new_type.upper() != "INTEGER":
+                c.update(auto=False, rowid=False)
+    model = {**current, "tables": {tbl["name"]: source}}
+    writer = _Writer(model, {**current, "tables": {tbl["name"]: tbl}}, spec)
+    pairs = [(c["name"], c["name"]) for c in tbl["columns"]]
+    writer.rebuild(source, tbl, 0, pairs, [f"change column {col['name']}"])
+    diff = writer.diffs[0]
+    steps = [statement for _phase, statement in diff["sql"] if not statement.startswith("--")]
+    # Triggers are made again below; anything else left out stops the change.
+    lost = [n for n in diff["manual"].split("; ") if n and not n.startswith("rebuilt: triggers")]
+    if lost:
+        raise DdlError("SQLite would lose part of the table in the rebuild: " + "; ".join(lost))
+    body = [s for s in steps if s not in (FK_OFF, FK_ON) and not s.startswith(FK_CHECK)]
+    checks = [s for s in steps if s.startswith(FK_CHECK)]
+    return [FK_OFF, "BEGIN"] + body + list(tbl.get("triggers") or []) + checks + [FK_ON]

@@ -47,8 +47,12 @@ _KIND_ORDER = {"table": 0, "view": 0, "column": 1, "pk": 2, "index": 3, "fk": 4}
 # Reading a schema
 # ---------------------------------------------------------------------------
 
-def snapshot(conn: Any, spec: Any, database: str, schema: str) -> dict:
-    """One schema's tables and views, in plain dicts (types stay SQLAlchemy types)."""
+def snapshot(conn: Any, spec: Any, database: str, schema: str,
+             only: Optional[list] = None) -> dict:
+    """
+    One schema's tables and views, in plain dicts (types stay SQLAlchemy
+    types). ``only`` reads just those tables, and no views.
+    """
     from sqlalchemy import inspect
 
     target = spec.schema_for(database, schema)
@@ -56,6 +60,8 @@ def snapshot(conn: Any, spec: Any, database: str, schema: str) -> dict:
     insp = inspect(conn)
     dialect = conn.dialect
     names = sorted(insp.get_table_names(schema=target))
+    if only is not None:
+        names = [name for name in names if name in only]
     model = {"engine": spec.name, "label": spec.label, "schema": target, "dialect": dialect,
              "tables": {}, "views": {}, "truncated": len(names) > MAX_TABLES}
     names = names[:MAX_TABLES]
@@ -83,6 +89,7 @@ def snapshot(conn: Any, spec: Any, database: str, schema: str) -> dict:
                 "rowid": spec.name == "sqlite" and pk_cols == [col["name"]]
                 and text.upper() == "INTEGER",
                 "computed": str(computed.get("sqltext")) if computed else None,
+                "comment": col.get("comment") or None,
             })
         found_fks = []
         for fk in fks.get(key) or []:
@@ -121,7 +128,7 @@ def snapshot(conn: Any, spec: Any, database: str, schema: str) -> dict:
         model["tables"][name] = {"name": name, "columns": cols, "fks": found_fks,
                                  "indexes": sorted(kept, key=lambda ix: str(ix["name"] or "")),
                                  "pk": {"name": pk.get("name"), "columns": pk_cols}}
-    view_names = sorted(insp.get_view_names(schema=target))
+    view_names = [] if only is not None else sorted(insp.get_view_names(schema=target))
     model["truncated"] = model["truncated"] or len(view_names) > MAX_VIEWS
     for name in view_names[:MAX_VIEWS]:
         try:

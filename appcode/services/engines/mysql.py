@@ -188,6 +188,8 @@ class MySQL(Engine):
             parts.append(f"DEFAULT {new['default']}")
         if new.get("auto"):
             parts.append("AUTO_INCREMENT")
+        if new.get("comment"):          # MODIFY drops a comment it does not restate
+            parts.append(f"COMMENT {self.sql_text_literal(new['comment'])}")
         return [f"ALTER TABLE {self.qualified(prep, schema, table)} MODIFY COLUMN {' '.join(parts)}"]
 
     def sql_drop_constraint(self, prep: Any, schema: Optional[str], table: str,

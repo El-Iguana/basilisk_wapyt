@@ -310,6 +310,20 @@ remembered per user (`settings.value_panel`).
   rolled back. SQL Server cannot drop a column that has a default:
   `before_drop_column` looks up the constraint and drops it first, shown in
   the preview.
+- **Change column** (`alter_column`, 2026-11-11): type, NULL and default in
+  one dialog that starts from the column as it is. `sqlops._table_now` reads
+  the table with `schema_compare.snapshot(only=[table])` (DuckDB: the whole
+  schema, a foreign key elsewhere blocks the change; SQLite: plus its
+  triggers' SQL) and `ddl.alter_column` works out what changed, then calls
+  the engine's `sql_alter_column` (the hook schema compare uses; MySQL's
+  `MODIFY` restates the comment too). **SQLite** rebuilds the table through
+  schema compare's `_Writer.rebuild`, triggers made again, as
+  `PRAGMA foreign_keys = OFF` → `BEGIN` … `PRAGMA foreign_key_check` → commit
+  → `foreign_keys = ON`; the two PRAGMAs go to the driver connection (inside
+  a transaction they do nothing; through SQLAlchemy the first would start
+  it). Anything the rebuild would lose (an expression index, a computed
+  column) refuses the change. CockroachDB drops `USING` when only the size
+  changes: with it, even a widening is a rewrite, refused on an indexed column.
 - The page: `_ddl_dialog` is a form whose SQL is re-previewed 250 ms after
   each keystroke; **Run** previews the current fields once more and runs
   exactly that. Drops and truncates use the red `_confirm_sql(danger=True)`.
